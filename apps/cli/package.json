@@ -57,9 +57,9 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lcrxgzl-wq/margin.git",
+    "url": "git+https://github.com/lcrxgzl-wq/margin-agent.git",
     "directory": "apps/cli"
   },
-  "homepage": "https://github.com/lcrxgzl-wq/margin#readme",
-  "bugs": "https://github.com/lcrxgzl-wq/margin/issues"
+  "homepage": "https://github.com/lcrxgzl-wq/margin-agent#readme",
+  "bugs": "https://github.com/lcrxgzl-wq/margin-agent/issues"
 }
