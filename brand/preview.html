@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Margin Logo 草稿对比</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 40px; background: #f5f1e8; color: #1F2328; }
+  h1 { font-size: 20px; }
+  .row { display: flex; gap: 32px; margin: 24px 0 48px; }
+  .cell { text-align: center; }
+  .cell .name { margin-top: 8px; font-size: 14px; color: #666; }
+  .box { display: inline-flex; align-items: center; justify-content: center; background: #fff; border-radius: 12px; padding: 12px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .dark { background: #1F2328; }
+  .sizes img { vertical-align: middle; margin-right: 20px; }
+</style>
+</head>
+<body>
+<h1>Margin Logo 草稿 — 页边红批（三选一）</h1>
+<div class="row" id="cards"></div>
+<h1>小尺寸可读性（白底 / 纸底 / 墨底，256 → 16px）</h1>
+<div id="sizes"></div>
+<script>
+const drafts = [
+  ["margin-red-check", "A · 红勾（裁决打勾）"],
+  ["margin-red-m", "B · 红 M（手写 Margin）"],
+  ["margin-red-caret", "C · 红插入符（修订记号）"],
+];
+const cards = document.getElementById("cards");
+for (const [file, label] of drafts) {
+  cards.insertAdjacentHTML("beforeend",
+    `<div class="cell"><div class="box"><img src="drafts/${file}.svg" width="192" height="192"></div><div class="name">${label}</div></div>`);
+}
+const sizes = document.getElementById("sizes");
+for (const [file, label] of drafts) {
+  let html = `<h3>${label}</h3><div class="row sizes">`;
+  for (const bg of ["#fff", "#f5f1e8", "#1F2328"]) {
+    html += `<span class="box" style="background:${bg}">` +
+      [128, 64, 32, 16].map(s => `<img src="drafts/${file}.svg" width="${s}" height="${s}">`).join("") +
+      `</span>`;
+  }
+  sizes.insertAdjacentHTML("beforeend", html + "</div>");
+}
+</script>
+</body>
+</html>

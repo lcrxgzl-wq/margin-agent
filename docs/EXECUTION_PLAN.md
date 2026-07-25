@@ -650,3 +650,19 @@ spec：`docs/superpowers/specs/2026-07-24-unlimited-external-read-design.md`（�
 | 6 | 验收：storage-local 104/104、cli 41/41、typecheck 7 包、build 全绿 | ✅ |
 
 非目标（第二阶段候选）：外部路径挂资料（replaceAttachedSources/readSourceExcerpt/source-chunk 三处，~25 行）、tool description 告知模型可传绝对路径、meta 接口+前端 UNLIMITED READ 徽标。
+
+## 第 61 轮 - 正式发布管线 ✅
+
+spec：`docs/superpowers/specs/2026-07-24-official-release-pipeline-design.md`。目标：用户 `npm i -g margin-agent` 一条命令安装；建立 git → GitHub → CI/CD → npm 可持续发布管线。
+
+| # | 项 | 状态 |
+|---|---|---|
+| 1 | Git 奠基：gh CLI 安装+设备码授权（lcrxgzl-wq）；`.gitignore` 加 `imports/`；首个 commit（226 文件，预检无密钥）；`gh repo create margin --public` 建仓推送（https://github.com/lcrxgzl-wq/margin）；push 被 workflow scope 拒→`gh auth refresh -s workflow` 二次授权后推送成功 | ✅ |
+| 2 | 包发布就绪：`publishConfig.access: public` + repository/homepage/bugs 字段；README 加最终用户安装段（npm i -g → 论文目录运行 → 带 token URL） | ✅ |
+| 3 | 安装冒烟门禁 `scripts/release-install-smoke.mjs`（根脚本 `gate:install`）：pack→临时 prefix 全局装 tarball→断言 bin shim+dist→临时工作区启动（MARGIN_NO_OPEN+随机端口）→轮询 200+UI HTML+token 输出→清理 | ✅ |
+| 4 | CI `.github/workflows/ci.yml`（push 触发：install→test→typecheck→build→gate:release）；CD `.github/workflows/publish.yml`（tag v* 触发：全门禁+gate:install→`npm publish --provenance`，OIDC trusted publishing，npm@latest 因 Node22 自带 npm10 不支持 trusted publishing） | ✅ |
+| 5 | 存量 bug 修复：release-package-gate GNU tar 把 `E:\` 盘符当远程主机→两处加 `--force-local`；冒烟脚本 shell:true 截断 `C:\Program Files`→改直调 node+npm-cli.js | ✅ |
+| 6 | 验收：`RELEASE_PACKAGE_GATE_OK files=23 bytes=932554`；`RELEASE_INSTALL_SMOKE_OK`（305 依赖 20s 装完、200、UI、token 全过）；首次 CI run 已触发 | ✅ |
+| 7 | `docs/RELEASE.md` runbook：首发手动（npm login 2h 会话+`npm publish --otp`）→配 Trusted Publisher→0.1.1 起 tag 自动发布；版本节奏 patch/轮 minor/里程碑 | ✅ |
+
+剩余（用户侧手动）：npm 2FA 确认 → `npm login && cd apps/cli && npm publish --otp=<码>` 首发 0.1.0 → npm 包设置绑定 Trusted Publisher（仓库+publish.yml）。

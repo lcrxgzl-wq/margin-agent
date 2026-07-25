@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- text lines -->
+  <g stroke="#1F2328" stroke-width="48" stroke-linecap="round">
+    <line x1="66" y1="156" x2="266" y2="156"/>
+    <line x1="66" y1="256" x2="326" y2="256"/>
+    <line x1="66" y1="356" x2="226" y2="356"/>
+  </g>
+  <!-- red margin bar: slimmer, wider gap, outer edges flush with text block -->
+  <line x1="444" y1="152" x2="444" y2="360" stroke="#E5484D" stroke-width="40" stroke-linecap="round"/>
+</svg>
