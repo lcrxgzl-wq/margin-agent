@@ -40,7 +40,7 @@ pnpm mvp
 
 使用：在对话中粘贴 `.docx` 绝对路径导入 → 画布中编辑或选中文字 → Agent 给出修改提案 → Y/N/E 裁决后应用。  
 DOCX 是 Word 主路径的规范文件；Markdown 仅保留旧文稿兼容。人的画布编辑需显式保存，Agent 永远不能直接覆盖正文。
-计划与进度：`docs/EXECUTION_PLAN.md` · 验收：`docs/MVP.md`
+长期规划：`ROADMAP.md` · 验收标准：`docs/MVP.md`
 
 ## 多工作区
 

@@ -17,3 +17,12 @@ release
 *.db
 
 imports/
+
+# internal working docs (kept local)
+docs/EXECUTION_PLAN.md
+docs/superpowers/
+docs/advisory_memo_margin_fable.md
+docs/FABLE_ADVISORY_BRIEF.md
+docs/review-pi-prompts.md
+docs/review-pi-router.md
+docs/review-pi-shell.md
