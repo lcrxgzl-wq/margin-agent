@@ -1,0 +1,331 @@
+/**
+ * Writing agent runtime: pi-agent-core tool loop (default) + simple fallback.
+ * Uses pi as a generic agent shell — not a coding agent fork.
+ * Never forks pi-coding-agent; no bash / arbitrary FS / apply tools.
+ */
+import { randomUUID } from "node:crypto";
+import type { BlockSnapshot } from "@margin/domain";
+import { contentHash } from "@margin/domain";
+import { generateProposal } from "@margin/llm";
+import { getHarness } from "@margin/harness";
+import { getHeuristicComments } from "./packs/registry.js";
+import { generateDirectProposal } from "./direct-proposal.js";
+import { runPiBlockScan } from "./pi-runner.js";
+import type {
+  PaperAgentContext,
+  PaperAgentResult,
+  ScanProgressHandler,
+} from "./types.js";
+
+export type {
+  PaperAgentContext,
+  PaperAgentResult,
+  AgentComment,
+  ScanProgressEvent,
+  ScanProgressHandler,
+  AgentWorkReport,
+} from "./types.js";
+export { runPiBlockScan, createPaperTools } from "./pi-runner.js";
+export { citeCheck, styleLint, heuristicComments } from "./packs/academic.js";
+export { academicPack } from "./packs/academic.js";
+export { dataAnalysisPack } from "./packs/data-analysis.js";
+export {
+  assemblePaperTools,
+  getHeuristicComments,
+  getPack,
+} from "./packs/registry.js";
+export type { MarginPack, PackExtras } from "./packs/types.js";
+export {
+  inspectCsv,
+  parseCsv,
+  runAnalysis,
+  formatResultValue,
+  parseResultRef,
+} from "./data/tabular.js";
+export { AnalysisRunStore } from "./data/store.js";
+export { buildOutline, searchBlocks } from "./outline.js";
+export { toolPhaseLabel, isUserFacingPhase } from "./progress.js";
+export { runPiAgentLoop } from "./pi-loop.js";
+export type {
+  PiLoopOptions,
+  PiLoopOutcome,
+  PiLoopResult,
+} from "./pi-loop.js";
+export {
+  decideRoute,
+  type PolicyDecision,
+  type PolicyInput,
+} from "./policy/router.js";
+export {
+  parseOpenIntent,
+  resolveOpenPath,
+  type OpenIntent,
+} from "./policy/open-intent-rule.js";
+export {
+  runSessionTurn,
+  runPiSessionTurn,
+  runOfflineSessionTurn,
+} from "./session-runner.js";
+export { createSessionTools } from "./session-tools.js";
+export type { SessionTurnResult, SessionTurnInput } from "./session-runner.js";
+export type { WorkspaceBridge, SessionDocBag } from "./session-tools.js";
+export {
+  MAX_CLARIFICATION_ROUNDS,
+  buildClarificationHint,
+  isEditOrRewriteIntent,
+  nextClarificationRound,
+  clampClarificationRound,
+} from "./clarification.js";
+export {
+  MAX_CASCADE_CANDIDATES,
+  MAX_CASCADE_PROPOSALS_PER_TURN,
+  assertCanProposeBlock,
+  createCascadeGate,
+  formatOutlineHint,
+  normalizeCascadeOffer,
+} from "./cascade.js";
+export type { CascadeCandidate, CascadeGate, ProposeScope } from "./cascade.js";
+export type { AgentMessage } from "@earendil-works/pi-agent-core";
+export {
+  resolveRuntimeModel,
+  hasRuntimeCredentials,
+  resolveRuntimeApiKey,
+} from "./resolve-model.js";
+
+/** Preferred agent engine is always pi; env may force simple. */
+export function preferredEngine(): "pi" {
+  return "pi";
+}
+
+/**
+ * Resolve requested engine.
+ * Default: pi (agent-first). Explicit MARGIN_ENGINE=simple for tests/offline.
+ */
+export function resolveEngine(): "pi" | "simple" {
+  const v = (process.env.MARGIN_ENGINE ?? "pi").toLowerCase();
+  return v === "simple" ? "simple" : "pi";
+}
+
+export async function runBlockScan(
+  ctx: PaperAgentContext,
+  blockIds?: string[],
+  onProgress?: ScanProgressHandler,
+): Promise<PaperAgentResult> {
+  if (ctx.preferSimple) {
+    return runDirectBlockProposal(ctx, blockIds, onProgress);
+  }
+  const engine = resolveEngine();
+  // Full Pi: only MARGIN_ENGINE=simple skips the pi loop entirely.
+  if (engine !== "simple") {
+    try {
+      return await runPiBlockScan(ctx, blockIds, onProgress);
+    } catch (err) {
+      if (ctx.signal?.aborted) throw err;
+      if (process.env.MARGIN_ENGINE_STRICT === "1") throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      onProgress?.({ phase: "回退 simple 引擎", detail: reason });
+      const fallback = await runSimpleBlockScan(ctx, blockIds, onProgress);
+      return {
+        ...fallback,
+        engine: "simple",
+        fallbackFrom: "pi",
+        fallbackReason: reason,
+        notes: [...(fallback.notes ?? []), `fallback from pi: ${reason}`],
+        steps: [...(fallback.steps ?? []), "回退 simple 引擎"],
+      };
+    }
+  }
+  return runSimpleBlockScan(ctx, blockIds, onProgress);
+}
+
+async function runDirectBlockProposal(
+  ctx: PaperAgentContext,
+  blockIds?: string[],
+  onProgress?: ScanProgressHandler,
+): Promise<PaperAgentResult> {
+  const selected = blockIds?.length
+    ? ctx.blocks.filter((block) => blockIds.includes(block.id))
+    : [];
+  if (!selected.length) {
+    throw new Error("direct proposal requires at least one selected block");
+  }
+  if (selected.length > 1) {
+    return runDirectMultiBlockProposal(ctx, selected, onProgress);
+  }
+
+  const block = selected[0]!;
+  if (block.kind === "table" && !ctx.tableCell) {
+    throw new Error("direct table replacement is unsupported; use a Host-backed table cell proposal");
+  }
+  const steps: string[] = [];
+  const emit = (phase: string, detail?: string) => {
+    steps.push(phase);
+    onProgress?.({ phase, detail });
+  };
+  emit("读取选中段落", block.id);
+  const index = ctx.blocks.findIndex((candidate) => candidate.id === block.id);
+  const targetBlock = ctx.tableCell
+    ? { ...block, kind: "paragraph" as const, text: ctx.tableCell.before, contentHash: contentHash(ctx.tableCell.before) }
+    : block;
+  const output = await generateDirectProposal({
+    block: targetBlock,
+    neighbors: ctx.blocks.slice(Math.max(0, index - 1), index + 2),
+    harnessId: ctx.harnessId,
+    instruction: ctx.instruction,
+    selectionText: ctx.selectionText,
+    selectionStart: ctx.selectionStart,
+    operation: ctx.operation,
+    targetLanguage: ctx.targetLanguage,
+    sourceContext: ctx.sourceContext,
+    signal: ctx.signal,
+  });
+  emit("生成修订提案", block.id);
+
+  const proposal: PaperAgentResult["proposals"][number] = {
+    schemaVersion: 1,
+    documentId: ctx.documentId,
+    blockId: block.id,
+    baseRevision: ctx.revision,
+    baseHash: block.contentHash,
+    before: ctx.tableCell?.before ?? block.text,
+    after: output.after,
+    rationale: output.rationale,
+    risk: output.risk,
+    evidence: output.evidence,
+    operation: ctx.tableCell ? undefined : output.operation,
+    tableCell: ctx.tableCell ? { ...ctx.tableCell, after: output.after } : undefined,
+  };
+  const comments = getHeuristicComments(undefined, ctx.harnessId)?.([block]) ?? [];
+  emit("完成（1 处提案）");
+  return { engine: "simple", proposals: [proposal], comments, steps };
+}
+
+/** Cross-paragraph selection: one whole-block proposal per covered paragraph,
+ *  each generated with the full selection as read-only context. */
+async function runDirectMultiBlockProposal(
+  ctx: PaperAgentContext,
+  selected: BlockSnapshot[],
+  onProgress?: ScanProgressHandler,
+): Promise<PaperAgentResult> {
+  if (ctx.tableCell) {
+    throw new Error("table cell proposals require exactly one table block");
+  }
+  const steps: string[] = [];
+  const emit = (phase: string, detail?: string) => {
+    steps.push(phase);
+    onProgress?.({ phase, detail });
+  };
+  emit("璇诲彇璺ㄦ钀介€夊尯", `${selected.length} blocks`);
+  const proposals: PaperAgentResult["proposals"] = [];
+  for (const [i, block] of selected.entries()) {
+    if (ctx.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    if (block.kind === "table") {
+      emit(`璺宠繃琛ㄦ牸 ${i + 1}/${selected.length}`, block.id);
+      continue;
+    }
+    emit(`鐢熸垚淇鎻愭 ${i + 1}/${selected.length}`, block.id);
+    const index = ctx.blocks.findIndex((candidate) => candidate.id === block.id);
+    const output = await generateDirectProposal({
+      block,
+      neighbors: ctx.blocks.slice(Math.max(0, index - 1), index + 2),
+      harnessId: ctx.harnessId,
+      instruction: ctx.instruction,
+      selectionContext: ctx.selectionText,
+      operation: ctx.operation,
+      targetLanguage: ctx.targetLanguage,
+      sourceContext: ctx.sourceContext,
+      signal: ctx.signal,
+    });
+    proposals.push({
+      schemaVersion: 1,
+      documentId: ctx.documentId,
+      blockId: block.id,
+      baseRevision: ctx.revision,
+      baseHash: block.contentHash,
+      before: block.text,
+      after: output.after,
+      rationale: output.rationale,
+      risk: output.risk,
+      evidence: output.evidence,
+      operation: output.operation,
+    });
+  }
+  const comments = getHeuristicComments(undefined, ctx.harnessId)?.(selected) ?? [];
+  emit(`瀹屾垚锛?{proposals.length} 澶勬彁妗堬級`);
+  return { engine: "simple", proposals, comments, steps };
+}
+
+export async function runSimpleBlockScan(
+  ctx: PaperAgentContext,
+  blockIds?: string[],
+  onProgress?: ScanProgressHandler,
+): Promise<PaperAgentResult> {
+  if (ctx.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  const harness = getHarness(ctx.harnessId);
+  const selected = blockIds?.length
+    ? ctx.blocks.filter((b) => blockIds.includes(b.id))
+    : ctx.blocks.slice(0, 20);
+
+  const steps: string[] = [];
+  const emit = (phase: string, detail?: string) => {
+    steps.push(phase);
+    onProgress?.({ phase, detail });
+  };
+  emit("读取段落");
+
+  const proposals: PaperAgentResult["proposals"] = [];
+  for (const [i, block] of selected.entries()) {
+    if (ctx.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    if (block.kind === "table") {
+      emit(`跳过表格 ${i + 1}/${selected.length}`, block.id);
+      continue;
+    }
+    emit(`生成修订草案 ${i + 1}/${selected.length}`, block.id);
+    const idx = ctx.blocks.findIndex((b) => b.id === block.id);
+    const neighbors = ctx.blocks.slice(Math.max(0, idx - 1), idx + 2);
+    const out = await generateProposal({
+      block,
+      neighbors,
+      harnessId: harness.id,
+      styleHint: harness.styleHint,
+      instruction: ctx.instruction,
+      signal: ctx.signal,
+    });
+    if (ctx.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    proposals.push({
+      schemaVersion: 1,
+      documentId: ctx.documentId,
+      blockId: block.id,
+      baseRevision: ctx.revision,
+      baseHash: block.contentHash,
+      before: block.text,
+      after: out.after,
+      rationale: out.rationale,
+      risk: out.risk,
+      evidence: out.evidence,
+    });
+  }
+
+  emit("整理侧注");
+  const comments = getHeuristicComments(undefined, ctx.harnessId)?.(selected) ?? [];
+  emit(`完成（${proposals.length} 处提案）`);
+
+  return { engine: "simple", proposals, comments, steps };
+}
+
+export function createPaperAgentAdapter() {
+  return {
+    id: "margin-paper-agent",
+    version: "0.1.0",
+    notes:
+      "Agent-first: default pi tool loop (9 tools); MARGIN_ENGINE=simple for offline/tests; STRICT disables fallback.",
+    newRunId: () => randomUUID(),
+    runBlockScan,
+    hash: contentHash,
+    resolveEngine,
+    preferredEngine,
+  };
+}
+
+export { getHarness, listHarnesses } from "@margin/harness";
+export type { BlockSnapshot };

@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Margin 边注 · MVP</title>
+    <style>
+      :root {
+        --bg: #f4f1ea;
+        --ink: #1c1917;
+        --muted: #78716c;
+        --line: #d6d3d1;
+        --accent: #9a3412;
+        --ok: #166534;
+        --panel: #fffdf8;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Songti SC", serif;
+        background: linear-gradient(180deg, #f7f3eb, #efe8dc);
+        color: var(--ink);
+        min-height: 100vh;
+      }
+      header {
+        padding: 1rem 1.5rem;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+        align-items: baseline;
+        flex-wrap: wrap;
+      }
+      header h1 { margin: 0; font-size: 1.35rem; letter-spacing: 0.04em; }
+      header p { margin: 0.2rem 0 0; color: var(--muted); font-size: 0.9rem; }
+      main {
+        display: grid;
+        grid-template-columns: 1.15fr 0.85fr;
+        gap: 1rem;
+        padding: 1rem 1.5rem 2rem;
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 1rem;
+      }
+      label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.35rem; }
+      input, textarea, button, select { font: inherit; }
+      input, select {
+        width: 100%;
+        padding: 0.55rem 0.65rem;
+        border: 1px solid var(--line);
+        border-radius: 3px;
+        background: #fff;
+      }
+      .row { display: flex; gap: 0.5rem; margin: 0.75rem 0; flex-wrap: wrap; align-items: center; }
+      button {
+        border: 1px solid var(--ink);
+        background: var(--ink);
+        color: #fff;
+        padding: 0.45rem 0.8rem;
+        border-radius: 3px;
+        cursor: pointer;
+      }
+      button:disabled { opacity: 0.45; cursor: not-allowed; }
+      button.secondary { background: transparent; color: var(--ink); }
+      button.y { background: var(--ok); border-color: var(--ok); }
+      button.n { background: #fff; color: var(--accent); border-color: var(--accent); }
+      button.e { background: #fff; color: var(--ink); }
+      .block { border-top: 1px solid var(--line); padding: 0.75rem 0; }
+      .block:first-child { border-top: 0; }
+      .meta { font-size: 0.75rem; color: var(--muted); margin-bottom: 0.35rem; }
+      .proposal {
+        border: 1px solid var(--line);
+        padding: 0.75rem;
+        margin-bottom: 0.75rem;
+        border-left: 3px solid var(--accent);
+      }
+      .proposal pre {
+        white-space: pre-wrap;
+        font-family: inherit;
+        margin: 0.4rem 0;
+        background: #f5f0e6;
+        padding: 0.5rem;
+      }
+      .comment {
+        border-left: 3px solid var(--line);
+        padding: 0.35rem 0.5rem;
+        margin: 0.35rem 0;
+        font-size: 0.85rem;
+        color: var(--muted);
+        background: #f8f4ec;
+      }
+      .comment.warn { border-left-color: var(--accent); color: var(--ink); }
+      #runMeta { font-size: 0.8rem; color: var(--muted); margin: 0.5rem 0; white-space: pre-wrap; }
+      .badge {
+        display: inline-block;
+        border: 1px solid var(--line);
+        padding: 0.15rem 0.45rem;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        color: var(--muted);
+      }
+      @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>Margin · 边注 <span class="badge">MVP</span></h1>
+        <p>打开 Markdown → 生成提案 → Y/N/E → 应用写回</p>
+      </div>
+      <div id="caps" class="badge">…</div>
+    </header>
+    <main>
+      <section class="panel">
+        <label for="fileSelect">工作区 Markdown</label>
+        <div class="row">
+          <select id="fileSelect"></select>
+          <select id="harnessSelect" title="Harness"></select>
+          <button id="openBtn">打开</button>
+          <button class="secondary" id="proposeBtn">生成提案</button>
+          <button class="secondary" id="applyBtn">应用已批准</button>
+          <button class="secondary" id="exportBtn">导出 packet</button>
+          <button class="secondary" id="exportDocxBtn">导出 DOCX</button>
+          <button class="secondary" id="importDocxBtn">导入 DOCX→MD</button>
+        </div>
+        <div id="status"></div>
+        <div id="runMeta"></div>
+        <div id="docMeta" class="meta"></div>
+        <div id="blocks"></div>
+      </section>
+      <section class="panel">
+        <h2 style="margin-top:0;font-size:1.1rem;">待裁决队列</h2>
+        <p class="meta">只显示 status=proposed。新一轮生成会作废未裁决提案。cite 检查仅形态、未验证真伪。</p>
+        <div id="queue"></div>
+        <h2 style="font-size:1.1rem;">侧注 Comments</h2>
+        <div id="comments"></div>
+      </section>
+    </main>
+    <script>
+      const token = new URL(location.href).hash.replace(/^#token=/, "") || localStorage.getItem("margin_token");
+      if (token) localStorage.setItem("margin_token", token);
+      const api = (path, opts = {}) =>
+        fetch(path, {
+          ...opts,
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+            ...(opts.headers || {}),
+          },
+        }).then(async (r) => {
+          const data = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(data.error || r.statusText);
+          return data;
+        });
+
+      let documentMeta = null;
+      let blocks = [];
+      let proposals = [];
+      let comments = [];
+
+      const statusEl = document.getElementById("status");
+      const setStatus = (t) => (statusEl.textContent = t);
+      const setRunMeta = (t) => (document.getElementById("runMeta").textContent = t || "");
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+      }
+
+      async function boot() {
+        const caps = await fetch("/api/v1/capabilities").then((r) => r.json());
+        document.getElementById("caps").textContent =
+          `local · llm=${caps.llmMode} · preferred=${caps.preferredEngine} · engine=${caps.engine}`;
+        const files = await api("/api/v1/workspace/files");
+        const sel = document.getElementById("fileSelect");
+        sel.innerHTML = files.files.length
+          ? files.files.map((f) => `<option value="${escapeHtml(f)}">${escapeHtml(f)}</option>`).join("")
+          : `<option value="">（工作区无 .md）</option>`;
+        if (files.files.includes("fixtures/agent-chapter.md")) sel.value = "fixtures/agent-chapter.md";
+        else if (files.files.includes("fixtures/sample.md")) sel.value = "fixtures/sample.md";
+        const harness = await api("/api/v1/harnesses");
+        const hs = document.getElementById("harnessSelect");
+        hs.innerHTML = harness.harnesses
+          .map((h) => `<option value="${escapeHtml(h.id)}">${escapeHtml(h.title)}</option>`)
+          .join("");
+        hs.value = harness.defaultId;
+      }
+
+      function commentsForBlock(blockId) {
+        return comments.filter((c) => c.blockId === blockId);
+      }
+
+      function renderBlocks() {
+        const defaultChecked = new Set(blocks.slice(0, 8).map((b) => b.id));
+        document.getElementById("blocks").innerHTML = blocks
+          .map((b) => {
+            const notes = commentsForBlock(b.id)
+              .map(
+                (c) =>
+                  `<div class="comment ${c.severity === "warn" ? "warn" : ""}">${escapeHtml(c.text)}</div>`,
+              )
+              .join("");
+            const checked = defaultChecked.has(b.id) ? "checked" : "";
+            return `<div class="block">
+              <label class="meta" style="display:flex;gap:0.5rem;align-items:center;cursor:pointer">
+                <input type="checkbox" class="block-check" value="${escapeHtml(b.id)}" ${checked} />
+                <span>${escapeHtml(b.kind)} · ${escapeHtml(b.id)}</span>
+              </label>
+              <div>${escapeHtml(b.text)}</div>
+              ${notes}
+            </div>`;
+          })
+          .join("");
+        document.getElementById("docMeta").textContent = documentMeta
+          ? `${documentMeta.relativePath} · rev=${documentMeta.revision} · hash=${documentMeta.contentHash}`
+          : "";
+      }
+
+      function renderCommentsPanel() {
+        const el = document.getElementById("comments");
+        if (!comments.length) {
+          el.innerHTML = `<p class="meta">暂无侧注。生成提案后，cite/style 启发会写在这里。</p>`;
+          return;
+        }
+        el.innerHTML = comments
+          .map(
+            (c) =>
+              `<div class="comment ${c.severity === "warn" ? "warn" : ""}"><span class="meta">${escapeHtml(c.blockId)} · ${escapeHtml(c.source)}</span><br/>${escapeHtml(c.text)}</div>`,
+          )
+          .join("");
+      }
+
+      async function refreshProposals() {
+        if (!documentMeta) return;
+        const data = await api(`/api/v1/documents/${documentMeta.id}/proposals?status=proposed`);
+        proposals = data.proposals;
+        document.getElementById("queue").innerHTML = proposals.length
+          ? proposals
+              .map(
+                (p) => `<div class="proposal">
+                  <div class="meta">${escapeHtml(p.risk)} · block ${escapeHtml(p.blockId)}</div>
+                  <div>${escapeHtml(p.rationale)}</div>
+                  <pre>${escapeHtml(p.after)}</pre>
+                  <div class="row">
+                    <button class="y" data-act="Y" data-id="${p.id}">Y 采纳</button>
+                    <button class="n" data-act="N" data-id="${p.id}">N 退回</button>
+                    <button class="e" data-act="E" data-id="${p.id}">E 改写</button>
+                  </div>
+                </div>`,
+              )
+              .join("")
+          : `<p class="meta">暂无待裁决提案。</p>`;
+      }
+
+      async function refreshComments() {
+        if (!documentMeta) return;
+        const data = await api(`/api/v1/documents/${documentMeta.id}/comments`);
+        comments = data.comments || [];
+        renderCommentsPanel();
+        renderBlocks();
+      }
+
+      document.getElementById("queue").addEventListener("click", async (ev) => {
+        const btn = ev.target.closest("button[data-act]");
+        if (!btn) return;
+        const kind = btn.dataset.act;
+        const id = btn.dataset.id;
+        let editedText;
+        if (kind === "E") {
+          const p = proposals.find((x) => x.id === id);
+          editedText = prompt("编辑后采纳：", p?.after || "");
+          if (editedText == null) return;
+        }
+        try {
+          await api(`/api/v1/proposals/${id}/decision`, {
+            method: "PATCH",
+            body: JSON.stringify({ kind, editedText, reason: kind === "N" ? "rejected" : undefined }),
+          });
+          setStatus(`${kind} 已记录`);
+          await refreshProposals();
+        } catch (e) {
+          setStatus(e.message);
+        }
+      });
+
+      document.getElementById("openBtn").onclick = async () => {
+        try {
+          const relativePath = document.getElementById("fileSelect").value;
+          if (!relativePath) return setStatus("没有可选文件");
+          const data = await api("/api/v1/documents/open", {
+            method: "POST",
+            body: JSON.stringify({ relativePath }),
+          });
+          documentMeta = data.document;
+          blocks = data.blocks;
+          await refreshComments();
+          await refreshProposals();
+          setRunMeta("");
+          setStatus(`已打开 ${blocks.length} 个块`);
+        } catch (e) {
+          setStatus(e.message);
+        }
+      };
+
+      document.getElementById("proposeBtn").onclick = async () => {
+        if (!documentMeta) return setStatus("先打开文稿");
+        try {
+          setStatus("生成中…");
+          document.getElementById("proposeBtn").disabled = true;
+          const checked = [...document.querySelectorAll(".block-check:checked")].map((el) => el.value);
+              if (checked.length > 12) throw new Error("一次最多勾选 12 个块");
+              if (!checked.length) throw new Error("请至少勾选一个块");
+              const { runId } = await api(`/api/v1/documents/${documentMeta.id}/proposal-runs`, {
+            method: "POST",
+            body: JSON.stringify({
+              blockIds: checked,
+              harnessId: document.getElementById("harnessSelect")?.value || undefined,
+            }),
+          });
+          let run;
+          for (let i = 0; i < 120; i++) {
+            await new Promise((r) => setTimeout(r, 400));
+            run = await api(`/api/v1/proposal-runs/${runId}`);
+            if (run.status === "done") break;
+            if (run.status === "error") throw new Error(run.error || "run failed");
+          }
+          if (run?.status !== "done") throw new Error("proposal run timeout");
+          await refreshProposals();
+          await refreshComments();
+          const eng = run.engine || "?";
+          const fb = run.fallbackFrom
+            ? `fallback ${run.fallbackFrom}→${eng}`
+            : `engine=${eng}`;
+          const notes = (run.notes || []).slice(0, 3).join(" · ");
+          setRunMeta(
+            [
+              fb,
+              run.commentCount != null ? `comments=${run.commentCount}` : "",
+              run.citeDisclaimer || "",
+              notes,
+              run.fallbackReason ? `reason: ${run.fallbackReason}` : "",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          );
+          setStatus(`提案就绪：${proposals.length} 条待裁决 · ${fb}`);
+        } catch (e) {
+          setStatus(e.message);
+        } finally {
+          document.getElementById("proposeBtn").disabled = false;
+        }
+      };
+
+      document.getElementById("applyBtn").onclick = async () => {
+        if (!documentMeta) return;
+        try {
+          const result = await api(`/api/v1/documents/${documentMeta.id}/apply`, {
+            method: "POST",
+            body: JSON.stringify({
+              expectedRevision: documentMeta.revision,
+              expectedHash: documentMeta.contentHash,
+            }),
+          });
+          documentMeta = result.document;
+          const data = await api(`/api/v1/documents/${documentMeta.id}/blocks`);
+          blocks = data.blocks;
+          renderBlocks();
+          await refreshProposals();
+          setStatus(`已写回文件 · rev=${documentMeta.revision}`);
+        } catch (e) {
+          const msg = e.message || String(e);
+          setStatus(msg.includes("nothing_to_apply") ? "没有可应用的 Y/E 裁决（可能全是 N）" : msg);
+        }
+      };
+
+      document.getElementById("exportBtn").onclick = async () => {
+        if (!documentMeta) return;
+        try {
+          const packet = await api(`/api/v1/documents/${documentMeta.id}/exports`);
+          const blob = new Blob([JSON.stringify(packet, null, 2)], { type: "application/json" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "revision-packet.json";
+          a.click();
+          setStatus("已导出 revision packet");
+        } catch (e) {
+          setStatus(e.message);
+        }
+      };
+
+      document.getElementById("exportDocxBtn").onclick = async () => {
+        if (!documentMeta) return;
+        try {
+          const result = await api(`/api/v1/documents/${documentMeta.id}/export-docx`, {
+            method: "POST",
+            body: JSON.stringify({}),
+          });
+          const r = result.report;
+          const ratios = r?.ratios
+            ? ` chars=${(r.ratios.chars * 100).toFixed(0)}% headings=${(r.ratios.headings * 100).toFixed(0)}%`
+            : "";
+          const gate = r?.ok === false ? ` · 损失告警: ${(r.flags || []).join(",")}` : ` · 往返 OK${ratios}`;
+          setStatus(`已导出 ${result.relativePath}${gate}`);
+        } catch (e) {
+          setStatus(e.message);
+        }
+      };
+
+      document.getElementById("importDocxBtn").onclick = async () => {
+        try {
+          const relativePath = prompt("工作区内 .docx 相对路径：", "");
+          if (!relativePath) return;
+          const data = await api("/api/v1/documents/import-docx", {
+            method: "POST",
+            body: JSON.stringify({ relativePath }),
+          });
+          documentMeta = data.document;
+          blocks = data.blocks;
+          await refreshComments();
+          await refreshProposals();
+          const r = data.report;
+          const gate = r?.ok === false ? ` · 损失告警: ${(r.flags || []).join(",")}` : " · 切块 OK";
+          setStatus(`已从 DOCX 导入为 ${documentMeta.relativePath}${gate}`);
+        } catch (e) {
+          setStatus(e.message);
+        }
+      };
+
+      if (!token) setStatus("缺少 session token：请从 CLI 打开的链接进入");
+      else boot().catch((e) => setStatus(e.message));
+    </script>
+  </body>
+</html>

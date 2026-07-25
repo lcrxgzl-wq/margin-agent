@@ -1,0 +1,295 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  clearAgentSession,
+  ensureAgentSessionSchema,
+  loadAgentSession,
+  openWorkspace,
+  saveAgentSession,
+} from "./index.js";
+
+const dirs: string[] = [];
+
+afterEach(() => {
+  for (const d of dirs.splice(0)) {
+    try {
+      fs.rmSync(d, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+});
+
+describe("agent session persistence", () => {
+  it("saves and restores messages across reopen", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-"));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, "a.md"), "# hi\n", "utf8");
+    const ws = await openWorkspace(root);
+    try {
+      saveAgentSession(ws, {
+        sessionId: "sess-1",
+        documentId: "doc-1",
+        messages: [
+          { role: "user", content: "打开样章" },
+          { role: "assistant", content: "好" },
+        ],
+        clarificationRounds: 2,
+        chatTurns: [
+          { role: "user", text: "打开样章" },
+          { role: "assistant", text: "好" },
+        ],
+        sourcePaths: ["notes/interview.txt", "data/cases.csv", "sources/paper.pdf"],
+        task: {
+          objective: "依据访谈材料修订本节",
+          status: "completed",
+          sourcePaths: ["notes/interview.txt"],
+          sourceRefs: ["notes/interview.txt#chars=0-120"],
+          proposalCount: 2,
+          inspectedDocument: true,
+          consistencyChecked: true,
+          selection: { blockIds: ["b1"], text: "选中的句子", start: 17 },
+          updatedAt: "2026-07-21T00:00:00.000Z",
+        },
+      });
+      const loaded = loadAgentSession(ws);
+      expect(loaded?.sessionId).toBe("sess-1");
+      expect(loaded?.documentId).toBe("doc-1");
+      expect(loaded?.messages).toHaveLength(2);
+      expect(loaded?.clarificationRounds).toBe(2);
+      expect(loaded?.chatTurns).toEqual([
+        { role: "user", text: "打开样章" },
+        { role: "assistant", text: "好" },
+      ]);
+      expect(loaded?.sourcePaths).toEqual([
+        "notes/interview.txt",
+        "data/cases.csv",
+        "sources/paper.pdf",
+      ]);
+      expect(loaded?.task).toMatchObject({
+        objective: "依据访谈材料修订本节",
+        status: "completed",
+        sourceRefs: ["notes/interview.txt#chars=0-120"],
+        proposalCount: 2,
+        inspectedDocument: true,
+        consistencyChecked: true,
+        selection: { blockIds: ["b1"], text: "选中的句子", start: 17 },
+      });
+      clearAgentSession(ws);
+      expect(loadAgentSession(ws)).toBeNull();
+    } finally {
+      try {
+        ws.db.close();
+      } catch {
+        /* ignore */
+      }
+      await ws.releaseLock();
+    }
+  });
+
+  it("loads legacy array payload as empty chat meta", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-legacy-"));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, "a.md"), "# hi\n", "utf8");
+    const ws = await openWorkspace(root);
+    try {
+      ensureAgentSessionSchema(ws);
+      ws.db
+        .prepare(
+          `INSERT INTO agent_sessions (id, session_id, messages_json, updated_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(
+          "current",
+          "legacy",
+          JSON.stringify([{ role: "user", content: "hi" }]),
+          new Date().toISOString(),
+        );
+      const loaded = loadAgentSession(ws);
+      expect(loaded?.sessionId).toBe("legacy");
+      expect(loaded?.documentId).toBeUndefined();
+      expect(loaded?.messages).toHaveLength(1);
+      expect(loaded?.clarificationRounds).toBe(0);
+      expect(loaded?.chatTurns).toEqual([]);
+      expect(loaded?.threads).toEqual([]);
+      expect(loaded?.sourcePaths).toEqual([]);
+    } finally {
+      try {
+        ws.db.close();
+      } catch {
+        /* ignore */
+      }
+      await ws.releaseLock();
+    }
+  });
+
+  it("restores a running task as interrupted after process restart", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-task-"));
+    dirs.push(root);
+    const ws = await openWorkspace(root);
+    try {
+      saveAgentSession(ws, {
+        sessionId: "running-task",
+        messages: [],
+        task: {
+          objective: "核对三份资料并修订",
+          status: "running",
+          currentStep: "正在读取文件…",
+          sourcePaths: ["notes.txt"],
+          sourceRefs: [],
+          proposalCount: 0,
+          inspectedDocument: false,
+          consistencyChecked: false,
+          updatedAt: "2026-07-21T00:00:00.000Z",
+        },
+      });
+
+      expect(loadAgentSession(ws)?.task).toMatchObject({
+        objective: "核对三份资料并修订",
+        status: "interrupted",
+        currentStep: "正在读取文件…",
+      });
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("trims persisted messages at a complete user-turn boundary", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-trim-"));
+    dirs.push(root);
+    const ws = await openWorkspace(root);
+    try {
+      const messages = Array.from({ length: 30 }, (_, index) => [
+        { role: "user", content: `user-${index}` },
+        { role: "assistant", content: `assistant-${index}` },
+        { role: "toolResult", content: `tool-${index}` },
+      ]).flat();
+      saveAgentSession(ws, { sessionId: "trimmed", messages });
+      const loaded = loadAgentSession(ws);
+      expect(loaded?.messages.length).toBeLessThanOrEqual(80);
+      expect((loaded?.messages[0] as { role?: string })?.role).toBe("user");
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("drops an oversized protocol turn and caps chat text", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-bytes-"));
+    dirs.push(root);
+    const ws = await openWorkspace(root);
+    try {
+      saveAgentSession(ws, {
+        sessionId: "bounded",
+        messages: [
+          { role: "user", content: "x".repeat(900_000) },
+          { role: "assistant", content: "done" },
+        ],
+        chatTurns: [{ role: "user", text: "y".repeat(20_000) }],
+      });
+      const row = ws.db
+        .prepare("SELECT messages_json FROM agent_sessions WHERE id = 'current'")
+        .get() as { messages_json: string };
+      const loaded = loadAgentSession(ws);
+      expect(Buffer.byteLength(row.messages_json, "utf8")).toBeLessThanOrEqual(800_000);
+      expect(loaded?.messages).toEqual([]);
+      expect(loaded?.chatTurns[0]?.text).toHaveLength(8_000);
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("persists bounded review threads and thread chat metadata", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-threads-"));
+    dirs.push(root);
+    const ws = await openWorkspace(root);
+    try {
+      saveAgentSession(ws, {
+        sessionId: "threaded",
+        documentId: "doc-1",
+        messages: [],
+        chatTurns: [
+          { role: "user", text: "Why change this?", threadId: "thread-1" },
+          { role: "assistant", text: "For clarity.", threadId: "thread-1" },
+        ],
+        threads: [{
+          id: "thread-1",
+          documentId: "doc-1",
+          anchor: {
+            blockId: "block-1",
+            selectionText: "x".repeat(7_000),
+            selectionStart: 12,
+            tableCell: {
+              row: 1,
+              column: 2,
+              address: "C2",
+              before: "y".repeat(7_000),
+            },
+          },
+          collapsed: false,
+          createdAt: "2026-07-23T00:00:00.000Z",
+        }, {
+          id: "invalid-thread",
+          documentId: "doc-1",
+          anchor: { blockId: "", selectionText: "invalid" },
+          collapsed: true,
+          createdAt: "not-a-date",
+        }],
+      });
+
+      const loaded = loadAgentSession(ws);
+      expect(loaded?.chatTurns).toEqual([
+        { role: "user", text: "Why change this?", threadId: "thread-1" },
+        { role: "assistant", text: "For clarity.", threadId: "thread-1" },
+      ]);
+      expect(loaded?.threads).toHaveLength(1);
+      expect(loaded?.threads[0]).toMatchObject({
+        id: "thread-1",
+        documentId: "doc-1",
+        anchor: { blockId: "block-1", selectionStart: 12 },
+        collapsed: false,
+      });
+      expect(loaded?.threads[0]?.anchor.selectionText).toHaveLength(6_000);
+      expect(loaded?.threads[0]?.anchor.tableCell?.before).toHaveLength(6_000);
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("preserves review threads when a later agent save omits them", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-thread-merge-"));
+    dirs.push(root);
+    const ws = await openWorkspace(root);
+    try {
+      saveAgentSession(ws, {
+        sessionId: "before",
+        documentId: "doc-1",
+        messages: [],
+        threads: [{
+          id: "thread-1",
+          documentId: "doc-1",
+          anchor: { blockId: "block-1", selectionText: "anchor" },
+          collapsed: true,
+          createdAt: "2026-07-23T00:00:00.000Z",
+        }],
+      });
+
+      saveAgentSession(ws, {
+        sessionId: "after",
+        documentId: "doc-1",
+        messages: [{ role: "user", content: "continue" }],
+        chatTurns: [{ role: "user", text: "continue", threadId: "thread-1" }],
+      });
+
+      expect(loadAgentSession(ws)?.threads).toMatchObject([{ id: "thread-1" }]);
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+});

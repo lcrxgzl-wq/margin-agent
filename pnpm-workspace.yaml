@@ -1,0 +1,10 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# pnpm v11: explicit allow/deny for dependency build scripts
+allowBuilds:
+  esbuild: true
+  # Transitive from pi-ai; not needed for OpenAI/Anthropic/mock path
+  "@google/genai": false
+  protobufjs: false

@@ -1,0 +1,65 @@
+{
+  "name": "margin-agent",
+  "version": "0.1.0",
+  "description": "Local-first, auditable academic writing agent with native DOCX review.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "type": "module",
+  "bin": {
+    "margin-agent": "./dist/index.js"
+  },
+  "files": [
+    "dist/index.js",
+    "dist/index.js.map",
+    "public",
+    "web-dist",
+    "skills",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "scripts": {
+    "dev": "tsx src/index.ts ../..",
+    "build": "tsc -p tsconfig.json",
+    "build:release": "pnpm --dir ../.. build && node ../../scripts/build-cli-release.mjs",
+    "prepack": "pnpm run build:release",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js ../..",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.80.10",
+    "@earendil-works/pi-ai": "^0.80.10",
+    "@fastify/cors": "^11.0.1",
+    "@fastify/static": "^10.1.0",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "docx": "^9.7.1",
+    "fastify": "^5.4.0",
+    "fast-xml-parser": "5.10.1",
+    "jszip": "3.10.1",
+    "mammoth": "1.12.0",
+    "open": "^10.2.0",
+    "pdf-parse": "2.4.5",
+    "proper-lockfile": "^4.1.2",
+    "write-file-atomic": "^6.0.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.14",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lcrxgzl-wq/margin.git",
+    "directory": "apps/cli"
+  },
+  "homepage": "https://github.com/lcrxgzl-wq/margin#readme",
+  "bugs": "https://github.com/lcrxgzl-wq/margin/issues"
+}
