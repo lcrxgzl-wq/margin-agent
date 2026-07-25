@@ -21,9 +21,10 @@ jobs:
       # Trusted publishing requires npm CLI >= 11.5.1 (Node 22 ships npm 10).
       - run: npm install -g npm@latest
       - run: pnpm install --frozen-lockfile
+      # workspace 包互相经 dist 入口解析，测试前必须先构建
+      - run: pnpm build
       - run: pnpm test
       - run: pnpm typecheck
-      - run: pnpm build
       - run: pnpm gate:release
       - run: pnpm gate:install
       - run: npm publish --provenance --access public

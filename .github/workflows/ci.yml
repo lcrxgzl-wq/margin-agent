@@ -15,7 +15,8 @@ jobs:
           node-version: 22
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
+      # workspace 包互相经 dist 入口解析，测试前必须先构建
+      - run: pnpm build
       - run: pnpm test
       - run: pnpm typecheck
-      - run: pnpm build
       - run: pnpm gate:release
