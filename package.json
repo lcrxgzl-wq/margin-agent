@@ -5,7 +5,7 @@
   "packageManager": "pnpm@11.13.1",
   "scripts": {
     "dev": "pnpm --filter margin-agent dev",
-    "build": "pnpm -r --filter @margin/domain --filter @margin/harness --filter @margin/storage-local --filter @margin/llm --filter @margin/agent --filter @margin/web --filter margin-agent build",
+    "build": "pnpm -r --filter @margin/domain --filter @margin/harness --filter @margin/storage-local --filter @margin/llm --filter @margin/agent --filter @margin/web build && pnpm --filter margin-agent build",
     "test": "node scripts/check-pack-deps.mjs && pnpm --filter @margin/domain test && pnpm --filter @margin/harness test && pnpm --filter @margin/storage-local test && pnpm --filter @margin/llm test && pnpm --filter @margin/agent test && pnpm --filter margin-agent test && pnpm --filter @margin/web test",
     "check:packs": "node scripts/check-pack-deps.mjs",
     "typecheck": "pnpm -r typecheck",
