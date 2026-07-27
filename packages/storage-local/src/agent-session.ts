@@ -5,6 +5,7 @@ const MAX_MESSAGES = 80;
 const MAX_CHAT_TURNS = 24;
 const MAX_CHAT_TEXT_CHARS = 8_000;
 const MAX_REVIEW_THREADS = 24;
+const MAX_THREAD_BLOCK_IDS = 8;
 const MAX_THREAD_ID_CHARS = 200;
 const MAX_ANCHOR_TEXT_CHARS = 6_000;
 const MAX_TABLE_ADDRESS_CHARS = 32;
@@ -25,6 +26,7 @@ export type PersistedReviewThread = {
   documentId: string;
   anchor: {
     blockId: string;
+    blockIds?: string[];
     selectionText: string;
     selectionStart?: number;
     tableCell?: {
@@ -33,6 +35,7 @@ export type PersistedReviewThread = {
       address: string;
       before: string;
     };
+    crossTableCells?: boolean;
   };
   collapsed: boolean;
   createdAt: string;
@@ -136,6 +139,13 @@ function normalizeReviewThreads(value: unknown): PersistedReviewThread[] {
       continue;
     }
 
+    const requestedBlockIds = Array.isArray(anchor.blockIds)
+      ? [...new Set(anchor.blockIds.map(boundedId).filter((value): value is string => Boolean(value)))]
+      : [];
+    const blockIds = requestedBlockIds.length
+      ? [blockId, ...requestedBlockIds.filter((value) => value !== blockId)].slice(0, MAX_THREAD_BLOCK_IDS)
+      : [];
+
     let tableCell: PersistedReviewThread["anchor"]["tableCell"];
     if (anchor.tableCell !== undefined) {
       const cell = anchor.tableCell;
@@ -160,11 +170,13 @@ function normalizeReviewThreads(value: unknown): PersistedReviewThread[] {
       documentId,
       anchor: {
         blockId,
+        ...(blockIds.length ? { blockIds } : {}),
         selectionText,
         ...(Number.isInteger(selectionStart) && selectionStart >= 0 && selectionStart <= 2_000_000
           ? { selectionStart }
           : {}),
         ...(tableCell ? { tableCell } : {}),
+        ...(anchor.crossTableCells === true ? { crossTableCells: true } : {}),
       },
       collapsed: thread.collapsed === true,
       createdAt,

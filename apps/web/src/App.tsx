@@ -785,6 +785,7 @@ function Workspace() {
               threadId: activeThread.id,
               selection: {
                 blockId: activeThread.anchor.blockId,
+                blockIds: activeThread.anchor.blockIds,
                 text: activeThread.anchor.selectionText,
                 selectionStart: activeThread.anchor.selectionStart,
                 tableCell: activeThread.anchor.tableCell,

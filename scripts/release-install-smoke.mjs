@@ -31,6 +31,7 @@ try {
   runNpm(["install", "-g", "--prefix", prefix, path.join(tmp, tarball)]);
 
   const pkgDir = path.join(prefix, "node_modules", "margin-agent");
+  const installedManifest = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8"));
   const shim =
     process.platform === "win32"
       ? path.join(prefix, "margin-agent.cmd")
@@ -64,7 +65,20 @@ try {
   }
   if (!body) throw new Error(`installed server did not respond 200 within 30s\n${serverLog}`);
   if (!body.includes("<html")) throw new Error("installed server did not serve the UI");
-  if (!/#token=/.test(serverLog)) throw new Error(`token URL was not printed\n${serverLog}`);
+  const urlMatch = /UI:\s+(http:\/\/127\.0\.0\.1:\d+\/#token=[a-z0-9]+)/i.exec(serverLog);
+  if (!urlMatch) throw new Error(`token URL was not printed\n${serverLog}`);
+  const url = new URL(urlMatch[1]);
+  const token = url.hash.replace(/^#token=/, "");
+  const capabilities = await fetch(`${url.origin}/api/v1/capabilities`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!capabilities.ok) throw new Error(`installed capabilities endpoint returned ${capabilities.status}`);
+  const capabilityBody = await capabilities.json();
+  if (capabilityBody.version !== installedManifest.version) {
+    throw new Error(
+      `installed capabilities version ${capabilityBody.version} does not match ${installedManifest.version}`,
+    );
+  }
 
   console.log(`RELEASE_INSTALL_SMOKE_OK port=${port} tarball=${tarball}`);
 } finally {

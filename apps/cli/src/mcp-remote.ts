@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { MARGIN_VERSION } from "./version.js";
 
 export type RemoteMcpTool = {
   name: string;
@@ -129,7 +130,7 @@ async function withClient<T>(
     import("@modelcontextprotocol/sdk/client/index.js"),
     import("@modelcontextprotocol/sdk/client/streamableHttp.js"),
   ]);
-  const client = new Client({ name: "margin", version: "0.1.0" });
+  const client = new Client({ name: "margin", version: MARGIN_VERSION });
   const transport = new StreamableHTTPClientTransport(new URL(url), {
     requestInit: {
       redirect: "error",

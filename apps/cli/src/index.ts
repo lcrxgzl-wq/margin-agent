@@ -92,6 +92,7 @@ import {
   removeRemoteMcpServer,
   saveRemoteMcpServer,
 } from "./mcp-remote.js";
+import { MARGIN_VERSION } from "./version.js";
 
 function llmMode(): "mock" | "byok" {
   if (
@@ -451,7 +452,7 @@ async function main() {
 
   app.get("/api/v1/capabilities", async () => ({
     mode: "local",
-    version: "0.1.0",
+    version: MARGIN_VERSION,
     mvp: true,
     features: {
       workspace: true,

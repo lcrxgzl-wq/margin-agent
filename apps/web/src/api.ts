@@ -58,6 +58,7 @@ export type SessionReviewThread = {
   documentId?: string;
   anchor: {
     blockId: string;
+    blockIds?: string[];
     selectionText: string;
     selectionStart?: number;
     tableCell?: {
@@ -66,6 +67,7 @@ export type SessionReviewThread = {
       address: string;
       before: string;
     };
+    crossTableCells?: boolean;
   };
   collapsed: boolean;
   createdAt: string;
@@ -510,6 +512,9 @@ export async function waitRun(
     });
     if (run.status === "done") return run;
     if (run.status === "error") throw new Error(run.error || "run failed");
+    if (run.status === "superseded") {
+      throw new Error(run.phase || "提案任务已被较新的任务替代");
+    }
     if (run.status === "cancelled") throw new DOMException("Aborted", "AbortError");
     await new Promise<void>((resolve, reject) => {
       const finish = () => {

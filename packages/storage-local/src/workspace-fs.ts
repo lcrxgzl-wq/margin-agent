@@ -93,6 +93,29 @@ function assertSingleLinkFile(absolutePath: string): void {
   if (stat.nlink > 1) throw new Error("hard-linked files are not allowed");
 }
 
+function ensureWorkspaceMetadataDirectory(root: string, relativePath: string): string {
+  const absolutePath = path.join(root, relativePath);
+  if (fs.existsSync(absolutePath)) {
+    const stat = fs.lstatSync(absolutePath);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error("workspace metadata directories must not be links");
+    }
+  } else {
+    fs.mkdirSync(absolutePath);
+  }
+  return resolveWorkspacePath(root, relativePath);
+}
+
+function resolveWorkspaceMetadataFile(root: string, relativePath: string): string {
+  const absolutePath = path.join(root, relativePath);
+  if (fs.existsSync(absolutePath) && fs.lstatSync(absolutePath).isSymbolicLink()) {
+    throw new Error("workspace metadata files must not be links");
+  }
+  const resolved = resolveWorkspacePath(root, relativePath);
+  assertSingleLinkFile(resolved);
+  return resolved;
+}
+
 /** Resolve a relative path and ensure it stays inside workspace root. */
 export function resolveWorkspacePath(root: string, candidate: string): string {
   if (!candidate || typeof candidate !== "string") {
@@ -121,19 +144,21 @@ function assertInsideWorkspace(root: string, candidate: string): string {
 }
 
 export async function openWorkspace(rootInput: string): Promise<Workspace> {
-  const root = path.resolve(rootInput);
-  fs.mkdirSync(root, { recursive: true });
-  const meta = marginDir(root);
-  fs.mkdirSync(path.join(meta, "backups"), { recursive: true });
+  const requestedRoot = path.resolve(rootInput);
+  fs.mkdirSync(requestedRoot, { recursive: true });
+  const root = fs.realpathSync(requestedRoot);
+  ensureWorkspaceMetadataDirectory(root, ".margin");
+  ensureWorkspaceMetadataDirectory(root, ".margin/backups");
 
-  const lockPath = path.join(meta, "workspace.lock");
+  const lockPath = resolveWorkspaceMetadataFile(root, ".margin/workspace.lock");
+  const databasePath = resolveWorkspaceMetadataFile(root, ".margin/margin.db");
   fs.writeFileSync(lockPath, "", { flag: "a" });
   const releaseLock = await lockfile.lock(lockPath, {
     retries: { retries: 5, minTimeout: 200, maxTimeout: 1000 },
     stale: 5_000,
   });
 
-  const db = new DatabaseSync(path.join(meta, "margin.db"));
+  const db = new DatabaseSync(databasePath);
   db.exec(`
     CREATE TABLE IF NOT EXISTS documents (
       id TEXT PRIMARY KEY,
@@ -999,23 +1024,26 @@ export async function exportDocumentDocx(
   const out = relativeOutPath ?? doc.relativePath.replace(/\.(md|markdown|docx)$/i, "") + ".export.docx";
   if (!/\.docx$/i.test(out)) throw new Error("export path must end with .docx");
   const abs = assertInsideWorkspace(ws.root, out);
+  const canonicalOut = visibleRelativePath(ws.root, abs);
+  assertNotRegisteredDocumentWrite(ws, canonicalOut);
+  assertSingleLinkFile(abs);
   const blocks = listBlocks(ws, documentId);
   const { statsFromBlocks, statsFromMarkdown, compareContentStats } = await import("./docx-loss.js");
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
   if (/\.docx$/i.test(doc.relativePath)) {
     const source = assertInsideWorkspace(ws.root, doc.relativePath);
-    fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.copyFileSync(source, abs);
+    await writeFileAtomic(abs, fs.readFileSync(source));
     const stats = statsFromBlocks(blocks);
     return {
-      relativePath: out.replace(/\\/g, "/"),
+      relativePath: canonicalOut,
       report: compareContentStats(stats, stats),
     };
   }
-  const { writeBlocksDocx, docxFileToMarkdown } = await import("./docx.js");
-  await writeBlocksDocx(abs, blocks);
+  const { blocksToDocxBuffer, docxFileToMarkdown } = await import("./docx.js");
+  await writeFileAtomic(abs, await blocksToDocxBuffer(blocks));
   const roundtripMd = await docxFileToMarkdown(abs);
   return {
-    relativePath: out.replace(/\\/g, "/"),
+    relativePath: canonicalOut,
     report: compareContentStats(statsFromBlocks(blocks), statsFromMarkdown(roundtripMd)),
   };
 }

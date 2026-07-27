@@ -4,32 +4,34 @@
 
 ## 一次性准备
 
-1. npm 账号：npmjs.com 注册 → 验证邮箱 → Settings 开启 2FA（Authenticator app）。**不开 2FA 无法发布**。
+1. npm 账号：已开启 passkey/安全密钥 2FA；手动发布必须使用用户自己的真实 TTY。
 2. GitHub：仓库已建（public）。首个版本发布后，到 npm 包设置 → Trusted Publisher 绑定本仓库 + `.github/workflows/publish.yml`，之后 tag 发布走 OIDC，本机不再存任何 npm 凭证。
 
 ## 每次发布
 
 ```bash
-pnpm build && pnpm gate:release && pnpm gate:install   # 本地门禁
-cd apps/cli && npm version patch                        # 或 minor；改版本号
+cd apps/cli && npm version patch --no-git-tag-version && cd ../..  # 或 minor
+pnpm build && pnpm test && pnpm typecheck
+pnpm gate:release && pnpm gate:install
 ```
 
-### 首发（0.1.0，手动）
+### 手动兜底（真实 TTY + passkey）
 
 ```bash
-npm login                                # 2 小时会话，浏览器授权
-cd apps/cli && npm publish --otp=<Authenticator 6 位码>
+npm login                                # 浏览器 + 安全密钥授权
+cd apps/cli && npm publish               # 必须在用户自己的真实终端执行
 npm view margin-agent                    # 验证已上线
 ```
 
-首发完成立刻去 npm 包设置配置 Trusted Publisher（见上）。
+日常发布优先使用下方 Trusted Publisher 自动管线。
 
 ### 之后（0.1.1+，OIDC 自动）
 
 ```bash
-cd apps/cli && npm version patch && cd ../..
-git add apps/cli/package.json && git commit -m "release: v0.1.1"
-git tag v0.1.1 && git push && git push --tags
+git add apps/cli/package.json
+git commit -m "release: vX.Y.Z"
+git tag vX.Y.Z
+git push && git push --tags
 ```
 
 tag 推送触发 `.github/workflows/publish.yml`：全部门禁（test/typecheck/build/gate:release/gate:install）→ `npm publish --provenance`。Actions 页面绿灯即发布完成。

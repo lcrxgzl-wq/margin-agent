@@ -221,8 +221,10 @@ describe("agent session persistence", () => {
           documentId: "doc-1",
           anchor: {
             blockId: "block-1",
+            blockIds: ["block-1", "block-2"],
             selectionText: "x".repeat(7_000),
             selectionStart: 12,
+            crossTableCells: true,
             tableCell: {
               row: 1,
               column: 2,
@@ -250,7 +252,12 @@ describe("agent session persistence", () => {
       expect(loaded?.threads[0]).toMatchObject({
         id: "thread-1",
         documentId: "doc-1",
-        anchor: { blockId: "block-1", selectionStart: 12 },
+        anchor: {
+          blockId: "block-1",
+          blockIds: ["block-1", "block-2"],
+          selectionStart: 12,
+          crossTableCells: true,
+        },
         collapsed: false,
       });
       expect(loaded?.threads[0]?.anchor.selectionText).toHaveLength(6_000);

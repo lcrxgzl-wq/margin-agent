@@ -45,6 +45,7 @@ export type RewritePromptState = {
 
 export type ThreadAnchor = {
   blockId: string;
+  blockIds?: string[];
   selectionText: string;
   selectionStart?: number;
   tableCell?: TableCellSelection;

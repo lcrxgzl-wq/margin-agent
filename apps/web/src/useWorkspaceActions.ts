@@ -50,6 +50,7 @@ function requestsSourceGrounding(instruction?: string): boolean {
 export function useWorkspaceActions(options?: {
   onSelectionRunStart?: (anchor: {
     blockId: string;
+    blockIds?: string[];
     selectionText: string;
     selectionStart?: number;
     tableCell?: TableCellSelection;
@@ -129,6 +130,7 @@ export function useWorkspaceActions(options?: {
     if (selectionText && editableIds[0]) {
       options?.onSelectionRunStart?.({
         blockId: editableIds[0],
+        blockIds: editableIds.length > 1 ? editableIds : undefined,
         selectionText,
         selectionStart,
         tableCell,
@@ -236,6 +238,7 @@ export function useWorkspaceActions(options?: {
           id: mid(),
           anchor: {
             blockId: command.blockId,
+            blockIds: command.blockIds,
             selectionText: command.selectionText ?? "",
             selectionStart: command.selectionStart,
             tableCell: command.tableCell,
@@ -280,6 +283,7 @@ export function useWorkspaceActions(options?: {
         id: mid(),
         anchor: {
           blockId,
+          blockIds,
           selectionText,
           selectionStart,
           tableCell,

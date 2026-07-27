@@ -215,15 +215,15 @@ async function runDirectMultiBlockProposal(
     steps.push(phase);
     onProgress?.({ phase, detail });
   };
-  emit("璇诲彇璺ㄦ钀介€夊尯", `${selected.length} blocks`);
+  emit("读取跨段落选区", `${selected.length} blocks`);
   const proposals: PaperAgentResult["proposals"] = [];
   for (const [i, block] of selected.entries()) {
     if (ctx.signal?.aborted) throw new DOMException("Aborted", "AbortError");
     if (block.kind === "table") {
-      emit(`璺宠繃琛ㄦ牸 ${i + 1}/${selected.length}`, block.id);
+      emit(`跳过表格 ${i + 1}/${selected.length}`, block.id);
       continue;
     }
-    emit(`鐢熸垚淇鎻愭 ${i + 1}/${selected.length}`, block.id);
+    emit(`生成修订提案 ${i + 1}/${selected.length}`, block.id);
     const index = ctx.blocks.findIndex((candidate) => candidate.id === block.id);
     const output = await generateDirectProposal({
       block,
@@ -251,7 +251,7 @@ async function runDirectMultiBlockProposal(
     });
   }
   const comments = getHeuristicComments(undefined, ctx.harnessId)?.(selected) ?? [];
-  emit(`瀹屾垚锛?{proposals.length} 澶勬彁妗堬級`);
+  emit(`完成（${proposals.length} 处提案）`);
   return { engine: "simple", proposals, comments, steps };
 }
 

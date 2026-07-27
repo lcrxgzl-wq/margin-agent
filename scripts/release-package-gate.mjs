@@ -5,8 +5,22 @@ import path from "node:path";
 const root = path.resolve(import.meta.dirname, "..");
 const cli = path.join(root, "apps", "cli");
 const output = path.join(root, ".tmp-release-gate");
+const sourceManifest = JSON.parse(fs.readFileSync(path.join(cli, "package.json"), "utf8"));
 fs.rmSync(output, { recursive: true, force: true });
 fs.mkdirSync(output, { recursive: true });
+
+let tarVersion = "";
+try {
+  tarVersion = execFileSync("tar", ["--version"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+} catch {
+  // Some BSD tar variants do not implement --version; only GNU needs --force-local.
+}
+const tarArgs = (args) => process.platform === "win32" && /\(GNU tar\)/.test(tarVersion)
+  ? ["--force-local", ...args]
+  : args;
 
 const pnpmCli = process.env.npm_execpath;
 if (!pnpmCli) throw new Error("release gate must run through pnpm");
@@ -15,10 +29,11 @@ execFileSync(process.execPath, [pnpmCli, "--filter", "margin-agent", "pack", "--
   stdio: "inherit",
 });
 
-const tarball = fs.readdirSync(output).find((file) => /^margin-agent-0\.1\.0\.tgz$/.test(file));
-if (!tarball) throw new Error("release tarball was not produced");
+const tarballs = fs.readdirSync(output).filter((file) => file.endsWith(".tgz"));
+if (tarballs.length !== 1) throw new Error("release gate expected exactly one tarball");
+const tarball = tarballs[0];
 const tarballPath = path.join(output, tarball);
-const entries = execFileSync("tar", ["--force-local", "-tf", tarballPath], { encoding: "utf8" })
+const entries = execFileSync("tar", tarArgs(["-tf", tarballPath]), { encoding: "utf8" })
   .split(/\r?\n/)
   .filter(Boolean);
 
@@ -40,11 +55,23 @@ if (forbidden.length) throw new Error(`release tarball contains forbidden files:
 
 const packedManifest = JSON.parse(execFileSync(
   "tar",
-  ["--force-local", "-xOf", tarballPath, "package/package.json"],
+  tarArgs(["-xOf", tarballPath, "package/package.json"]),
   { encoding: "utf8" },
 ));
-if (packedManifest.name !== "margin-agent" || packedManifest.version !== "0.1.0") {
+if (
+  sourceManifest.name !== "margin-agent" ||
+  packedManifest.name !== sourceManifest.name ||
+  packedManifest.version !== sourceManifest.version
+) {
   throw new Error("release package identity is incorrect");
+}
+if (
+  process.env.GITHUB_REF_TYPE === "tag" &&
+  process.env.GITHUB_REF_NAME !== `v${packedManifest.version}`
+) {
+  throw new Error(
+    `release tag ${process.env.GITHUB_REF_NAME} does not match package version ${packedManifest.version}`,
+  );
 }
 const runtimeDependencies = Object.keys(packedManifest.dependencies ?? {});
 const leakedWorkspaceDependency = [

@@ -8,3 +8,11 @@ allowBuilds:
   # Transitive from pi-ai; not needed for OpenAI/Anthropic/mock path
   "@google/genai": false
   protobufjs: false
+
+minimumReleaseAgeExclude:
+  - '@hono/node-server@2.0.12'
+
+overrides:
+  # MCP SDK 1.29 still requests the vulnerable 1.x adapter; v2 keeps the exports
+  # used by the SDK and supports Margin's Node >=22.19 runtime.
+  '@hono/node-server@<2.0.5': 2.0.12

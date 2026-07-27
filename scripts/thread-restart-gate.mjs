@@ -14,7 +14,8 @@ import {
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sourceArgument = process.argv.slice(2).find((argument) => argument !== "--");
-const sourceDocx = path.resolve(sourceArgument ?? process.env.MARGIN_OFFICE_DOCX ?? "");
+const sourceInput = sourceArgument ?? process.env.MARGIN_OFFICE_DOCX;
+const sourceDocx = sourceInput ? path.resolve(sourceInput) : undefined;
 const edgePath = process.env.MARGIN_EDGE_PATH ??
   "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
 const keepArtifacts = process.env.MARGIN_KEEP_THREAD_E2E === "1";
@@ -55,7 +56,9 @@ async function stopCli(child) {
     child.exitCode != null || child.signalCode != null,
     "CLI process did not exit during restart",
   );
-  await new Promise((resolve) => setTimeout(resolve, 250));
+  // child.kill("SIGTERM") force-terminates on Windows, so proper-lockfile's
+  // shutdown hook cannot run. Wait for the configured 5s stale window.
+  await new Promise((resolve) => setTimeout(resolve, process.platform === "win32" ? 5_250 : 250));
 }
 
 function apiFor(url) {
@@ -105,16 +108,19 @@ async function selectOfficeText(page, selection) {
 }
 
 async function main() {
-  invariant(sourceDocx && fs.existsSync(sourceDocx), `DOCX fixture not found: ${sourceDocx}`);
+  invariant(
+    sourceDocx && fs.existsSync(sourceDocx) && fs.statSync(sourceDocx).isFile(),
+    `DOCX fixture not found: ${sourceDocx ?? "pass a DOCX path or set MARGIN_OFFICE_DOCX"}`,
+  );
   invariant(fs.existsSync(edgePath), `Edge executable not found: ${edgePath}`);
   const { workspace, runtimeRoot } = createGateWorkspace(repoRoot, "margin-thread-restart-");
   const copiedDocx = path.join(workspace, path.basename(sourceDocx));
-  fs.copyFileSync(sourceDocx, copiedDocx);
 
   let browser;
   let server;
   const pageErrors = [];
   try {
+    fs.copyFileSync(sourceDocx, copiedDocx);
     server = startCli(workspace, await freePort());
     const firstUrl = await waitForCliUrl(server.child, server.output);
     const firstApi = apiFor(firstUrl);

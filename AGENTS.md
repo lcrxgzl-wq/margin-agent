@@ -23,7 +23,7 @@ Margin（npm 包 `margin-agent`）：本地运行的文档修订 Agent。模型�
 - `pnpm gate:release` — 发布包内容校验（esbuild 单文件 bundle）
 - `pnpm gate:install` — 安装冒烟（pack → 临时 prefix 全局装 → 启动 → 200）
 - `node scripts/ux-walkthrough.mjs "imports/sport value.docx"` — UI 走查（需本机 Edge）
-- `node scripts/visual-thread-check.mjs` — 视觉检查
+- `node scripts/visual-thread-check.mjs "imports/sport value.docx"` — 视觉检查
 - `pnpm dev` / `pnpm start` — 启动（`MARGIN_PORT`、`MARGIN_NO_OPEN=1`、`--unlimited`）
 
 ## 必须知道的坑
@@ -43,5 +43,5 @@ Margin（npm 包 `margin-agent`）：本地运行的文档修订 Agent。模型�
 
 - 每轮工作：spec（`docs/superpowers/specs/`）→ 实现 → 门禁全绿 → 进度写入 `docs/EXECUTION_PLAN.md`（本地工作文档，已被 gitignore 不入库）。
 - **git 变更操作（commit/push 等）每次先取得用户确认。**
-- 测试基线：404 全绿（第 61 轮时点）；新功能必须带测试。
+- 测试基线：409 全绿（第 62 轮时点）；新功能必须带测试。
 - 走查脚本改动 UI 行为后必跑；发版前必跑 `gate:release && gate:install`。

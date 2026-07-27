@@ -11,6 +11,8 @@ import {
   listAgentTranscripts,
   listWorkspaceSourceFiles,
   assertNotRegisteredDocumentWrite,
+  exportDocumentDocx,
+  openDocxDocument,
   writeWorkspaceText,
 } from "./index.js";
 
@@ -53,6 +55,20 @@ describe("resolveWorkspacePath", () => {
   it("rejects absolute paths", () => {
     const root = tmpWorkspace();
     expect(() => resolveWorkspacePath(root, path.resolve(root, "a.md"))).toThrow(/escapes/);
+  });
+});
+
+describe("workspace metadata boundary", () => {
+  it("rejects a .margin directory link before writing metadata", async () => {
+    const root = tmpWorkspace();
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "margin-outside-"));
+    dirs.push(outside);
+    linkDirectory(outside, path.join(root, ".margin"));
+
+    await expect(openWorkspace(root)).rejects.toThrow(/metadata.*links|escapes/);
+    expect(fs.existsSync(path.join(outside, "margin.db"))).toBe(false);
+    expect(fs.existsSync(path.join(outside, "workspace.lock"))).toBe(false);
+    expect(fs.existsSync(path.join(outside, "backups"))).toBe(false);
   });
 });
 
@@ -188,6 +204,43 @@ describe("workspace text io", () => {
       if (process.platform === "win32") {
         expect(() => assertNotRegisteredDocumentWrite(ws, "A.MD")).toThrow(/canonical/);
       }
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("rejects DOCX export through an existing hard link", async () => {
+    const root = tmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "margin-export-outside-"));
+    dirs.push(outsideDir);
+    const outside = path.join(outsideDir, "outside.docx");
+    fs.writeFileSync(outside, "outside", "utf8");
+    fs.linkSync(outside, path.join(root, "a.export.docx"));
+    const ws = await openWorkspace(root);
+    try {
+      const document = openDocument(ws, "a.md");
+      await expect(exportDocumentDocx(ws, document.id)).rejects.toThrow(/hard-linked/);
+      expect(fs.readFileSync(outside, "utf8")).toBe("outside");
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("does not overwrite a DOCX that has become a registered document", async () => {
+    const root = tmpWorkspace();
+    const ws = await openWorkspace(root);
+    try {
+      const source = openDocument(ws, "a.md");
+      await exportDocumentDocx(ws, source.id);
+      const exported = await openDocxDocument(ws, "a.export.docx");
+      const before = fs.readFileSync(path.join(root, "a.export.docx"));
+
+      await expect(exportDocumentDocx(ws, source.id)).rejects.toThrow(/canonical document/);
+      expect(fs.readFileSync(path.join(root, "a.export.docx")).equals(before)).toBe(true);
+      expect(openDocument(ws, "a.md").id).toBe(source.id);
+      expect(exported.relativePath).toBe("a.export.docx");
     } finally {
       ws.db.close();
       await ws.releaseLock();

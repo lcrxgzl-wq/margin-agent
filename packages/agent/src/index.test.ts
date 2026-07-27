@@ -199,6 +199,27 @@ describe("paper agent adapter", () => {
     }
   });
 
+  it("reports readable progress for a direct multi-block proposal", async () => {
+    const result = await runBlockScan(
+      {
+        documentId: "d1",
+        revision: 2,
+        blocks: sampleBlocks,
+        instruction: "Make both blocks concise.",
+        preferSimple: true,
+      },
+      ["h1", "b1"],
+    );
+
+    expect(result.proposals).toHaveLength(2);
+    expect(result.steps).toEqual([
+      "读取跨段落选区",
+      "生成修订提案 1/2",
+      "生成修订提案 2/2",
+      "完成（2 处提案）",
+    ]);
+  });
+
   it("creates a cell-only proposal for an exact table target", async () => {
     const result = await runBlockScan(
       {
