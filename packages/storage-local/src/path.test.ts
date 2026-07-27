@@ -293,12 +293,20 @@ describe("agent transcripts", () => {
       });
       expect(listAgentTranscripts(ws)).toEqual([saved]);
 
-      for (let i = 2; i <= 51; i++) {
-        saveAgentTranscript(ws, {
-          turnId: `turn-${i}`,
-          role: "assistant",
-          payload: { toolCalls: [] },
-        });
+      // Batch fixture setup so Windows CI does not fsync 50 independent transactions.
+      ws.db.exec("BEGIN");
+      try {
+        for (let i = 2; i <= 51; i++) {
+          saveAgentTranscript(ws, {
+            turnId: `turn-${i}`,
+            role: "assistant",
+            payload: { toolCalls: [] },
+          });
+        }
+        ws.db.exec("COMMIT");
+      } catch (error) {
+        ws.db.exec("ROLLBACK");
+        throw error;
       }
       expect(listAgentTranscripts(ws, 50)).toHaveLength(50);
     } finally {

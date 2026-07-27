@@ -13,7 +13,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --testTimeout=30000"
+    "test": "vitest run --pool=threads --maxWorkers=2 --testTimeout=30000"
   },
   "dependencies": {
     "@margin/domain": "workspace:*",
