@@ -30,7 +30,11 @@ try {
   const prefix = path.join(tmp, "prefix");
   runNpm(["install", "-g", "--prefix", prefix, path.join(tmp, tarball)]);
 
-  const pkgDir = path.join(prefix, "node_modules", "margin-agent");
+  const pkgDir = [
+    path.join(prefix, "node_modules", "margin-agent"),
+    path.join(prefix, "lib", "node_modules", "margin-agent"),
+  ].find((candidate) => fs.existsSync(candidate));
+  if (!pkgDir) throw new Error("npm global install did not create a margin-agent package directory");
   const installedManifest = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8"));
   const shim =
     process.platform === "win32"
