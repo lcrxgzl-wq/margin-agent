@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
+  PiLoopFailure,
   runSessionTurn,
   nextClarificationRound,
   type AgentMessage,
   type SessionDocBag,
   type SessionTurnResult,
   type WorkspaceBridge,
+  type ToolAuditEvent,
 } from "@margin/agent";
 import type { BlockSnapshot, DocumentMeta } from "@margin/domain";
 import {
@@ -35,10 +37,6 @@ import {
   isDocumentOpenStatusMessage,
   parseExplicitLocalDocxPath,
 } from "./local-document-intent.js";
-import {
-  callEnabledRemoteMcpTool,
-  listEnabledRemoteMcpTools,
-} from "./mcp-remote.js";
 
 const MAX_SOURCE_PATHS = 50;
 
@@ -181,21 +179,8 @@ export function replaceAttachedSources(
 }
 
 export function createWorkspaceBridge(workspace: Workspace): WorkspaceBridge {
-  const enabledMcpTools = listEnabledRemoteMcpTools(workspace.root);
   return {
     skillsRoot: path.join(workspace.root, ".margin", "skills"),
-    ...(enabledMcpTools.length > 0
-      ? {
-          mcp: {
-            listTools: async () => listEnabledRemoteMcpTools(workspace.root),
-            callTool: (input: {
-              serverId: string;
-              name: string;
-              arguments?: Record<string, unknown>;
-            }) => callEnabledRemoteMcpTool(workspace.root, input),
-          },
-        }
-      : {}),
     listSourceFiles: () => listWorkspaceSourceFiles(workspace),
     readText: (relativePath) =>
       readWorkspaceSource(workspace, relativePath, {
@@ -225,7 +210,6 @@ export type ChatAgentTurnResult = {
   clarificationRounds?: number;
   sourcePaths: string[];
   cascadeOffer?: Array<{ blockId: string; reason: string; query?: string }>;
-  fallbackFrom?: string;
   notes?: string[];
   task?: PersistedAgentTask;
 };
@@ -240,6 +224,7 @@ export function buildTranscriptPayload(input: {
   notes?: string[];
   loadedSkills?: Array<{ name: string; contentHash: string }>;
   sourcePaths: string[];
+  toolAudit?: ToolAuditEvent[];
 }) {
   return {
     steps: (input.steps ?? []).slice(-24),
@@ -251,6 +236,13 @@ export function buildTranscriptPayload(input: {
     notes: input.notes?.slice(-12).map((note) => note.slice(0, 500)),
     loadedSkills: input.loadedSkills?.slice(-20),
     sourcePaths: input.sourcePaths.slice(0, MAX_SOURCE_PATHS),
+    toolAudit: input.toolAudit?.slice(-24).map((event) => ({
+      toolCallId: event.toolCallId.slice(0, 200),
+      toolName: event.toolName.slice(0, 120),
+      status: event.status,
+      durationMs: Math.max(0, Math.floor(event.durationMs)),
+      args: event.args,
+    })),
   };
 }
 
@@ -377,6 +369,7 @@ export async function runChatAgentTurn(opts: {
         })()
       : await runSessionTurn({
         message,
+        workspaceWriteApprovalMessage: requestedMessage,
         messages: agentState.agentMessages,
         bag: agentState.bag,
         bridge: createWorkspaceBridge(workspace),
@@ -413,6 +406,24 @@ export async function runChatAgentTurn(opts: {
       sourcePaths: agentState.sourcePaths,
       task: agentState.task,
     });
+    if (error instanceof PiLoopFailure) {
+      saveAgentTranscript(workspace, {
+        turnId: randomUUID(),
+        documentId: agentState.bag.documentId,
+        role: "assistant",
+        payload: buildTranscriptPayload({
+          steps: [],
+          reply: error.message,
+          proposalCount: 0,
+          clarificationRounds: agentState.clarificationRounds,
+          sessionId: agentState.sessionId,
+          engine: "pi",
+          notes: error.notes,
+          sourcePaths: agentState.sourcePaths,
+          toolAudit: error.toolAudit,
+        }),
+      });
+    }
     throw error;
   }
 
@@ -542,6 +553,7 @@ export async function runChatAgentTurn(opts: {
       notes: turn.notes,
       loadedSkills: turn.loadedSkills,
       sourcePaths: agentState.sourcePaths,
+      toolAudit: turn.toolAudit,
     }),
     createdAt: new Date().toISOString(),
   });
@@ -555,7 +567,6 @@ export async function runChatAgentTurn(opts: {
     clarificationRounds: agentState.clarificationRounds,
     sourcePaths: [...agentState.sourcePaths],
     cascadeOffer: turn.cascadeOffer,
-    fallbackFrom: turn.fallbackFrom,
     notes: turn.notes,
     task: agentState.task,
   };

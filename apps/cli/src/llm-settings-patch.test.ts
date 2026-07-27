@@ -60,6 +60,13 @@ describe("buildLlmSettingsUpdate", () => {
 });
 
 describe("PUT /api/v1/settings/llm update flow", () => {
+  it("normalizes profile ids before persistence", () => {
+    expect(buildLlmSettingsUpdate({ harnessId: "  minimal  " }, "provider").harnessId)
+      .toBe("minimal");
+    expect(buildLlmSettingsUpdate({ harnessId: "   " }, "provider").harnessId)
+      .toBeNull();
+  });
+
   let root: string;
   const prev = { ...process.env };
 
@@ -101,7 +108,7 @@ describe("PUT /api/v1/settings/llm update flow", () => {
       root,
       buildLlmSettingsUpdate(
         {
-          harnessId: "novel",
+          harnessId: "minimal",
           provider: {
             apiFormat: "anthropic",
             baseURL: "https://two.test",
@@ -115,7 +122,7 @@ describe("PUT /api/v1/settings/llm update flow", () => {
     );
 
     const store = readLlmSettingsStore(root);
-    expect(store.harnessId).toBe("novel");
+    expect(store.harnessId).toBe("minimal");
     const active = activeProfile(store);
     expect(active.apiFormat).toBe("anthropic");
     expect(active.baseURL).toBe("https://two.test");

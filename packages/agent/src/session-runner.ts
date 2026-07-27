@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { DocumentMeta, TableCellProposalDraft } from "@margin/domain";
-import { composeSystemPrompt, getHarness } from "@margin/harness";
+import { composeSystemPrompt, getAgentProfile, getHarness } from "@margin/harness";
 import {
   emitTextChunks,
   generateProposal,
@@ -8,7 +8,7 @@ import {
   type ChatHistoryTurn,
 } from "@margin/llm";
 import { getHeuristicComments } from "./packs/registry.js";
-import { runPiAgentLoop } from "./pi-loop.js";
+import { runPiAgentLoop, type ToolAuditEvent } from "./pi-loop.js";
 import { assertPiLoopCompleted } from "./pi-outcome.js";
 import { decideRoute } from "./policy/router.js";
 import { isUserFacingPhase, toolPhaseLabel } from "./progress.js";
@@ -26,6 +26,8 @@ import type { AgentComment, AgentWorkReport, ScanProgressHandler } from "./types
 
 export type SessionTurnInput = {
   message: string;
+  /** Unexpanded user text used for this turn's workspace-write approval only. */
+  workspaceWriteApprovalMessage?: string;
   /** Prior pi transcript (multi-turn). */
   messages?: AgentMessage[];
   bag: SessionDocBag;
@@ -64,10 +66,9 @@ export type SessionTurnResult = {
   written?: { relativePath: string; created: boolean };
   loadedSkills?: Array<{ name: string; contentHash: string }>;
   cascadeOffer?: CascadeCandidate[];
-  fallbackFrom?: "pi";
-  fallbackReason?: string;
   notes?: string[];
   workReport?: AgentWorkReport;
+  toolAudit?: ToolAuditEvent[];
 };
 
 function buildWorkReport(
@@ -87,14 +88,31 @@ function buildWorkReport(
   };
 }
 
-function maxTurns(): number {
-  const n = Number(process.env.MARGIN_PI_MAX_TURNS ?? 20);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 20;
+function maxTurns(fallback: number): number {
+  const n = Number(process.env.MARGIN_PI_MAX_TURNS ?? fallback);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
-function timeoutMs(): number {
-  const n = Number(process.env.MARGIN_PI_TIMEOUT_MS ?? 120_000);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 120_000;
+function timeoutMs(fallback: number): number {
+  const n = Number(process.env.MARGIN_PI_TIMEOUT_MS ?? fallback);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function explicitlyRequestedWorkspaceWritePaths(message: string): string[] {
+  const paths: string[] = [];
+  const matches = message.matchAll(
+    /(?:新建|创建|写入|保存为?|write|create|save(?:\s+as)?)\s+(?:["“']([^"”'\r\n]+\.(?:md|txt|json|csv))\b["”']|([^\s"“”'，。；;:]+\.(?:md|txt|json|csv))\b)/gi,
+  );
+  for (const match of matches) {
+    const clausePrefix = message
+      .slice(0, match.index)
+      .split(/[，。；;！？!?\r\n]/)
+      .at(-1) ?? "";
+    if (/(?:不要|别|勿|禁止|不必|无需|do\s+not|don't|never)/i.test(clausePrefix)) continue;
+    const requested = (match[1] ?? match[2] ?? "").trim();
+    if (requested) paths.push(requested.replace(/\\/g, "/").replace(/^\.\//, ""));
+  }
+  return [...new Set(paths)];
 }
 
 function extractAssistantText(messages: AgentMessage[]): string {
@@ -124,7 +142,8 @@ function extractAssistantText(messages: AgentMessage[]): string {
 export async function runPiSessionTurn(
   input: SessionTurnInput,
 ): Promise<SessionTurnResult> {
-  const runtime = resolveRuntimeModel();
+  const profile = getAgentProfile(input.harnessId);
+  const runtime = resolveRuntimeModel(profile.model);
   const { model, apiKey } = runtime;
   if (!hasRuntimeCredentials()) {
     throw new Error(
@@ -139,6 +158,10 @@ export async function runPiSessionTurn(
   const cascadeIds = (input.cascadeBlockIds ?? []).filter(Boolean);
   const tools = createSessionTools(input.bridge, input.bag, drafts, comments, effects, {
     harnessId: input.harnessId,
+    enforceProfile: true,
+    workspaceWriteApprovedPaths: explicitlyRequestedWorkspaceWritePaths(
+      input.workspaceWriteApprovalMessage ?? input.message,
+    ),
     selectionBlockIds: selectionIds,
     cascadeConfirmedIds: cascadeIds,
     enforceCascadeGate: selectionIds.length > 0 || cascadeIds.length > 0,
@@ -170,7 +193,7 @@ export async function runPiSessionTurn(
     harnessId: input.harnessId,
   });
   const cascadeSkillHint =
-    getHarness(input.harnessId).skillScope === "none"
+    getHarness(input.harnessId).skills.scope === "none"
       ? ""
       : `可 load_skill("cascade-consistency-zh").`;
   const cascadeHint = cascadeIds.length
@@ -186,7 +209,7 @@ export async function runPiSessionTurn(
     ),
   ];
   const sourceSkillHint =
-    getHarness(input.harnessId).skillScope === "all"
+    getHarness(input.harnessId).skills.scope === "all"
       ? `可 load_skill("source-grounded-writing").`
       : "";
   const sourceHint = sourcePaths.length
@@ -203,8 +226,11 @@ export async function runPiSessionTurn(
     model,
     apiKey,
     sessionId: input.sessionId,
-    maxTurns: maxTurns(),
-    timeoutMs: timeoutMs(),
+    maxTurns: maxTurns(profile.limits.maxTurns),
+    timeoutMs: timeoutMs(profile.limits.timeoutMs),
+    maxContextMessages: profile.limits.maxContextMessages,
+    maxContextChars: profile.limits.maxContextChars,
+    allowedToolNames: tools.map((tool) => tool.name),
     onProgress: emit,
     onDelta: input.onDelta,
     signal: input.signal,
@@ -250,6 +276,7 @@ export async function runPiSessionTurn(
     loadedSkills: effects.loadedSkills,
     cascadeOffer: effects.cascadeOffer,
     notes: result.notes.length ? result.notes : undefined,
+    toolAudit: result.toolAudit,
     workReport: buildWorkReport(effects, steps, drafts.length + (effects.tableCellProposals?.length ?? 0)),
   };
 }
@@ -500,21 +527,8 @@ export async function runSessionTurn(
     hasCredentials: hasRuntimeCredentials(),
     engineEnv: process.env.MARGIN_ENGINE,
   });
-  if (decision.route === "offline_planner") {
+  if (decision.route === "offline_planner" || decision.route === "host_command") {
     return runOfflineSessionTurn(input);
   }
-  try {
-    return await runPiSessionTurn(input);
-  } catch (err) {
-    if (process.env.MARGIN_ENGINE_STRICT === "1") throw err;
-    if (input.signal?.aborted) throw err;
-    const reason = err instanceof Error ? err.message : String(err);
-    const offline = await runOfflineSessionTurn(input);
-    return {
-      ...offline,
-      fallbackFrom: "pi",
-      fallbackReason: reason,
-      notes: [...(offline.notes ?? []), `fallback from pi: ${reason}`],
-    };
-  }
+  return runPiSessionTurn(input);
 }

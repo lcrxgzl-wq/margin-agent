@@ -23,6 +23,8 @@ export type PaperAgentContext = {
   tableCell?: Omit<TableCellChange, "after">;
   /** Host-read, bounded material excerpts available to a direct selection proposal. */
   sourceContext?: Array<{ sourceRef: string; text: string }>;
+  /** Workspace Skill root used only to compile explicitly selected Quick Edit skills. */
+  skillsRoot?: string;
   signal?: AbortSignal;
   /** Prefer single-shot LLM proposals over full pi tool loop (snappier UX). */
   preferSimple?: boolean;
@@ -58,10 +60,8 @@ export type PaperAgentResult = {
   engine: "pi" | "simple";
   proposals: Omit<Proposal, "id" | "createdAt" | "status">[];
   comments?: AgentComment[];
-  /** Set when requested engine was pi but simple ran instead. */
-  fallbackFrom?: "pi";
-  fallbackReason?: string;
   notes?: string[];
   /** Human-readable tool/step trail for UI. */
   steps?: string[];
+  toolAudit?: import("./pi-loop.js").ToolAuditEvent[];
 };

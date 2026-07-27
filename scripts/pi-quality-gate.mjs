@@ -103,7 +103,6 @@ const child = spawn(
       MARGIN_PORT: port,
       MARGIN_NO_OPEN: "1",
       MARGIN_ENGINE: "pi",
-      MARGIN_ENGINE_STRICT: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
   },
@@ -153,7 +152,7 @@ try {
     throw new Error(`run not done: ${JSON.stringify(run)}`);
   }
   if (run.engine !== "pi") {
-    throw new Error(`expected engine=pi, got ${run.engine} (fallback not allowed under STRICT)`);
+    throw new Error(`expected engine=pi, got ${run.engine} (a started Pi run must not fall back)`);
   }
   if (!run.proposalIds?.length) {
     throw new Error(

@@ -8,6 +8,7 @@ export type RemoteMcpTool = {
   name: string;
   description: string;
   readOnly: boolean;
+  inputSchema: Record<string, unknown>;
 };
 
 export type RemoteMcpServer = {
@@ -15,7 +16,7 @@ export type RemoteMcpServer = {
   name: string;
   url: string;
   token?: string;
-  enabledTools: Array<Pick<RemoteMcpTool, "name" | "description">>;
+  enabledTools: Array<Pick<RemoteMcpTool, "name" | "description" | "inputSchema">>;
 };
 
 type RemoteMcpStore = { servers: RemoteMcpServer[] };
@@ -24,10 +25,20 @@ const MAX_SERVERS = 8;
 const MAX_TOOLS = 100;
 const MAX_RESULT_CHARS = 64_000;
 const MAX_TOKEN_CHARS = 8_192;
+const MAX_SCHEMA_CHARS = 32_000;
 const TIMEOUT_MS = 20_000;
 
 function settingsPath(workspaceRoot: string): string {
   return path.join(workspaceRoot, ".margin", "mcp-settings.json");
+}
+
+function normalizeInputSchema(value: unknown): Record<string, unknown> {
+  const candidate = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : { type: "object" };
+  const serialized = JSON.stringify(candidate);
+  if (serialized.length > MAX_SCHEMA_CHARS) throw new Error("MCP tool input schema is too large");
+  return JSON.parse(serialized) as Record<string, unknown>;
 }
 
 export function normalizeRemoteMcpUrl(raw: string): string {
@@ -93,6 +104,7 @@ export function readRemoteMcpStore(workspaceRoot: string): RemoteMcpStore {
                 .map((tool) => ({
                   name: tool.name,
                   description: typeof tool.description === "string" ? tool.description.slice(0, 500) : "",
+                  inputSchema: normalizeInputSchema(tool.inputSchema),
                 }))
             : [];
           return [{
@@ -176,6 +188,7 @@ export async function discoverRemoteMcp(input: {
       name: tool.name,
       description: tool.description?.slice(0, 500) ?? "",
       readOnly: tool.annotations?.readOnlyHint === true && tool.annotations?.destructiveHint !== true,
+      inputSchema: normalizeInputSchema(tool.inputSchema),
     }));
   });
   return { url, tools, latencyMs: Math.max(0, Date.now() - started) };
@@ -209,7 +222,7 @@ export async function saveRemoteMcpServer(
   const requested = new Set(input.enabledTools.filter(Boolean));
   const enabledTools = discovered.tools
     .filter((tool) => tool.readOnly && requested.has(tool.name))
-    .map(({ name, description }) => ({ name, description }));
+    .map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
   if (!enabledTools.length) throw new Error("至少选择一个只读 MCP 工具");
   if (requested.size !== enabledTools.length) {
     throw new Error("所选 MCP 工具不存在、未标记只读或具有破坏性");
@@ -257,6 +270,7 @@ export function listEnabledRemoteMcpTools(workspaceRoot: string) {
       serverName: server.name,
       name: tool.name,
       description: tool.description,
+      inputSchema: tool.inputSchema,
     })),
   );
 }

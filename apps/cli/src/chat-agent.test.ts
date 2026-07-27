@@ -43,6 +43,13 @@ describe("buildTranscriptPayload", () => {
       notes: Array.from({ length: 20 }, () => "n".repeat(600)),
       loadedSkills: [],
       sourcePaths: Array.from({ length: 60 }, (_, index) => `source-${index}.md`),
+      toolAudit: Array.from({ length: 30 }, (_, index) => ({
+        toolCallId: `call-${index}`,
+        toolName: "get_block",
+        status: "completed" as const,
+        durationMs: index + 0.9,
+        args: { blockId: `b${index}` },
+      })),
     });
 
     expect(payload.steps).toHaveLength(24);
@@ -50,6 +57,8 @@ describe("buildTranscriptPayload", () => {
     expect(payload.notes).toHaveLength(12);
     expect(payload.notes?.every((note) => note.length === 500)).toBe(true);
     expect(payload.sourcePaths).toHaveLength(50);
+    expect(payload.toolAudit).toHaveLength(24);
+    expect(payload.toolAudit?.at(-1)).toMatchObject({ durationMs: 29 });
     expect(payload).not.toHaveProperty("toolTrail");
   });
 
@@ -94,12 +103,12 @@ describe("buildTranscriptPayload", () => {
 });
 
 describe("workspace bridge extensions", () => {
-  it("omits MCP tools until the user enables at least one read-only tool", () => {
+  it("never exposes configured MCP tools to the agent bridge", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-agent-"));
     dirs.push(root);
     const workspace = { root } as Workspace;
 
-    expect(createWorkspaceBridge(workspace).mcp).toBeUndefined();
+    expect("mcp" in createWorkspaceBridge(workspace)).toBe(false);
 
     fs.mkdirSync(path.join(root, ".margin"), { recursive: true });
     fs.writeFileSync(
@@ -115,7 +124,7 @@ describe("workspace bridge extensions", () => {
       "utf8",
     );
 
-    expect(createWorkspaceBridge(workspace).mcp).toBeDefined();
+    expect("mcp" in createWorkspaceBridge(workspace)).toBe(false);
   });
 
   it("passes the unlimited-read switch through bridge.readText", async () => {

@@ -48,7 +48,13 @@ import {
   type PersistedReviewThread,
   type Workspace,
 } from "@margin/storage-local";
-import { isUserFacingPhase, runBlockScan, resolveEngine } from "@margin/agent";
+import {
+  isUserFacingPhase,
+  PiLoopFailure,
+  runBlockScan,
+  resolveEngine,
+  type ToolAuditEvent,
+} from "@margin/agent";
 import {
   contentHash,
   type ProposalOperationKind,
@@ -116,12 +122,11 @@ type RunState = {
   commentCount?: number;
   engine?: string;
   preferredEngine?: string;
-  fallbackFrom?: string;
-  fallbackReason?: string;
   notes?: string[];
   citeDisclaimer?: string;
   phase?: string;
   steps?: string[];
+  toolAudit?: ToolAuditEvent[];
 };
 
 type AppState = {
@@ -159,8 +164,15 @@ async function main() {
   await recoverDecidedProposals(workspace);
   await reconcileRegisteredDocxDocuments(workspace);
   loadAndApplyLlmSettings(workspacePath);
+  const configuredProfileId = readLlmSettingsStore(workspacePath).harnessId;
+  if (configuredProfileId) getHarness(configuredProfileId.trim());
 
   const llmPublic = () => publicLlmSettings(readLlmSettingsStore(workspacePath));
+  const resolveHarnessId = (requested?: string | null) => {
+    const configured = readLlmSettingsStore(workspacePath).harnessId;
+    const requestedId = typeof requested === "string" ? requested.trim() : "";
+    return getHarness(requestedId || configured?.trim() || undefined).id;
+  };
 
   const resolveConnectionDraft = (body: LlmConnectionBody = {}) =>
     resolveLlmConnectionInput(readLlmSettingsStore(workspacePath), body, {
@@ -276,7 +288,7 @@ async function main() {
           documentId,
           revision: doc.revision,
           blocks,
-          harnessId: opts?.harnessId,
+          harnessId: resolveHarnessId(opts?.harnessId),
           instruction: opts?.instruction,
           selectionText: opts?.selectionText,
           selectionStart: opts?.selectionStart,
@@ -284,6 +296,7 @@ async function main() {
           targetLanguage: opts?.targetLanguage,
           tableCell: opts?.tableCell,
           sourceContext,
+          skillsRoot: path.join(workspace.root, ".margin", "skills"),
           signal,
           preferSimple: opts?.preferSimple ?? false,
         },
@@ -333,11 +346,10 @@ async function main() {
         commentCount: scan.comments?.length ?? 0,
         engine: scan.engine,
         preferredEngine: "pi",
-        fallbackFrom: scan.fallbackFrom,
-        fallbackReason: scan.fallbackReason,
         notes: scan.notes,
         phase: scan.steps?.at(-1) ?? "完成",
         steps: scan.steps,
+        toolAudit: scan.toolAudit,
         citeDisclaimer:
           "cite_check 仅检查引用形态，未验证文献存在性、真实性或内容支持关系。",
       });
@@ -351,6 +363,9 @@ async function main() {
         status: "error",
         error: e instanceof Error ? e.message : String(e),
         phase: "失败",
+        ...(e instanceof PiLoopFailure
+          ? { notes: e.notes, toolAudit: e.toolAudit }
+          : {}),
       });
     }
   };
@@ -483,7 +498,7 @@ async function main() {
 
   app.get("/api/v1/session", async (req) => {
     requireAuth(state, req.headers.authorization);
-    const harness = getHarness();
+    const harness = getHarness(resolveHarnessId());
     const opened = state.agent.bag.documentId
       ? {
           document: getDocument(workspace, state.agent.bag.documentId),
@@ -545,6 +560,9 @@ async function main() {
     requireAuth(state, req.headers.authorization);
     const body = req.body ?? {};
     try {
+      if (typeof body.harnessId === "string" && body.harnessId.trim()) {
+        getHarness(body.harnessId.trim());
+      }
       const current = activeProfile(readLlmSettingsStore(workspacePath));
       await saveLlmSettings(workspacePath, buildLlmSettingsUpdate(body, current.id));
       return llmPublic();
@@ -577,7 +595,14 @@ async function main() {
   app.get("/api/v1/harnesses", async (req) => {
     requireAuth(state, req.headers.authorization);
     return {
-      harnesses: listHarnesses().map((h) => ({ id: h.id, title: h.title })),
+      harnesses: listHarnesses().map((h) => ({
+        id: h.id,
+        title: h.title,
+        capabilities: h.capabilities,
+        skills: h.skills,
+        limits: h.limits,
+        approvals: h.approvals,
+      })),
       defaultId: getHarness().id,
     };
   });
@@ -798,7 +823,7 @@ async function main() {
       documentId,
       selected.map((b) => b.id),
       {
-        harnessId: req.body?.harnessId,
+        harnessId: resolveHarnessId(req.body?.harnessId),
         instruction: instruction || undefined,
         selectionText: selectionText?.trim() ? selectionText : undefined,
         selectionStart,
@@ -1259,7 +1284,7 @@ async function main() {
           cascadeBlockIds: req.body.cascadeBlockIds,
           sourcePaths: switchedDocument ? [] : req.body.sourcePaths,
           chatMode: req.body.chatMode === "socratic" ? "socratic" : "direct",
-          harnessId: req.body.harnessId,
+          harnessId: resolveHarnessId(req.body.harnessId),
           threadId,
         });
         if (previousDocumentId && state.agent.bag.documentId !== previousDocumentId) {
@@ -1287,7 +1312,6 @@ async function main() {
         clarificationRounds: turn.clarificationRounds,
         sourcePaths: turn.sourcePaths,
         cascadeOffer: turn.cascadeOffer,
-        fallbackFrom: turn.fallbackFrom,
         notes: turn.notes,
         task: turn.task,
       };
@@ -1382,7 +1406,7 @@ async function main() {
           cascadeBlockIds: req.body.cascadeBlockIds,
           sourcePaths: switchedDocument ? [] : req.body.sourcePaths,
           chatMode: req.body.chatMode === "socratic" ? "socratic" : "direct",
-          harnessId: req.body.harnessId,
+          harnessId: resolveHarnessId(req.body.harnessId),
           threadId,
           signal: ac.signal,
           onProgress: (phase) => {
@@ -1435,7 +1459,6 @@ async function main() {
         sourcePaths: turn.sourcePaths,
         cascadeOffer: turn.cascadeOffer,
         notes: turn.notes,
-        fallbackFrom: turn.fallbackFrom,
         task: turn.task,
       });
       reply.raw.end();

@@ -75,6 +75,10 @@ describe("direct proposal completion", () => {
     expect(requestBody).not.toHaveProperty("response_format");
     expect(requestBody).not.toHaveProperty("temperature");
     expect(requestBody?.max_tokens).toBe(4096);
+    const messages = requestBody?.messages as Array<{ content?: string }>;
+    expect(messages[0]?.content).toContain("禁止编造文献");
+    expect(messages[0]?.content).toContain("风格：问题意识清晰、文献对话、克制可辩护");
+    expect(messages[0]?.content).toContain('<skill name="argument-revision-zh">');
   });
 
   it("uses an OpenAI-compatible chat completion without tool fields", async () => {
@@ -317,34 +321,37 @@ describe("direct proposal completion", () => {
     })).rejects.toThrow(/selection replacement/);
   });
 
-  it("retries once without tools when a translation repeats the complete source selection", async () => {
+  it("rejects an invalid translation after exactly one model request", async () => {
     process.env.MARGIN_API_FORMAT = "openai";
     process.env.MARGIN_API_KEY = "test-key";
-    const replacements = ["Original paragraph.（原始段落）", "原始段落"];
     const requestBodies: Array<Record<string, unknown>> = [];
     vi.stubGlobal("fetch", vi.fn(async (_input, init?: RequestInit) => {
       requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
-      const replacement = replacements.shift();
       return new Response(JSON.stringify({
         choices: [{
           message: {
-            content: JSON.stringify({ blockId: "b1", replacement, rationale: "Translated.", risk: "language", evidence: [] }),
+            content: JSON.stringify({
+              blockId: "b1",
+              replacement: "Original paragraph.（原始段落）",
+              rationale: "Translated.",
+              risk: "language",
+              evidence: [],
+            }),
           },
         }],
       }), { status: 200, headers: { "Content-Type": "application/json" } });
     }));
 
-    const proposal = await generateDirectProposal({
+    await expect(generateDirectProposal({
       block: { ...block, text: "Before Original paragraph. After" },
       selectionText: "Original paragraph.",
       selectionStart: 7,
       instruction: "Translate to Chinese.",
       operation: "translate",
       targetLanguage: "zh-CN",
-    });
+    })).rejects.toThrow(/bilingual source-plus-translation/);
 
-    expect(proposal.operation?.selection?.after).toBe("原始段落");
-    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies).toHaveLength(1);
     for (const body of requestBodies) {
       expect(body).not.toHaveProperty("tools");
       expect(body).not.toHaveProperty("tool_choice");
@@ -352,33 +359,33 @@ describe("direct proposal completion", () => {
     }
   });
 
-  it("rejects a short source selection retained with changed case", async () => {
+  it("rejects a short retained source selection without retrying", async () => {
     process.env.MARGIN_API_FORMAT = "openai";
     process.env.MARGIN_API_KEY = "test-key";
-    const replacements = ["source（来源）", "来源"];
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
       choices: [{
         message: {
           content: JSON.stringify({
             blockId: "b1",
-            replacement: replacements.shift(),
+            replacement: "source（来源）",
             rationale: "Translated.",
             risk: "language",
             evidence: [],
           }),
         },
       }],
-    }), { status: 200, headers: { "Content-Type": "application/json" } })));
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
 
-    const proposal = await generateDirectProposal({
+    await expect(generateDirectProposal({
       block: { ...block, text: "Before Source After" },
       selectionText: "Source",
       selectionStart: 7,
       operation: "translate",
       targetLanguage: "zh-CN",
-    });
+    })).rejects.toThrow(/bilingual source-plus-translation/);
 
-    expect(proposal.operation?.selection?.after).toBe("来源");
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("rejects a structurally foreign proposal", async () => {

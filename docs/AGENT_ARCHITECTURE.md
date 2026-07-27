@@ -5,11 +5,11 @@
 
 ## 裁决摘要（强制）
 
-1. **默认引擎 = pi + fallback**（无 Key / 失败 → simple + 显式 `fallbackReason`）；`MARGIN_ENGINE=simple` 仅显式/测试；`STRICT` 禁止降级。  
+1. **执行前选路，执行后不重跑**：有凭据时开放任务只运行一次 Pi；无凭据或 `MARGIN_ENGINE=simple` 才在启动前选择离线流程。Pi 超时/失败直接报错，禁止用第二套 planner 重放。
 2. **工具副作用**：前八个工具不持久化、不 apply；评论工具名 **`propose_block_comment`**（仅写入本次 ScanRun）；`finish_scan` 只终止。  
 3. **提案契约**：Draft 含 `blockId` + `baseRevision` + `baseHash` + after/rationale；host 持久化后不可变；Apply 仅 CAS。  
 4. **`cite_check`**：每条结果必须 `heuristic_only: true` + `verification: "not_verified"`；文案声明未验证真伪。  
-5. **验收**：工具单测 + fallback/STRICT 路径；不把无 Key fallback 冒充 pi 通过。
+5. **验收**：工具单测 + 无凭据预选离线 + Pi 失败不重放；不得把离线执行冒充 Pi。
 
 ## 产品命题
 
@@ -26,7 +26,7 @@ Host 命令（apply/reject/…）不可见 → `PaperAgentRuntime` → 九工具
 
 ## 本轮验收
 
-核心工具与 packs 可测；comments 会话返回；默认 pi+fallback；capabilities 报 preferred/actual；test+smoke 绿；无云/Desktop/真文献库。TipTap 仅保留旧 Markdown 兼容。
+核心工具与 packs 可测；comments 会话返回；有凭据时单 Pi、无凭据时预选离线；capabilities 报 preferred/actual；test+smoke 绿；无云/Desktop/真文献库。TipTap 仅保留旧 Markdown 兼容。
 
 ## 文档内核（第 40 轮）
 
@@ -37,9 +37,10 @@ Host 命令（apply/reject/…）不可见 → `PaperAgentRuntime` → 九工具
 
 详见实现：`packages/agent/`。
 
-## 提示词与模块化（2026-07 重构后现状）
+## Profile、提示词与模块化（2026-07 重构后现状）
 
-- **harness 三档**：`social-science-zh`（默认，skillScope all）/ `office-zh`（core）/ `minimal`（none）。人格 = 共享骨架 CORE_CONTRACT（身份/编辑契约/微观选区优先/证据先行/寻址模型/澄清/联动底线）+ 参数化约束（fabricationBan/placeholder/evidence），办公档是"更松的同一骨架"而非平行复制。
-- **skills 两层归属**：SKILL.md frontmatter 可选 `packs:`（缺省 core）；索引与 `load_skill` 按 harness skillScope 过滤。bundled：argument-revision-zh / socratic-revision-zh / source-grounded-writing（academic）、fill-table-from-csv（data-analysis）、cascade-consistency-zh / format-tidy-zh（core）。
+- **AgentProfile 三档**：`social-science-zh`（默认）/ `office-zh` / `minimal`。每档只组合 instructions、model、capabilities、skills、limits、approvals；未知 id 直接拒绝。`minimal` 的 Pi 工具面仅保留块读取、提案与结束。
+- **三条执行路径**：纯列文件/打开命令走 Host；选区重写/翻译/润色走单次 Quick Edit；开放任务只走一次 Pi。三者共用同一 profile 编译器，Quick Edit 可用 `@skill-name` 显式内联已导入 Skill。
+- **skills 两层归属**：SKILL.md frontmatter 可选 `packs:`（缺省 core）；索引与 `load_skill` 按 profile 的 skills.scope 过滤。bundled：argument-revision-zh / socratic-revision-zh / source-grounded-writing（academic）、fill-table-from-csv（data-analysis）、cascade-consistency-zh / format-tidy-zh（core）。
 - **工具面**：上节"九工具"是扫描期原始面；会话面已扩展（open_document / read_workspace_file / propose_* / offer_cascade / load_skill 等，见 `packages/agent/src/session-tools.ts`）。
-- **无工具 completion**（direct proposal / discuss）注入 `directIdentity()` 两行身份，不带工具与联动噪声；会话 hint（cascade/source/clarification）的 load_skill 指针按 scope 门控。
+- **运行时边界**：Pi 用 `transformContext` 按完整用户轮次裁剪消息和工具输出；`beforeToolCall` 二次验权，`afterToolCall` 产出脱敏审计。远程 MCP 配置与输入 schema 可保留，但在 Host 完成逐次参数确认前不向模型暴露调用工具。

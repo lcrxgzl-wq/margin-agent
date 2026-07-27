@@ -102,10 +102,11 @@ function runtimeBaseURL(
   return canonicalizeProviderBaseURL(value, format);
 }
 
-export function resolveRuntimeModel(): ResolvedRuntimeModel {
+export function resolveRuntimeModel(modelOverride?: string): ResolvedRuntimeModel {
   const format = apiFormat();
   const style = authStyle();
   const modelId =
+    modelOverride?.trim() ||
     process.env.MARGIN_MODEL?.trim() ||
     (format === "anthropic" ? "claude-sonnet-4-6" : "gpt-4o-mini");
   const baseURL = runtimeBaseURL(format);

@@ -180,43 +180,66 @@ describe("attached source tools", () => {
   });
 });
 
-describe("remote MCP tools", () => {
-  it("exposes only the host-provided MCP list and delegates calls", async () => {
-    const calls: unknown[] = [];
+describe("profile capability boundary", () => {
+  it("keeps minimal Pi limited to essential proposal tools", () => {
     const tools = createSessionTools(
       {
-        listSourceFiles: () => [],
-        readText: () => ({ relativePath: "", text: "", bytes: 0 }),
-        writeText: async () => ({ relativePath: "", bytes: 0, created: true }),
+        listSourceFiles: () => ["notes.md"],
+        readText: () => ({ relativePath: "notes.md", text: "", bytes: 0 }),
+        writeText: async () => ({ relativePath: "notes.md", bytes: 0, created: true }),
         openDocument: () => { throw new Error("unused"); },
-        mcp: {
-          listTools: async () => [{
-            serverId: "mcp-1",
-            serverName: "Library",
-            name: "lookup",
-            description: "Read evidence",
-          }],
-          callTool: async (input) => {
-            calls.push(input);
-            return "evidence-result";
-          },
-        },
       },
       { revision: 0, blocks: [] },
       [],
       [],
       {},
+      {
+        harnessId: "minimal",
+        enforceProfile: true,
+        workspaceWriteApprovedPaths: ["notes.md"],
+      },
     );
-    const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
-    const listed = await byName.list_mcp_tools!.execute("list", {});
-    expect(JSON.parse(listed.content[0]!.type === "text" ? listed.content[0].text : "{}"))
-      .toMatchObject({ tools: [{ name: "lookup" }] });
-    const called = await byName.call_mcp_tool!.execute("call", {
-      serverId: "mcp-1",
-      name: "lookup",
-      arguments: { query: "sport" },
+    const names = tools.map((tool) => tool.name);
+    expect(names).toContain("get_block");
+    expect(names).toContain("propose_block_edit");
+    expect(names).toContain("finish_turn");
+    expect(names).not.toContain("list_workspace_files");
+    expect(names).not.toContain("write_workspace_file");
+    expect(names).not.toContain("load_skill");
+    expect(names.length).toBeLessThanOrEqual(5);
+  });
+
+  it("limits an approved write to the exact path named by the user", async () => {
+    const written: string[] = [];
+    const tools = createSessionTools(
+      {
+        listSourceFiles: () => [],
+        readText: () => ({ relativePath: "", text: "", bytes: 0 }),
+        writeText: async (relativePath, content) => {
+          written.push(relativePath);
+          return { relativePath, bytes: content.length, created: true };
+        },
+        openDocument: () => { throw new Error("unused"); },
+      },
+      { revision: 0, blocks: [] },
+      [],
+      [],
+      {},
+      {
+        harnessId: "social-science-zh",
+        enforceProfile: true,
+        workspaceWriteApprovedPaths: ["notes/approved.md"],
+      },
+    );
+    const write = tools.find((tool) => tool.name === "write_workspace_file")!;
+    await expect(write.execute("wrong", {
+      relativePath: "notes/other.md",
+      content: "no",
+    })).rejects.toThrow(/not approved/);
+    await write.execute("right", {
+      relativePath: "notes/approved.md",
+      content: "ok",
     });
-    expect(called.content[0]).toMatchObject({ type: "text", text: "evidence-result" });
-    expect(calls).toEqual([{ serverId: "mcp-1", name: "lookup", arguments: { query: "sport" } }]);
+    expect(written).toEqual(["notes/approved.md"]);
   });
 });

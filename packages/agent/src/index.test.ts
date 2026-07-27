@@ -70,7 +70,6 @@ describe("paper agent adapter", () => {
         (e) => phases.push(e.phase),
       );
       expect(result.engine).toBe("simple");
-      expect(result.fallbackFrom).toBeUndefined();
       expect(result.proposals.length).toBeGreaterThan(0);
       expect(result.comments?.length).toBeGreaterThan(0);
       expect(result.steps?.length).toBeGreaterThan(0);
@@ -82,11 +81,9 @@ describe("paper agent adapter", () => {
     }
   });
 
-  it("falls back from pi without key and records reason", async () => {
+  it("selects simple before execution when no key exists", async () => {
     const prev = process.env.MARGIN_ENGINE;
-    const strict = process.env.MARGIN_ENGINE_STRICT;
     delete process.env.MARGIN_ENGINE;
-    delete process.env.MARGIN_ENGINE_STRICT;
     delete process.env.OPENAI_API_KEY;
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.MARGIN_API_KEY;
@@ -99,38 +96,10 @@ describe("paper agent adapter", () => {
         blocks: [sampleBlocks[1]!],
       });
       expect(result.engine).toBe("simple");
-      expect(result.fallbackFrom).toBe("pi");
-      expect(result.fallbackReason).toMatch(/API key/i);
+      expect(result.proposals).toHaveLength(1);
     } finally {
       if (prev === undefined) delete process.env.MARGIN_ENGINE;
       else process.env.MARGIN_ENGINE = prev;
-      if (strict === undefined) delete process.env.MARGIN_ENGINE_STRICT;
-      else process.env.MARGIN_ENGINE_STRICT = strict;
-    }
-  });
-
-  it("STRICT mode does not fallback", async () => {
-    const prev = process.env.MARGIN_ENGINE;
-    const strict = process.env.MARGIN_ENGINE_STRICT;
-    process.env.MARGIN_ENGINE = "pi";
-    process.env.MARGIN_ENGINE_STRICT = "1";
-    delete process.env.OPENAI_API_KEY;
-    delete process.env.ANTHROPIC_API_KEY;
-    delete process.env.MARGIN_API_KEY;
-    delete process.env.MARGIN_BASE_URL;
-    try {
-      await expect(
-        runBlockScan({
-          documentId: "d1",
-          revision: 0,
-          blocks: [sampleBlocks[1]!],
-        }),
-      ).rejects.toThrow(/API key/i);
-    } finally {
-      if (prev === undefined) delete process.env.MARGIN_ENGINE;
-      else process.env.MARGIN_ENGINE = prev;
-      if (strict === undefined) delete process.env.MARGIN_ENGINE_STRICT;
-      else process.env.MARGIN_ENGINE_STRICT = strict;
     }
   });
 
@@ -154,7 +123,6 @@ describe("paper agent adapter", () => {
     const previous = Object.fromEntries(
       [
         "MARGIN_ENGINE",
-        "MARGIN_ENGINE_STRICT",
         "MARGIN_API_FORMAT",
         "MARGIN_BASE_URL",
         "MARGIN_API_KEY",
@@ -164,7 +132,6 @@ describe("paper agent adapter", () => {
       ].map((key) => [key, process.env[key]]),
     );
     process.env.MARGIN_ENGINE = "pi";
-    process.env.MARGIN_ENGINE_STRICT = "1";
     delete process.env.MARGIN_BASE_URL;
     delete process.env.MARGIN_API_KEY;
     delete process.env.OPENAI_API_KEY;
@@ -182,7 +149,6 @@ describe("paper agent adapter", () => {
         ["b1"],
       );
       expect(result.engine).toBe("simple");
-      expect(result.fallbackFrom).toBeUndefined();
       expect(result.proposals).toHaveLength(1);
       expect(result.proposals[0]).toMatchObject({
         documentId: "d1",

@@ -1,5 +1,5 @@
 import type { Proposal } from "@margin/domain";
-import { composeSystemPrompt } from "@margin/harness";
+import { composeSystemPrompt, getAgentProfile } from "@margin/harness";
 import { getHeuristicComments } from "./packs/registry.js";
 import { runPiAgentLoop } from "./pi-loop.js";
 import { assertPiLoopCompleted } from "./pi-outcome.js";
@@ -14,14 +14,14 @@ import type {
 
 export { createPaperTools } from "./pi-tools.js";
 
-function maxTurns(): number {
-  const n = Number(process.env.MARGIN_PI_MAX_TURNS ?? 16);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 16;
+function maxTurns(fallback: number): number {
+  const n = Number(process.env.MARGIN_PI_MAX_TURNS ?? fallback);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
-function timeoutMs(): number {
-  const n = Number(process.env.MARGIN_PI_TIMEOUT_MS ?? 120_000);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 120_000;
+function timeoutMs(fallback: number): number {
+  const n = Number(process.env.MARGIN_PI_TIMEOUT_MS ?? fallback);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
 export async function runPiBlockScan(
@@ -29,7 +29,8 @@ export async function runPiBlockScan(
   blockIds?: string[],
   onProgress?: ScanProgressHandler,
 ): Promise<PaperAgentResult> {
-  const { model, apiKey } = resolveRuntimeModel();
+  const profile = getAgentProfile(ctx.harnessId);
+  const { model, apiKey } = resolveRuntimeModel(profile.model);
   if (!hasRuntimeCredentials()) {
     throw new Error(
       "pi engine requires API key or Base URL (configure in Settings / CC Switch)",
@@ -80,8 +81,11 @@ export async function runPiBlockScan(
     messages: [],
     model,
     apiKey,
-    maxTurns: maxTurns(),
-    timeoutMs: timeoutMs(),
+    maxTurns: maxTurns(profile.limits.maxTurns),
+    timeoutMs: timeoutMs(profile.limits.timeoutMs),
+    maxContextMessages: profile.limits.maxContextMessages,
+    maxContextChars: profile.limits.maxContextChars,
+    allowedToolNames: tools.map((tool) => tool.name),
     onProgress: (phase, tool) => emit(phase, tool),
     signal: ctx.signal,
   });
@@ -110,6 +114,7 @@ export async function runPiBlockScan(
     comments: merged,
     notes: notes.length ? notes : undefined,
     steps,
+    toolAudit: result.toolAudit,
   };
 }
 

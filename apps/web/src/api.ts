@@ -184,6 +184,7 @@ export type McpToolSummary = {
   name: string;
   description: string;
   readOnly?: boolean;
+  inputSchema?: Record<string, unknown>;
 };
 
 export type McpServerSummary = {
@@ -495,8 +496,6 @@ export async function waitRun(
       status: string;
       error?: string;
       engine?: string;
-      fallbackFrom?: string;
-      fallbackReason?: string;
       notes?: string[];
       commentCount?: number;
       citeDisclaimer?: string;
@@ -601,7 +600,6 @@ export async function chatTurn(body: {
     opened?: { document: DocumentMeta; blocks: Block[] };
     run?: {
       engine?: string;
-      fallbackFrom?: string;
       notes?: string[];
       citeDisclaimer?: string;
     };

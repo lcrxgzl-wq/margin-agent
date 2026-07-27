@@ -1,5 +1,5 @@
 /**
- * Writing agent runtime: pi-agent-core tool loop (default) + simple fallback.
+ * Writing agent runtime: pi-agent-core tool loop (default) + explicit offline mode.
  * Uses pi as a generic agent shell — not a coding agent fork.
  * Never forks pi-coding-agent; no bash / arbitrary FS / apply tools.
  */
@@ -11,6 +11,7 @@ import { getHarness } from "@margin/harness";
 import { getHeuristicComments } from "./packs/registry.js";
 import { generateDirectProposal } from "./direct-proposal.js";
 import { runPiBlockScan } from "./pi-runner.js";
+import { hasRuntimeCredentials } from "./resolve-model.js";
 import type {
   PaperAgentContext,
   PaperAgentResult,
@@ -46,10 +47,12 @@ export { AnalysisRunStore } from "./data/store.js";
 export { buildOutline, searchBlocks } from "./outline.js";
 export { toolPhaseLabel, isUserFacingPhase } from "./progress.js";
 export { runPiAgentLoop } from "./pi-loop.js";
+export { PiLoopFailure } from "./pi-outcome.js";
 export type {
   PiLoopOptions,
   PiLoopOutcome,
   PiLoopResult,
+  ToolAuditEvent,
 } from "./pi-loop.js";
 export {
   decideRoute,
@@ -115,25 +118,10 @@ export async function runBlockScan(
     return runDirectBlockProposal(ctx, blockIds, onProgress);
   }
   const engine = resolveEngine();
-  // Full Pi: only MARGIN_ENGINE=simple skips the pi loop entirely.
+  // Decide offline before starting Pi. Once Pi starts, failures are never replayed.
   if (engine !== "simple") {
-    try {
-      return await runPiBlockScan(ctx, blockIds, onProgress);
-    } catch (err) {
-      if (ctx.signal?.aborted) throw err;
-      if (process.env.MARGIN_ENGINE_STRICT === "1") throw err;
-      const reason = err instanceof Error ? err.message : String(err);
-      onProgress?.({ phase: "回退 simple 引擎", detail: reason });
-      const fallback = await runSimpleBlockScan(ctx, blockIds, onProgress);
-      return {
-        ...fallback,
-        engine: "simple",
-        fallbackFrom: "pi",
-        fallbackReason: reason,
-        notes: [...(fallback.notes ?? []), `fallback from pi: ${reason}`],
-        steps: [...(fallback.steps ?? []), "回退 simple 引擎"],
-      };
-    }
+    if (!hasRuntimeCredentials()) return runSimpleBlockScan(ctx, blockIds, onProgress);
+    return runPiBlockScan(ctx, blockIds, onProgress);
   }
   return runSimpleBlockScan(ctx, blockIds, onProgress);
 }
@@ -177,6 +165,7 @@ async function runDirectBlockProposal(
     operation: ctx.operation,
     targetLanguage: ctx.targetLanguage,
     sourceContext: ctx.sourceContext,
+    workspaceSkillsRoot: ctx.skillsRoot,
     signal: ctx.signal,
   });
   emit("生成修订提案", block.id);
@@ -234,6 +223,7 @@ async function runDirectMultiBlockProposal(
       operation: ctx.operation,
       targetLanguage: ctx.targetLanguage,
       sourceContext: ctx.sourceContext,
+      workspaceSkillsRoot: ctx.skillsRoot,
       signal: ctx.signal,
     });
     proposals.push({
@@ -318,7 +308,7 @@ export function createPaperAgentAdapter() {
     id: "margin-paper-agent",
     version: "0.1.0",
     notes:
-      "Agent-first: default pi tool loop (9 tools); MARGIN_ENGINE=simple for offline/tests; STRICT disables fallback.",
+      "Agent-first: one pi tool loop; missing credentials or MARGIN_ENGINE=simple selects offline before execution.",
     newRunId: () => randomUUID(),
     runBlockScan,
     hash: contentHash,

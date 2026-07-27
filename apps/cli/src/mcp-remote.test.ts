@@ -62,7 +62,11 @@ describe("remote MCP boundary", () => {
   it("discovers, persists, and calls only explicitly enabled read-only tools", async () => {
     const discovered = await discoverRemoteMcp({ url });
     expect(discovered.tools).toEqual([
-      expect.objectContaining({ name: "lookup", readOnly: true }),
+      expect.objectContaining({
+        name: "lookup",
+        readOnly: true,
+        inputSchema: expect.objectContaining({ type: "object" }),
+      }),
       expect.objectContaining({ name: "delete_everything", readOnly: false }),
     ]);
 
@@ -76,6 +80,9 @@ describe("remote MCP boundary", () => {
       id: saved.id,
       tokenSet: false,
       enabledTools: [{ name: "lookup" }],
+    });
+    expect(publicRemoteMcpServers(root)[0]?.enabledTools[0]?.inputSchema).toMatchObject({
+      type: "object",
     });
     await expect(callEnabledRemoteMcpTool(root, {
       serverId: saved.id,

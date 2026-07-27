@@ -7,8 +7,6 @@ describe("PolicyRouter (full Pi)", () => {
   it.each([
     ["你好", "pi-default"],
     ["who are you", "pi-default"],
-    ["有哪些文件", "pi-default"],
-    ["打开样章", "pi-default"],
     ["重写这一段，使其更简洁", "pi-default"],
     ["讨论研究设计", "pi-default"],
     ["打开样章然后重写第一段", "pi-default"],
@@ -19,8 +17,18 @@ describe("PolicyRouter (full Pi)", () => {
     });
   });
 
+  it.each(["有哪些文件", "列出工作区文件", "list files", "ls", "打开样章", "打开 notes/a.md"])(
+    "routes deterministic host command %s without invoking Pi",
+    (message) => {
+      expect(decideRoute({ message, ...credentials })).toEqual({
+        route: "host_command",
+        matchedRule: "host-command",
+      });
+    },
+  );
+
   it("uses the offline planner without credentials for all categories", () => {
-    for (const message of ["讨论研究设计", "重写这一段", "打开样章", "你好", "有哪些文件"]) {
+    for (const message of ["讨论研究设计", "重写这一段", "你好"]) {
       expect(decideRoute({ message, hasCredentials: false })).toEqual({
         route: "offline_planner",
         matchedRule: "missing-credentials",

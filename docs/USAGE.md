@@ -42,7 +42,7 @@ Key 只保存在当前工作区的 `.margin/llm-settings.json`，不会发送到
 - 内置 Skill 随发布包提供；可从 `SKILL.md` 导入到当前工作区，大小上限 128 KiB，必须有 `name` 和 `description` frontmatter。
 - 工作区 Skill 可以覆盖同名内置 Skill，也可以在扩展面板移除；Skill 只提供方法文本，不获得 shell 或正文覆盖权限。
 - MCP 只支持显式配置的远程 HTTP(S) Streamable HTTP 服务；非 loopback 地址携带 Token 时必须使用 HTTPS。
-- 连接后只允许服务端标记为 read-only 且未标记 destructive 的工具。每个服务和工具数、响应大小、请求时间均有上限；MCP 输出只能作为上下文，不能直接写正文。
+- 连接时只允许保存服务端标记为 read-only 且未标记 destructive 的工具，并保留其输入 schema。当前版本尚无逐次参数确认，因此不会把 MCP 工具交给 Agent 调用；配置可保留，待 Host 确认流程完成后再启用。
 
 ## 本地边界
 

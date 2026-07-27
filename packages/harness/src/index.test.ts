@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  composeDirectPrompt,
   composeSystemPrompt,
   directIdentity,
   getHarness,
@@ -13,6 +14,8 @@ import {
   loadBundledSkill,
   loadAvailableSkill,
   removeWorkspaceSkill,
+  validateAgentProfile,
+  type AgentProfile,
 } from "./index.js";
 
 const roots: string[] = [];
@@ -24,16 +27,10 @@ afterEach(() => {
 describe("harness", () => {
   it("defaults to social-science-zh", () => {
     expect(getHarness().id).toBe("social-science-zh");
-    expect(getHarness().systemPrompt).toContain("文档写作与修订");
-    expect(getHarness().systemPrompt).toContain("证据底线");
-    expect(getHarness().toolProfile).toEqual([
-      "cite_check",
-      "style_lint",
-      "inspect_tabular_file",
-      "run_table_analysis",
-      "get_analysis_result",
-      "propose_block_edit_from_results",
-    ]);
+    expect(getHarness().instructions).toContain("文档写作与修订");
+    expect(getHarness().instructions).toContain("证据底线");
+    expect(getHarness().capabilities).toContain("review.academic");
+    expect(getHarness().capabilities).toContain("analysis.tabular");
   });
 
   it("lists harnesses", () => {
@@ -41,35 +38,46 @@ describe("harness", () => {
   });
 
   it("keeps minimal free of optional tools", () => {
-    expect(getHarness("minimal").toolProfile).toEqual([]);
+    expect(getHarness("minimal").capabilities).toEqual(["document.propose"]);
+    expect(getHarness("minimal").skills).toEqual({ scope: "none", direct: [] });
   });
 
   it("composes persona from shared skeleton + parameterized constraints", () => {
     for (const id of ["social-science-zh", "office-zh"] as const) {
       const h = getHarness(id);
-      expect(h.systemPrompt).toContain("propose_"); // 编辑契约（共享骨架）
-      expect(h.systemPrompt).toContain("选区"); // 微观选区优先（共享骨架）
+      expect(h.instructions).toContain("propose_"); // 编辑契约（共享骨架）
+      expect(h.instructions).toContain("选区"); // 微观选区优先（共享骨架）
     }
-    expect(getHarness("office-zh").systemPrompt).not.toContain("文献"); // 学术约束不进办公档
-    expect(getHarness("office-zh").toolProfile).toEqual([]);
+    expect(getHarness("office-zh").instructions).not.toContain("文献"); // 学术约束不进办公档
+    expect(getHarness("office-zh").capabilities).not.toContain("review.academic");
   });
 
   it("exposes office-zh in registry", () => {
     expect(listHarnesses().map((h) => h.id)).toContain("office-zh");
   });
 
-  it("directIdentity is persona-only: no tools, no cascade noise", () => {
+  it("directIdentity uses the selected profile constraints", () => {
     const identity = directIdentity("social-science-zh");
     expect(identity).toContain("你是 Margin");
-    expect(identity).not.toContain("offer_cascade");
-    expect(identity).not.toContain("工具");
     expect(identity).not.toContain("load_skill");
-    expect(directIdentity("minimal")).toBe(identity); // pack-invariant
+    expect(identity).toContain("禁止编造文献");
+    expect(directIdentity("minimal")).not.toContain("文献");
+  });
+
+  it("rejects unknown profile ids instead of silently using academic", () => {
+    expect(() => getHarness("novel")).toThrow(/Unknown agent profile/);
+  });
+
+  it("validates capability and limit boundaries", () => {
+    const profile = structuredClone(getHarness("minimal")) as AgentProfile;
+    profile.limits.maxTurns = 0;
+    expect(() => validateAgentProfile(profile)).toThrow(/maxTurns/);
   });
 
   it("composeSystemPrompt is Pi-short: persona + boundary + skills index", () => {
     const session = composeSystemPrompt("social-science-zh", "session");
     expect(session).toContain("文档写作与修订");
+    expect(session).toContain("风格：问题意识清晰、文献对话、克制可辩护");
     expect(session).toContain("禁止 bash");
     expect(session).toContain("available_skills");
     expect(session).toContain("argument-revision-zh");
@@ -136,6 +144,11 @@ describe("harness", () => {
     expect(loadAvailableSkill("interview-coding", root).body).toContain("attached evidence");
     expect(composeSystemPrompt("social-science-zh", "session", { workspaceSkillsRoot: root }))
       .toContain("interview-coding");
+    expect(composeDirectPrompt("social-science-zh", {
+      workspaceSkillsRoot: root,
+      instruction: "Use @interview-coding for this edit",
+    })).toContain("Only use attached evidence");
+    expect(composeDirectPrompt("minimal")).toContain("风格：保持原意，小幅改清晰度");
   });
 
   it("refuses to import through a symlinked skill directory", async () => {

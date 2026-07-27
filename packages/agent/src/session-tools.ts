@@ -1,7 +1,12 @@
 import { type AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { contentHash, type BlockSnapshot, type DocumentMeta, type TableCellProposalDraft } from "@margin/domain";
-import { getHarness, loadAvailableSkill } from "@margin/harness";
+import {
+  getHarness,
+  hasCapability,
+  loadAvailableSkill,
+  type AgentCapability,
+} from "@margin/harness";
 import { AnalysisRunStore } from "./data/store.js";
 import { createCascadeGate, type CascadeCandidate } from "./cascade.js";
 import { createPaperTools, type Draft } from "./pi-tools.js";
@@ -16,19 +21,6 @@ export type SessionDocBag = {
 
 export type WorkspaceBridge = {
   skillsRoot?: string;
-  mcp?: {
-    listTools: () => Promise<Array<{
-      serverId: string;
-      serverName: string;
-      name: string;
-      description: string;
-    }>>;
-    callTool: (input: {
-      serverId: string;
-      name: string;
-      arguments?: Record<string, unknown>;
-    }) => Promise<string>;
-  };
   listSourceFiles: () => string[];
   readText: (relativePath: string) => Promise<{
     relativePath: string;
@@ -92,6 +84,10 @@ export type SessionToolOptions = {
   cascadeUnlocked?: boolean;
   /** Read-only materials explicitly attached to this session turn. */
   sourcePaths?: string[];
+  /** Apply the selected profile as a hard tool boundary (Pi only). */
+  enforceProfile?: boolean;
+  /** Exact relative paths explicitly approved by the user for this turn. */
+  workspaceWriteApprovedPaths?: string[];
 };
 
 const DEFAULT_SOURCE_CHUNK_CHARS = 6_000;
@@ -115,6 +111,9 @@ export function createSessionTools(
       ? { harnessId: harnessIdOrOpts }
       : harnessIdOrOpts;
   const harnessId = opts.harnessId;
+  const profile = getHarness(harnessId);
+  const permits = (capability: AgentCapability) =>
+    !opts.enforceProfile || hasCapability(profile, capability);
   const selectionBlockIds = (opts.selectionBlockIds ?? []).filter(Boolean);
   const cascadeConfirmedIds = (opts.cascadeConfirmedIds ?? []).filter(Boolean);
   const enforceCascadeGate =
@@ -123,6 +122,9 @@ export function createSessionTools(
   const sourcePaths = [
     ...new Set((opts.sourcePaths ?? []).map(normalizeSourcePath).filter(Boolean)),
   ];
+  const approvedWritePaths = new Set(
+    (opts.workspaceWriteApprovedPaths ?? []).map((item) => normalizeRel(item.trim())),
+  );
   const cascadeGate = createCascadeGate();
   const readCache = new Map<
     string,
@@ -243,6 +245,9 @@ export function createSessionTools(
     execute: async (_id, raw) => {
       const params = raw as { relativePath: string; content: string };
       const relativePath = String(params.relativePath);
+      if (opts.enforceProfile && !approvedWritePaths.has(normalizeRel(relativePath))) {
+        throw new Error(`Workspace write was not approved for "${normalizeRel(relativePath)}"`);
+      }
       if (isProtectedDocumentPath(relativePath, bag, bridge)) {
         throw new Error(
           `Refused to overwrite canonical document "${normalizeRel(relativePath)}". Use propose_block_edit; Host Accept applies.`,
@@ -312,7 +317,7 @@ export function createSessionTools(
       const skill = loadAvailableSkill(
         String(params.name),
         bridge.skillsRoot,
-        getHarness(harnessId).skillScope,
+        getHarness(harnessId).skills.scope,
       );
       effects.loadedSkills = [
         ...(effects.loadedSkills ?? []),
@@ -333,50 +338,6 @@ export function createSessionTools(
       };
     },
   };
-
-  const mcpTools: AgentTool[] = bridge.mcp ? [
-    {
-      name: "list_mcp_tools",
-      label: "List MCP Tools",
-      description: "List user-enabled read-only tools from configured remote HTTP MCP servers.",
-      parameters: Type.Object({}),
-      executionMode: "sequential",
-      execute: async () => {
-        const tools = await bridge.mcp!.listTools();
-        return {
-          content: [{ type: "text", text: JSON.stringify({ tools }) }],
-          details: { count: tools.length },
-        };
-      },
-    },
-    {
-      name: "call_mcp_tool",
-      label: "Call MCP Tool",
-      description: "Call one explicitly enabled read-only remote MCP tool. MCP output is context only and never applies document edits.",
-      parameters: Type.Object({
-        serverId: Type.String(),
-        name: Type.String(),
-        arguments: Type.Optional(Type.Object({}, { additionalProperties: true })),
-      }),
-      executionMode: "sequential",
-      execute: async (_id, raw) => {
-        const params = raw as {
-          serverId: string;
-          name: string;
-          arguments?: Record<string, unknown>;
-        };
-        const result = await bridge.mcp!.callTool({
-          serverId: String(params.serverId),
-          name: String(params.name),
-          arguments: params.arguments,
-        });
-        return {
-          content: [{ type: "text", text: result }],
-          details: { serverId: params.serverId, name: params.name },
-        };
-      },
-    },
-  ] : [];
 
   const analysisStore = new AnalysisRunStore();
 
@@ -419,5 +380,13 @@ export function createSessionTools(
     },
   );
 
-  return [listFiles, readFile, writeFile, openDoc, loadSkill, ...mcpTools, ...paper];
+  const workspaceWriteAllowed = permits("workspace.write") &&
+    profile.approvals.workspaceWrite === "explicit" && approvedWritePaths.size > 0;
+  return [
+    ...(permits("workspace.read") ? [listFiles, readFile] : []),
+    ...(workspaceWriteAllowed || !opts.enforceProfile ? [writeFile] : []),
+    ...(permits("document.open") ? [openDoc] : []),
+    ...(permits("skills.load") ? [loadSkill] : []),
+    ...paper,
+  ];
 }

@@ -50,7 +50,7 @@ export function buildClarificationHint(input: {
   const remaining = Math.max(0, max - used);
   // socratic-revision-zh is an academic-pack skill: only skillScope "all" can load it.
   const socraticPointer =
-    getHarness(input.harnessId).skillScope === "all"
+    getHarness(input.harnessId).skills.scope === "all"
       ? `可 load_skill("socratic-revision-zh").`
       : "";
 

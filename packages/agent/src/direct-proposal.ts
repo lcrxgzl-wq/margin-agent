@@ -6,7 +6,7 @@ import {
   type ProposalOperationKind,
   type ProposalTargetLanguage,
 } from "@margin/domain";
-import { directIdentity } from "@margin/harness";
+import { composeDirectPrompt, getAgentProfile } from "@margin/harness";
 import { canonicalizeProviderBaseURL } from "@margin/llm";
 
 type DirectProposalInput = {
@@ -21,6 +21,7 @@ type DirectProposalInput = {
   operation?: ProposalOperationKind;
   targetLanguage?: ProposalTargetLanguage;
   sourceContext?: Array<{ sourceRef: string; text: string }>;
+  workspaceSkillsRoot?: string;
   signal?: AbortSignal;
 };
 
@@ -212,7 +213,7 @@ function mockProposal(input: DirectProposalInput): LlmProposalOutput {
   });
 }
 
-function promptFor(input: DirectProposalInput, retryReason?: string): string {
+function promptFor(input: DirectProposalInput): string {
   const neighbors = (input.neighbors ?? [])
     .filter((block) => block.id !== input.block.id)
     .map((block) => `- (${block.id}) ${block.text.slice(0, 300)}`)
@@ -234,10 +235,10 @@ function promptFor(input: DirectProposalInput, retryReason?: string): string {
   const responseShape = selection
     ? '{"blockId":"...","replacement":"...","rationale":"...","risk":"language|structure|argument|fact","evidence":[]}'
     : '{"blockId":"...","after":"...","rationale":"...","risk":"language|structure|argument|fact","evidence":[]}';
-  const retryRule = retryReason
-    ? `\n- The previous response was invalid (${retryReason}). Correct it now; do not repeat source-plus-translation text.`
-    : "";
-  return `${directIdentity(input.harnessId)}
+  return `${composeDirectPrompt(input.harnessId, {
+    workspaceSkillsRoot: input.workspaceSkillsRoot,
+    instruction: input.instruction,
+  })}
 
 Return exactly one JSON object with this shape:
 ${responseShape}
@@ -251,7 +252,6 @@ Rules:
 - Do not use Markdown fences and do not add prose outside the JSON object.
 ${outputRule}
 - ${operationHint}
-${retryRule}
 
 Target block (${input.block.kind}):
 ${input.block.text}
@@ -351,8 +351,11 @@ async function requestCompletion(
   key: string,
   prompt: string,
   externalSignal?: AbortSignal,
+  modelOverride?: string,
+  timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<string> {
   const model =
+    modelOverride?.trim() ||
     process.env.MARGIN_MODEL?.trim() ||
     (format === "anthropic" ? "claude-sonnet-4-6" : "gpt-4o-mini");
   const body =
@@ -368,7 +371,7 @@ async function requestCompletion(
           messages: [{ role: "user", content: prompt }],
         };
   const endpoints = endpointURLs(format);
-  const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const signal = externalSignal
     ? AbortSignal.any([externalSignal, timeoutSignal])
     : timeoutSignal;
@@ -410,6 +413,7 @@ export async function generateDirectProposal(
     throw new Error("translation requires an explicit target language");
   }
   const format = apiFormat();
+  const profile = getAgentProfile(input.harnessId);
   const key = apiKey(format);
   const hasSelection = !!input.selectionText?.trim();
   if (!key) {
@@ -426,20 +430,19 @@ export async function generateDirectProposal(
     });
   }
 
-  const complete = async (retryReason?: string) => {
-    const raw = await requestCompletion(format, key, promptFor(input, retryReason), input.signal);
-    const proposal = parseProposal(input.block.id, raw, hasSelection);
-    return validateEvidence(input, hasSelection ? applySelectedSpan(input, proposal) : proposal);
-  };
-
-  let proposal: DirectProposalResult;
-  try {
-    proposal = await complete();
-  } catch (error) {
-    if (!hasSelection || input.operation !== "translate") throw error;
-    const reason = error instanceof Error ? error.message : String(error);
-    proposal = await complete(reason.slice(0, 160));
-  }
+  const raw = await requestCompletion(
+    format,
+    key,
+    promptFor(input),
+    input.signal,
+    profile.model,
+    profile.limits.timeoutMs,
+  );
+  const parsed = parseProposal(input.block.id, raw, hasSelection);
+  const proposal = validateEvidence(
+    input,
+    hasSelection ? applySelectedSpan(input, parsed) : parsed,
+  );
   if (hasSelection) return proposal;
   return {
     ...proposal,

@@ -34,6 +34,9 @@ export function buildLlmSettingsUpdate(
   body: LlmSettingsPutBody,
   activeProviderId: string,
 ): SaveLlmSettingsInput {
+  const harnessId = typeof body.harnessId === "string"
+    ? body.harnessId.trim() || null
+    : body.harnessId;
   const obj = typeof body.provider === "object" && body.provider ? body.provider : {};
   const { id: _ignoredId, ...profilePatch } = obj;
   const merged = {
@@ -49,7 +52,7 @@ export function buildLlmSettingsUpdate(
   );
   return {
     clearApiKey: !!body.clearApiKey,
-    harnessId: body.harnessId,
+    harnessId,
     provider: Object.keys(defined).length
       ? { ...defined, id: activeProviderId }
       : undefined,

@@ -66,7 +66,7 @@ ${input.excerpt?.trim() ? `选区：\n"""\n${input.excerpt.trim()}\n"""\n` : ""}
 请回复。`;
 }
 
-/** @deprecated Prefer harness.systemPrompt; kept for any external callers. */
+/** @deprecated Prefer the active AgentProfile instructions; kept for external callers. */
 export function agentSystemPrompt(): string {
   return `你是 Margin：本地学术写作 Agent。短中文；文稿操作须经工具；只提案不 apply；不得虚构文献或访谈引语。`;
 }

@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { assertPiLoopCompleted } from "./pi-outcome.js";
+import { assertPiLoopCompleted, PiLoopFailure } from "./pi-outcome.js";
 import type { PiLoopOptions, PiLoopResult } from "./pi-loop.js";
 import type { WorkspaceBridge } from "./session-tools.js";
 
@@ -21,7 +21,6 @@ const { runSessionTurn } = await import("./session-runner.js");
 
 const ENV_KEYS = [
   "MARGIN_ENGINE",
-  "MARGIN_ENGINE_STRICT",
   "MARGIN_API_KEY",
   "MARGIN_BASE_URL",
   "OPENAI_API_KEY",
@@ -55,6 +54,7 @@ function loopResult(
     notes: outcome === "completed" ? [] : [detail],
     streamedText: "",
     errorMessage: outcome === "error" ? detail : undefined,
+    toolAudit: [],
   };
 }
 
@@ -82,22 +82,18 @@ describe("Pi loop outcome handling", () => {
     }
   });
 
-  it("falls back after a failed session outcome", async () => {
-    mocks.runPiAgentLoop.mockResolvedValue(loopResult("error", "provider failed"));
-
+  it("runs deterministic host commands without starting Pi", async () => {
     const result = await runSessionTurn({
-      message: "who are you",
+      message: "有哪些文件",
       bridge,
       bag: { revision: 0, blocks: [] },
     });
 
     expect(result.engine).toBe("offline");
-    expect(result.fallbackFrom).toBe("pi");
-    expect(result.fallbackReason).toMatch(/provider failed/);
+    expect(mocks.runPiAgentLoop).not.toHaveBeenCalled();
   });
 
-  it("propagates a failed session outcome in strict mode", async () => {
-    process.env.MARGIN_ENGINE_STRICT = "1";
+  it("propagates a failed session outcome without replaying offline", async () => {
     mocks.runPiAgentLoop.mockResolvedValue(loopResult("error", "provider failed"));
 
     await expect(
@@ -109,7 +105,7 @@ describe("Pi loop outcome handling", () => {
     ).rejects.toThrow(/pi session failed.*provider failed/);
   });
 
-  it("does not fallback when the caller aborts the session", async () => {
+  it("propagates caller abort without starting another planner", async () => {
     const controller = new AbortController();
     controller.abort();
     mocks.runPiAgentLoop.mockResolvedValue(
@@ -126,7 +122,7 @@ describe("Pi loop outcome handling", () => {
     ).rejects.toThrow(/pi session aborted.*external signal/);
   });
 
-  it("discards a partial Pi scan draft before fallback", async () => {
+  it("does not run a second planner after a partial Pi scan", async () => {
     process.env.MARGIN_ENGINE = "pi";
     mocks.runPiAgentLoop.mockImplementation(async (options: PiLoopOptions) => {
       const propose = options.tools.find((tool) => tool.name === "propose_block_edit");
@@ -139,7 +135,7 @@ describe("Pi loop outcome handling", () => {
       return loopResult("timed_out", "aborted after 10ms");
     });
 
-    const result = await runBlockScan(
+    await expect(runBlockScan(
       {
         documentId: "doc-1",
         revision: 1,
@@ -154,12 +150,96 @@ describe("Pi loop outcome handling", () => {
         ],
       },
       ["b1"],
-    );
+    )).rejects.toThrow(/pi scan timed out/);
+  });
 
-    expect(result.fallbackFrom).toBe("pi");
-    expect(result.fallbackReason).toMatch(/pi scan timed out/);
-    expect(result.proposals).toHaveLength(1);
-    expect(result.proposals[0]?.after).not.toBe("partial Pi draft");
+  it("does not repeat a completed write when Pi later times out", async () => {
+    let writes = 0;
+    const writeBridge: WorkspaceBridge = {
+      ...bridge,
+      writeText: async (relativePath, content) => {
+        writes += 1;
+        return { relativePath, bytes: content.length, created: true };
+      },
+    };
+    mocks.runPiAgentLoop.mockImplementation(async (options: PiLoopOptions) => {
+      const write = options.tools.find((tool) => tool.name === "write_workspace_file");
+      await write!.execute("write-once", {
+        relativePath: "notes/result.md",
+        content: "done",
+      });
+      const result = loopResult("timed_out", "aborted after 10ms");
+      result.toolAudit = [{
+        toolCallId: "write-once",
+        toolName: "write_workspace_file",
+        status: "completed",
+        durationMs: 1,
+        args: { relativePath: "notes/result.md" },
+      }];
+      return result;
+    });
+
+    const failure = await runSessionTurn({
+      message: "write notes/result.md",
+      bridge: writeBridge,
+      bag: { revision: 0, blocks: [] },
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PiLoopFailure);
+    expect(failure).toMatchObject({
+      message: expect.stringMatching(/pi session timed out/),
+      toolAudit: [expect.objectContaining({ toolName: "write_workspace_file" })],
+    });
+    expect(writes).toBe(1);
+
+    mocks.runPiAgentLoop.mockImplementation(async (options: PiLoopOptions) => {
+      expect(options.tools.find((tool) => tool.name === "write_workspace_file")).toBeUndefined();
+      return loopResult("completed");
+    });
+    await runSessionTurn({
+      message: "继续此前任务：write notes/result.md",
+      workspaceWriteApprovalMessage: "继续",
+      bridge: writeBridge,
+      bag: { revision: 0, blocks: [] },
+    });
+    expect(writes).toBe(1);
+  });
+
+  it("does not treat a negated write as approval and supports an explicit quoted path", async () => {
+    const written: string[] = [];
+    const writeBridge: WorkspaceBridge = {
+      ...bridge,
+      writeText: async (relativePath, content) => {
+        written.push(relativePath);
+        return { relativePath, bytes: content.length, created: true };
+      },
+    };
+    const mounted: string[][] = [];
+    mocks.runPiAgentLoop.mockImplementation(async (options: PiLoopOptions) => {
+      mounted.push(options.tools.map((tool) => tool.name));
+      const write = options.tools.find((tool) => tool.name === "write_workspace_file");
+      if (write) {
+        await write.execute("approved", {
+          relativePath: "notes/final draft.md",
+          content: "done",
+        });
+      }
+      return loopResult("completed");
+    });
+
+    await runSessionTurn({
+      message: "不要创建 notes/final.md，只讨论方案",
+      bridge: writeBridge,
+      bag: { revision: 0, blocks: [] },
+    });
+    await runSessionTurn({
+      message: '请创建 "notes/final draft.md"',
+      bridge: writeBridge,
+      bag: { revision: 0, blocks: [] },
+    });
+
+    expect(mounted[0]).not.toContain("write_workspace_file");
+    expect(mounted[1]).toContain("write_workspace_file");
+    expect(written).toEqual(["notes/final draft.md"]);
   });
 
   it("gates the source-grounded-writing skill pointer by harness scope", async () => {

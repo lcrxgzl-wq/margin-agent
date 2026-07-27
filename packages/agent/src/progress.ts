@@ -34,10 +34,6 @@ export function toolPhaseLabel(toolName: string): string {
       return "正在打开文稿…";
     case "load_skill":
       return "正在加载写作技能…";
-    case "list_mcp_tools":
-      return "正在查看只读扩展…";
-    case "call_mcp_tool":
-      return "正在读取 MCP 资料…";
     case "inspect_tabular_file":
       return "正在检查数据表…";
     case "run_table_analysis":
@@ -60,7 +56,7 @@ export function isUserFacingPhase(phase: string): boolean {
   ) {
     return false;
   }
-  if (/启动|完成（|回退 simple/i.test(t) && t.length < 24) {
+  if (/启动|完成（/i.test(t) && t.length < 24) {
     return !/起草|打开|列出|读取|写入|修订|侧注|检查/.test(t);
   }
   return true;

@@ -332,22 +332,19 @@
           await refreshProposals();
           await refreshComments();
           const eng = run.engine || "?";
-          const fb = run.fallbackFrom
-            ? `fallback ${run.fallbackFrom}→${eng}`
-            : `engine=${eng}`;
+          const engineLabel = `engine=${eng}`;
           const notes = (run.notes || []).slice(0, 3).join(" · ");
           setRunMeta(
             [
-              fb,
+              engineLabel,
               run.commentCount != null ? `comments=${run.commentCount}` : "",
               run.citeDisclaimer || "",
               notes,
-              run.fallbackReason ? `reason: ${run.fallbackReason}` : "",
             ]
               .filter(Boolean)
               .join("\n"),
           );
-          setStatus(`提案就绪：${proposals.length} 条待裁决 · ${fb}`);
+          setStatus(`提案就绪：${proposals.length} 条待裁决 · ${engineLabel}`);
         } catch (e) {
           setStatus(e.message);
         } finally {
