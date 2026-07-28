@@ -9,9 +9,12 @@ import {
   type SessionTurnResult,
   type WorkspaceBridge,
   type ToolAuditEvent,
+  type RemoteMcpApprovalFn,
+  type RemoteMcpBridge,
 } from "@margin/agent";
 import type { BlockSnapshot, DocumentMeta } from "@margin/domain";
 import {
+  activeProfile,
   assertNotRegisteredDocumentWrite,
   getDocument,
   importExternalDocxDocument,
@@ -21,17 +24,22 @@ import {
   loadAgentSession,
   openDocument,
   readWorkspaceSource,
+  readLlmSettingsStore,
+  readSkillSettings,
+  disabledSkillNames,
   readNativeDocxTableCell,
   replaceDocumentComments,
   saveAgentSession,
   saveProposal,
   saveAgentTranscript,
   writeWorkspaceText,
+  type PersistedAgentSession,
   type PersistedAgentTask,
   type PersistedReviewThread,
   type Workspace,
 } from "@margin/storage-local";
 import type { ChatMemory } from "./chat-memory.js";
+import type { McpApprovalAuditEntry } from "./mcp-approvals.js";
 import {
   claimsDocumentOpened,
   isDocumentOpenStatusMessage,
@@ -71,9 +79,11 @@ export function createChatAgentState(seed?: {
   };
 }
 
-/** Restore Pi AgentMessage[] from the last persisted session, if any. */
-export function restoreChatAgentState(workspace: Workspace): ChatAgentState {
-  const saved = loadAgentSession(workspace);
+/** Rebuild in-memory agent state from a persisted session envelope (startup or session switch). */
+export function chatAgentStateFromSession(
+  workspace: Workspace,
+  saved: PersistedAgentSession | null,
+): ChatAgentState {
   if (!saved?.sessionId || !Array.isArray(saved.messages)) {
     return createChatAgentState();
   }
@@ -101,6 +111,12 @@ export function restoreChatAgentState(workspace: Workspace): ChatAgentState {
   }
   return state;
 }
+
+/** Restore Pi AgentMessage[] from the last persisted session, if any. */
+export function restoreChatAgentState(workspace: Workspace): ChatAgentState {
+  return chatAgentStateFromSession(workspace, loadAgentSession(workspace));
+}
+
 
 /** Short chat turns for UI hydrate (may be empty on legacy sessions). */
 export function loadPersistedChatTurns(workspace: Workspace): Array<{
@@ -211,6 +227,8 @@ export type ChatAgentTurnResult = {
   sourcePaths: string[];
   cascadeOffer?: Array<{ blockId: string; reason: string; query?: string }>;
   notes?: string[];
+  /** Skills inlined via explicit selection or loaded via load_skill this turn. */
+  loadedSkills?: Array<{ name: string; contentHash: string }>;
   task?: PersistedAgentTask;
 };
 
@@ -225,6 +243,7 @@ export function buildTranscriptPayload(input: {
   loadedSkills?: Array<{ name: string; contentHash: string }>;
   sourcePaths: string[];
   toolAudit?: ToolAuditEvent[];
+  mcpApprovals?: McpApprovalAuditEntry[];
 }) {
   return {
     steps: (input.steps ?? []).slice(-24),
@@ -243,6 +262,7 @@ export function buildTranscriptPayload(input: {
       durationMs: Math.max(0, Math.floor(event.durationMs)),
       args: event.args,
     })),
+    mcpApprovals: input.mcpApprovals?.slice(-12),
   };
 }
 
@@ -288,6 +308,12 @@ export async function runChatAgentTurn(opts: {
   onProgress?: (phase: string) => void;
   onDelta?: (chunk: string) => void;
   signal?: AbortSignal;
+  /** Remote MCP bridge + per-call approval (stream chat path only). */
+  remoteMcp?: { bridge: RemoteMcpBridge; requestApproval: RemoteMcpApprovalFn };
+  /** Live per-run audit array; settled approvals are appended by the host. */
+  mcpApprovalAudit?: McpApprovalAuditEntry[];
+  /** Explicit one-turn Skills (structured ids) for this chat turn. */
+  selectedSkills?: string[];
 }): Promise<ChatAgentTurnResult> {
   const { workspace, chat, agentState } = opts;
   if (opts.sourcePaths !== undefined) {
@@ -368,6 +394,8 @@ export async function runChatAgentTurn(opts: {
         };
         })()
       : await runSessionTurn({
+        reasoningMode: readLlmSettingsStore(workspace.root).reasoningMode,
+        reasoningOptIn: activeProfile(readLlmSettingsStore(workspace.root)).reasoningOptIn,
         message,
         workspaceWriteApprovalMessage: requestedMessage,
         messages: agentState.agentMessages,
@@ -379,8 +407,11 @@ export async function runChatAgentTurn(opts: {
         sourcePaths: agentState.sourcePaths,
         history: chat.prior(),
         sessionId: agentState.sessionId,
+        remoteMcp: opts.remoteMcp,
         chatMode: opts.chatMode,
         harnessId: opts.harnessId,
+        disabledSkills: disabledSkillNames(readSkillSettings(workspace.root)),
+        selectedSkills: opts.selectedSkills,
         clarificationRound,
         signal: opts.signal,
         onProgress: (ev) => {
@@ -421,6 +452,7 @@ export async function runChatAgentTurn(opts: {
           notes: error.notes,
           sourcePaths: agentState.sourcePaths,
           toolAudit: error.toolAudit,
+          mcpApprovals: opts.mcpApprovalAudit,
         }),
       });
     }
@@ -554,6 +586,7 @@ export async function runChatAgentTurn(opts: {
       loadedSkills: turn.loadedSkills,
       sourcePaths: agentState.sourcePaths,
       toolAudit: turn.toolAudit,
+      mcpApprovals: opts.mcpApprovalAudit,
     }),
     createdAt: new Date().toISOString(),
   });
@@ -568,6 +601,7 @@ export async function runChatAgentTurn(opts: {
     sourcePaths: [...agentState.sourcePaths],
     cascadeOffer: turn.cascadeOffer,
     notes: turn.notes,
+    loadedSkills: turn.loadedSkills,
     task: agentState.task,
   };
 }

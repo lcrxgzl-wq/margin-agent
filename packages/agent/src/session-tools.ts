@@ -9,6 +9,11 @@ import {
 } from "@margin/harness";
 import { AnalysisRunStore } from "./data/store.js";
 import { createCascadeGate, type CascadeCandidate } from "./cascade.js";
+import {
+  createRemoteMcpTools,
+  type RemoteMcpApprovalFn,
+  type RemoteMcpBridge,
+} from "./mcp-tools.js";
 import { createPaperTools, type Draft } from "./pi-tools.js";
 import type { AgentComment } from "./types.js";
 
@@ -88,6 +93,10 @@ export type SessionToolOptions = {
   enforceProfile?: boolean;
   /** Exact relative paths explicitly approved by the user for this turn. */
   workspaceWriteApprovedPaths?: string[];
+  /** Persistently disabled Skills: load_skill rejects them visibly. */
+  disabledSkills?: string[];
+  /** Remote MCP bridge + per-call approval (chat path only; scan passes none). */
+  remoteMcp?: { bridge: RemoteMcpBridge; requestApproval: RemoteMcpApprovalFn };
 };
 
 const DEFAULT_SOURCE_CHUNK_CHARS = 6_000;
@@ -314,6 +323,10 @@ export function createSessionTools(
     executionMode: "sequential",
     execute: async (_id, raw) => {
       const params = raw as { name: string };
+      const requested = String(params.name).toLowerCase();
+      if ((opts.disabledSkills ?? []).includes(requested)) {
+        throw new Error(`Skill 已关闭: ${requested}`);
+      }
       const skill = loadAvailableSkill(
         String(params.name),
         bridge.skillsRoot,
@@ -387,6 +400,9 @@ export function createSessionTools(
     ...(workspaceWriteAllowed || !opts.enforceProfile ? [writeFile] : []),
     ...(permits("document.open") ? [openDoc] : []),
     ...(permits("skills.load") ? [loadSkill] : []),
+    ...(opts.remoteMcp && permits("remote.mcp") && profile.approvals.remoteMcp === "per-call"
+      ? createRemoteMcpTools(opts.remoteMcp)
+      : []),
     ...paper,
   ];
 }

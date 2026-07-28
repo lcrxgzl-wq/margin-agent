@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  archiveAgentSession,
+  loadAgentSessionEnvelope,
   openDocument,
   openWorkspace,
   saveAgentSession,
@@ -10,6 +12,7 @@ import {
 } from "@margin/storage-local";
 import {
   buildTranscriptPayload,
+  chatAgentStateFromSession,
   clearChatAgentConversation,
   closeChatAgentDocument,
   createChatAgentState,
@@ -237,5 +240,56 @@ describe("chat session lifecycle", () => {
     expect(isCloseDocumentRequest("关闭当前文稿")).toBe(true);
     expect(isCloseDocumentRequest("请关闭 DOCX")).toBe(true);
     expect(isCloseDocumentRequest("讨论如何关闭文章结尾")).toBe(false);
+  });
+});
+
+describe("chatAgentStateFromSession (session switch)", () => {
+  it("rebuilds agent state from an archived envelope, degrading on a missing document", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-switch-"));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, "paper.md"), "# Title\n\nBody text.\n", "utf8");
+    const workspace = await openWorkspace(root);
+    try {
+      const document = openDocument(workspace, "paper.md");
+      saveAgentSession(workspace, {
+        sessionId: "s-1",
+        documentId: document.id,
+        messages: [{ role: "user", content: "hi" }],
+        chatTurns: [{ role: "user", text: "hi" }],
+        sourcePaths: ["paper.md"],
+      });
+      archiveAgentSession(workspace, "s-1");
+
+      const envelope = loadAgentSessionEnvelope(workspace, "s-1");
+      expect(envelope?.sessionId).toBe("s-1");
+
+      const restored = chatAgentStateFromSession(workspace, envelope);
+      expect(restored.sessionId).toBe("s-1");
+      expect(restored.bag.documentId).toBe(document.id);
+      expect(restored.bag.blocks.length).toBeGreaterThan(0);
+      expect(restored.sourcePaths).toEqual(["paper.md"]);
+
+      // A document that no longer exists: bag stays empty, sources detach.
+      const ghost = chatAgentStateFromSession(workspace, {
+        ...envelope!,
+        documentId: "doc-gone",
+      });
+      expect(ghost.sessionId).toBe("s-1");
+      expect(ghost.bag.documentId).toBeUndefined();
+      expect(ghost.sourcePaths).toEqual([]);
+      expect(ghost.sourceDocumentId).toBeUndefined();
+
+      // No envelope: a fresh state with a new sessionId.
+      const fresh = chatAgentStateFromSession(workspace, null);
+      expect(fresh.sessionId).not.toBe("s-1");
+      expect(fresh.agentMessages).toEqual([]);
+    } finally {
+      try {
+        workspace.db.close();
+      } catch {
+        /* ignore */
+      }
+      await workspace.releaseLock();
+    }
   });
 });

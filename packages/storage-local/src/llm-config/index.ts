@@ -10,6 +10,8 @@ export {
   loadAndApplyLlmSettings,
   publicLlmSettings,
   activeProfile,
+  isLoopbackBaseURL,
+  CC_SWITCH_PLACEHOLDER_KEY,
   PROVIDER_PRESETS,
   type LlmSettings,
   type LlmSettingsStore,
@@ -18,12 +20,14 @@ export {
   type LlmProviderProfilePublic,
   type ApiFormat,
   type AuthStyle,
+  type ReasoningMode,
   type SaveLlmSettingsInput,
 } from "../llm-settings.js";
 
 export {
-  importFromCcSwitch,
-  detectCcSwitchProxy,
-  type CcSwitchImportResult,
-  type CcSwitchProxyInfo,
+  detectCcSwitchRoutes,
+  probeCcSwitchHealth,
+  type CcSwitchRoute,
+  type CcSwitchRoutes,
+  type CcSwitchHealthResult,
 } from "../cc-switch-import.js";

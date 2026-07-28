@@ -16,6 +16,11 @@ import {
   testLlmModelConnection,
   type LlmProbeResult,
 } from "./provider-probe.js";
+import {
+  extractUsage,
+  marginRequestHeaders,
+  reportModelUsage,
+} from "./request-policy.js";
 
 export {
   canonicalizeProviderBaseURL,
@@ -28,6 +33,15 @@ export {
   type LlmModelOption,
   type LlmProbeResult,
 } from "./provider-probe.js";
+export {
+  configureRequestPolicy,
+  extractUsage,
+  marginRequestHeaders,
+  reportModelUsage,
+  type ModelRequestPath,
+  type ModelUsage,
+  type ModelUsageEntry,
+} from "./request-policy.js";
 
 export type { ChatHistoryTurn } from "./history.js";
 export { formatHistoryForPrompt, trimHistory } from "./history.js";
@@ -76,6 +90,7 @@ function runtimeHeaders(format: RuntimeFormat, key: string): Record<string, stri
   const headers: Record<string, string> = {
     Accept: "application/json",
     "Content-Type": "application/json",
+    ...marginRequestHeaders(),
   };
   if (format === "anthropic") {
     headers["anthropic-version"] = "2023-06-01";
@@ -130,9 +145,10 @@ async function requestTextCompletion(
     ? { model, max_tokens: 4096, system, messages: [{ role: "user", content: prompt }] }
     : { model, max_tokens: 4096, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] };
   const timeout = AbortSignal.timeout(COMPLETION_TIMEOUT_MS);
+  const headers = runtimeHeaders(format, key ?? "ollama");
   const response = await fetch(runtimeEndpoint(format), {
     method: "POST",
-    headers: runtimeHeaders(format, key ?? "ollama"),
+    headers,
     body: JSON.stringify(body),
     redirect: "manual",
     signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
@@ -147,6 +163,15 @@ async function requestTextCompletion(
     payload = JSON.parse(raw);
   } catch {
     throw new Error("LLM endpoint returned invalid JSON");
+  }
+  const usage = extractUsage(format, payload);
+  if (usage) {
+    reportModelUsage({
+      path: "legacy",
+      model,
+      ...usage,
+      requestId: headers["X-Client-Request-Id"] ?? "",
+    });
   }
   const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
   if (format === "anthropic") {

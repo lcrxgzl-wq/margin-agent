@@ -3,9 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  archiveAgentSession,
   clearAgentSession,
+  deleteAgentSession,
   ensureAgentSessionSchema,
+  listAgentSessions,
   loadAgentSession,
+  loadAgentSessionEnvelope,
   openWorkspace,
   saveAgentSession,
 } from "./index.js";
@@ -294,6 +298,148 @@ describe("agent session persistence", () => {
       });
 
       expect(loadAgentSession(ws)?.threads).toMatchObject([{ id: "thread-1" }]);
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+});
+
+describe("agent session history", () => {
+  it("archives, lists, restores and deletes sessions", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-hist-"));
+    dirs.push(root);
+    const ws = await openWorkspace(root);
+    try {
+      saveAgentSession(ws, {
+        sessionId: "s-1",
+        documentId: "doc-1",
+        messages: [{ role: "user", content: "帮我修订导论" }],
+        chatTurns: [
+          { role: "user", text: "帮我修订导论" },
+          { role: "assistant", text: "好的" },
+        ],
+      });
+      // Archiving a different sessionId is a no-op.
+      expect(archiveAgentSession(ws, "other")).toBe(false);
+      expect(archiveAgentSession(ws, "s-1")).toBe(true);
+
+      const list = listAgentSessions(ws);
+      expect(list).toHaveLength(1);
+      expect(list[0]).toMatchObject({
+        sessionId: "s-1",
+        title: "帮我修订导论",
+        documentId: "doc-1",
+        turnCount: 2,
+      });
+
+      const envelope = loadAgentSessionEnvelope(ws, "s-1");
+      expect(envelope?.sessionId).toBe("s-1");
+      expect(envelope?.documentId).toBe("doc-1");
+      expect(envelope?.messages).toHaveLength(1);
+      expect(envelope?.chatTurns).toHaveLength(2);
+      expect(loadAgentSessionEnvelope(ws, "missing")).toBeNull();
+
+      deleteAgentSession(ws, "s-1");
+      expect(listAgentSessions(ws)).toHaveLength(0);
+      expect(loadAgentSessionEnvelope(ws, "s-1")).toBeNull();
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("re-archiving upserts the latest content instead of duplicating", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-hist-upsert-"));
+    dirs.push(root);
+    const ws = await openWorkspace(root);
+    try {
+      saveAgentSession(ws, {
+        sessionId: "s-1",
+        messages: [{ role: "user", content: "first" }],
+        chatTurns: [{ role: "user", text: "first" }],
+      });
+      archiveAgentSession(ws, "s-1");
+
+      saveAgentSession(ws, {
+        sessionId: "s-1",
+        messages: [{ role: "user", content: "first" }, { role: "assistant", content: "second" }],
+        chatTurns: [{ role: "user", text: "first" }, { role: "assistant", text: "second" }],
+      });
+      archiveAgentSession(ws, "s-1");
+
+      const list = listAgentSessions(ws);
+      expect(list).toHaveLength(1);
+      expect(list[0]?.turnCount).toBe(2);
+      expect(loadAgentSessionEnvelope(ws, "s-1")?.messages).toHaveLength(2);
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("falls back to 新会话 when no user turn exists", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-hist-title-"));
+    dirs.push(root);
+    const ws = await openWorkspace(root);
+    try {
+      saveAgentSession(ws, {
+        sessionId: "s-no-user",
+        messages: [],
+        chatTurns: [{ role: "assistant", text: "只有助手回复" }],
+      });
+      archiveAgentSession(ws, "s-no-user");
+      expect(listAgentSessions(ws)[0]).toMatchObject({ title: "新会话", turnCount: 1 });
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("prunes history to the latest 50 sessions", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-hist-prune-"));
+    dirs.push(root);
+    const ws = await openWorkspace(root);
+    try {
+      for (let index = 0; index < 55; index += 1) {
+        const sessionId = `s-${index}`;
+        saveAgentSession(ws, {
+          sessionId,
+          messages: [{ role: "user", content: `topic ${index}` }],
+          chatTurns: [{ role: "user", text: `topic ${index}` }],
+        });
+        archiveAgentSession(ws, sessionId);
+        // Deterministic ordering: updated_at otherwise ties at ms resolution.
+        ws.db
+          .prepare(`UPDATE agent_session_history SET updated_at = ? WHERE id = ?`)
+          .run(`2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`, sessionId);
+      }
+      const list = listAgentSessions(ws);
+      expect(list).toHaveLength(50);
+      expect(list[0]?.sessionId).toBe("s-54");
+      expect(list.some((entry) => entry.sessionId === "s-4")).toBe(false);
+      expect(list.some((entry) => entry.sessionId === "s-5")).toBe(true);
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("clearing the active session does not touch history", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-hist-clear-"));
+    dirs.push(root);
+    const ws = await openWorkspace(root);
+    try {
+      saveAgentSession(ws, {
+        sessionId: "s-1",
+        messages: [{ role: "user", content: "hi" }],
+        chatTurns: [{ role: "user", text: "hi" }],
+      });
+      archiveAgentSession(ws, "s-1");
+      clearAgentSession(ws);
+      expect(loadAgentSession(ws)).toBeNull();
+      expect(listAgentSessions(ws)).toHaveLength(1);
+      expect(loadAgentSessionEnvelope(ws, "s-1")?.chatTurns).toHaveLength(1);
     } finally {
       ws.db.close();
       await ws.releaseLock();

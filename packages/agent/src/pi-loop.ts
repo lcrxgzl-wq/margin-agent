@@ -1,8 +1,16 @@
+import { randomUUID } from "node:crypto";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
 import {
   Agent,
   type AgentMessage,
   type AgentTool,
+  type StreamFn,
 } from "@earendil-works/pi-agent-core";
+import {
+  marginRequestHeaders,
+  reportModelUsage,
+  type ModelUsage,
+} from "@margin/llm";
 import { toolPhaseLabel } from "./progress.js";
 
 export type PiLoopOutcome = "completed" | "aborted" | "timed_out" | "error";
@@ -16,6 +24,10 @@ export type PiLoopOptions = {
   model: unknown;
   apiKey?: string;
   sessionId?: string;
+  /** Explicit Pi thinking level; undefined keeps reasoning controls omitted ("off"). */
+  thinkingLevel?: "low" | "medium" | "high";
+  /** Usage-recording path label for this loop. */
+  usagePath?: "pi-chat" | "pi-scan";
   maxTurns?: number;
   timeoutMs?: number;
   maxContextMessages?: number;
@@ -216,6 +228,14 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
   const notes: string[] = [];
   const toolAudit: ToolAuditEvent[] = [];
   const toolStarts = new Map<string, { startedAt: number; args: unknown; name: string }>();
+  const usageRequestId = randomUUID();
+  const usageTotal: ModelUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  // Shared request policy: margin identity headers on every provider request.
+  const streamFn: StreamFn = (model, context, options) =>
+    streamSimple(model, context, {
+      ...options,
+      headers: { ...(options?.headers ?? {}), ...marginRequestHeaders() },
+    });
   const contextMessageLimit = opts.maxContextMessages ?? DEFAULT_MAX_CONTEXT_MESSAGES;
   const contextCharLimit = opts.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS;
   const forwardAbort = () => {
@@ -252,7 +272,7 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
     initialState: {
       systemPrompt: opts.systemPrompt,
       model: opts.model as never,
-      thinkingLevel: "off",
+      thinkingLevel: opts.thinkingLevel ?? "off",
       tools: tools as AgentTool[],
       messages: trimAgentMessages(
         opts.messages ?? [],
@@ -297,6 +317,7 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
       return undefined;
     },
     toolExecution: "sequential",
+    streamFn,
     getApiKey: async () => opts.apiKey,
     sessionId: opts.sessionId,
   });
@@ -314,6 +335,16 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
   if (opts.signal?.aborted) onExternalAbort();
 
   const unsub = agent.subscribe((event) => {
+    if (event.type === "message_end") {
+      const message = event.message as { role?: string; usage?: Partial<ModelUsage> };
+      if (message.role === "assistant" && message.usage) {
+        usageTotal.input += message.usage.input ?? 0;
+        usageTotal.output += message.usage.output ?? 0;
+        usageTotal.cacheRead += message.usage.cacheRead ?? 0;
+        usageTotal.cacheWrite += message.usage.cacheWrite ?? 0;
+      }
+      return;
+    }
     if (event.type === "tool_execution_start") {
       opts.onProgress?.(toolPhaseLabel(event.toolName), event.toolName);
       return;
@@ -390,6 +421,21 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
     });
   }
   toolStarts.clear();
+
+  if (
+    opts.usagePath &&
+    (usageTotal.input > 0 ||
+      usageTotal.output > 0 ||
+      usageTotal.cacheRead > 0 ||
+      usageTotal.cacheWrite > 0)
+  ) {
+    reportModelUsage({
+      path: opts.usagePath,
+      model: String((opts.model as { id?: string } | undefined)?.id ?? ""),
+      ...usageTotal,
+      requestId: usageRequestId,
+    });
+  }
 
   return {
     messages: trimAgentMessages(agent.state.messages, contextMessageLimit, contextCharLimit),

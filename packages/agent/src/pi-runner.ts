@@ -1,10 +1,15 @@
+import { createHash } from "node:crypto";
 import type { Proposal } from "@margin/domain";
 import { composeSystemPrompt, getAgentProfile } from "@margin/harness";
 import { getHeuristicComments } from "./packs/registry.js";
 import { runPiAgentLoop } from "./pi-loop.js";
 import { assertPiLoopCompleted } from "./pi-outcome.js";
 import { createPaperTools } from "./pi-tools.js";
-import { hasRuntimeCredentials, resolveRuntimeModel } from "./resolve-model.js";
+import {
+  effectiveThinkingLevel,
+  hasRuntimeCredentials,
+  resolveRuntimeModel,
+} from "./resolve-model.js";
 import type {
   AgentComment,
   PaperAgentContext,
@@ -30,7 +35,9 @@ export async function runPiBlockScan(
   onProgress?: ScanProgressHandler,
 ): Promise<PaperAgentResult> {
   const profile = getAgentProfile(ctx.harnessId);
-  const { model, apiKey } = resolveRuntimeModel(profile.model);
+  const runtime = resolveRuntimeModel(profile.model);
+  const { model, apiKey } = runtime;
+  const thinkingLevel = effectiveThinkingLevel(ctx.reasoningMode, runtime, ctx.reasoningOptIn);
   if (!hasRuntimeCredentials()) {
     throw new Error(
       "pi engine requires API key or Base URL (configure in Settings / CC Switch)",
@@ -81,6 +88,10 @@ export async function runPiBlockScan(
     messages: [],
     model,
     apiKey,
+    thinkingLevel,
+    usagePath: "pi-scan",
+    // Stable, opaque cache/session key: hash of the document id only (never a path or text).
+    sessionId: `pi-scan-${createHash("sha256").update(`margin-scan:${ctx.documentId}`).digest("hex").slice(0, 24)}`,
     maxTurns: maxTurns(profile.limits.maxTurns),
     timeoutMs: timeoutMs(profile.limits.timeoutMs),
     maxContextMessages: profile.limits.maxContextMessages,

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { configureRequestPolicy, type ModelUsageEntry } from "@margin/llm";
 import { generateDirectProposal } from "./direct-proposal.js";
 
 const ENV_KEYS = [
@@ -75,10 +76,15 @@ describe("direct proposal completion", () => {
     expect(requestBody).not.toHaveProperty("response_format");
     expect(requestBody).not.toHaveProperty("temperature");
     expect(requestBody?.max_tokens).toBe(4096);
-    const messages = requestBody?.messages as Array<{ content?: string }>;
-    expect(messages[0]?.content).toContain("禁止编造文献");
-    expect(messages[0]?.content).toContain("风格：问题意识清晰、文献对话、克制可辩护");
-    expect(messages[0]?.content).toContain('<skill name="argument-revision-zh">');
+    // Persona/instructions travel in the stable system field, before dynamic content.
+    expect(requestBody?.system).toContain("禁止编造文献");
+    expect(requestBody?.system).toContain("风格：问题意识清晰、文献对话、克制可辩护");
+    expect(requestBody?.system).toContain('<skill name="argument-revision-zh">');
+    const messages = requestBody?.messages as Array<{ role?: string; content?: string }>;
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.role).toBe("user");
+    expect(messages[0]?.content).toContain("Return exactly one JSON object");
+    expect(messages[0]?.content).toContain("Original paragraph.");
   });
 
   it("uses an OpenAI-compatible chat completion without tool fields", async () => {
@@ -110,6 +116,51 @@ describe("direct proposal completion", () => {
     expect(requestBody).not.toHaveProperty("tool_choice");
     expect(requestBody).not.toHaveProperty("response_format");
     expect(requestBody).not.toHaveProperty("temperature");
+  });
+
+  it("sends an OpenAI system message first, policy headers, and records usage", async () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_BASE_URL = "https://provider.test/v1";
+    process.env.MARGIN_API_KEY = "test-key";
+    process.env.MARGIN_MODEL = "model-qe";
+    configureRequestPolicy({ version: "0.2.0-test" });
+    const recorded: ModelUsageEntry[] = [];
+    configureRequestPolicy({ onUsage: (entry) => recorded.push(entry) });
+    let requestBody: Record<string, unknown> | undefined;
+    let sentHeaders: Headers | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      sentHeaders = new Headers(init?.headers);
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content:
+          '{"blockId":"b1","after":"Revised.","rationale":"Clearer.","risk":"language","evidence":[]}' } }],
+        usage: {
+          prompt_tokens: 88,
+          completion_tokens: 17,
+          prompt_tokens_details: { cached_tokens: 40 },
+        },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+
+    await expect(generateDirectProposal({ block })).resolves.toMatchObject({ blockId: "b1" });
+    const messages = requestBody?.messages as Array<{ role?: string; content?: string }>;
+    expect(messages[0]?.role).toBe("system");
+    expect(messages[0]?.content).toContain("禁止编造文献");
+    expect(messages[1]?.role).toBe("user");
+    expect(messages[1]?.content).toContain("Original paragraph.");
+    expect(sentHeaders?.get("user-agent")).toBe("margin-agent/0.2.0-test");
+    const requestId = sentHeaders?.get("x-client-request-id");
+    expect(requestId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(recorded).toEqual([{
+      path: "quick-edit",
+      model: "model-qe",
+      input: 88,
+      output: 17,
+      cacheRead: 40,
+      cacheWrite: 0,
+      requestId,
+    }]);
+    configureRequestPolicy({ onUsage: undefined });
   });
 
   it("keeps only evidence references supplied by the Host", async () => {

@@ -12,6 +12,7 @@ vi.mock("./pi-loop.js", () => ({
 }));
 
 vi.mock("./resolve-model.js", () => ({
+  effectiveThinkingLevel: () => undefined,
   hasRuntimeCredentials: () => true,
   resolveRuntimeModel: () => ({ model: {}, apiKey: "test-key" }),
 }));

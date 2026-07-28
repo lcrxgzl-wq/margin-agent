@@ -1,3 +1,9 @@
+import {
+  extractUsage,
+  marginRequestHeaders,
+  reportModelUsage,
+} from "./request-policy.js";
+
 export type LlmApiFormat = "openai" | "anthropic";
 export type LlmAuthStyle = "bearer" | "apikey";
 
@@ -132,7 +138,10 @@ function openAIV1FallbackURL(
 }
 
 function requestHeaders(input: LlmProviderProbeInput): Record<string, string> {
-  const headers: Record<string, string> = { Accept: "application/json" };
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    ...marginRequestHeaders(),
+  };
   const key = input.apiKey?.trim();
 
   if (input.apiFormat === "anthropic") {
@@ -244,6 +253,8 @@ function statusFailure(
 type ProviderJsonResult = {
   payload: unknown;
   resolvedBaseURL: string;
+  /** X-Client-Request-Id sent with the request, for usage recording. */
+  requestId: string;
 };
 
 async function requestJson(
@@ -267,6 +278,7 @@ async function requestJson(
   return {
     payload: await readLimitedJson(response),
     resolvedBaseURL: canonicalizeProviderBaseURL(url, input.apiFormat),
+    requestId: headers["X-Client-Request-Id"] ?? "",
   };
 }
 
@@ -419,6 +431,15 @@ export async function testLlmModelConnection(
       ? hasAnthropicContent(response.payload)
       : hasOpenAICompletion(response.payload);
     if (!valid) return failure(started, "API 响应格式与所选协议不匹配");
+    const usage = extractUsage(input.apiFormat, response.payload);
+    if (usage) {
+      reportModelUsage({
+        path: "probe",
+        model,
+        ...usage,
+        requestId: response.requestId,
+      });
+    }
     return {
       ok: true,
       models: [],

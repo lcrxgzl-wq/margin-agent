@@ -245,3 +245,224 @@ describe("llm-settings", () => {
     expect(readLlmSettingsStore(root).harnessId).toBeUndefined();
   });
 });
+
+describe("reasoning settings", () => {
+  let root: string;
+  const prev = { ...process.env };
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-llm-reasoning-"));
+    fs.mkdirSync(path.join(root, ".margin"), { recursive: true });
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_AUTH_TOKEN;
+    delete process.env.MARGIN_API_KEY;
+    delete process.env.MARGIN_BASE_URL;
+    delete process.env.MARGIN_PROVIDER;
+    delete process.env.MARGIN_MODEL;
+    delete process.env.MARGIN_AUTH_STYLE;
+    delete process.env.MARGIN_API_FORMAT;
+  });
+
+  afterEach(() => {
+    for (const k of [
+      "OPENAI_API_KEY",
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN",
+      "MARGIN_API_KEY",
+      "MARGIN_BASE_URL",
+      "MARGIN_PROVIDER",
+      "MARGIN_MODEL",
+      "MARGIN_AUTH_STYLE",
+      "MARGIN_API_FORMAT",
+    ] as const) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("defaults to auto and persists an explicit reasoning mode", async () => {
+    expect(readLlmSettingsStore(root).reasoningMode).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).reasoningMode).toBe("auto");
+
+    await saveLlmSettings(root, { reasoningMode: "deep" });
+    expect(readLlmSettingsStore(root).reasoningMode).toBe("deep");
+    expect(publicLlmSettings(readLlmSettingsStore(root)).reasoningMode).toBe("deep");
+
+    await saveLlmSettings(root, { reasoningMode: null });
+    expect(readLlmSettingsStore(root).reasoningMode).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).reasoningMode).toBe("auto");
+  });
+
+  it("persists a custom provider reasoning opt-in per profile", async () => {
+    await saveLlmSettings(root, {
+      provider: {
+        id: "custom",
+        apiFormat: "openai",
+        baseURL: "https://provider.test/v1",
+        model: "model-a",
+        authStyle: "bearer",
+        reasoningOptIn: true,
+      },
+    });
+    const store = readLlmSettingsStore(root);
+    expect(store.providers[0]?.reasoningOptIn).toBe(true);
+    expect(publicLlmSettings(store).provider?.reasoningOptIn).toBe(true);
+
+    await saveLlmSettings(root, { provider: { id: "custom", reasoningOptIn: false } });
+    expect(readLlmSettingsStore(root).providers[0]?.reasoningOptIn).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).provider?.reasoningOptIn)
+      .toBeUndefined();
+  });
+
+  it("ignores invalid persisted reasoning modes", () => {
+    fs.writeFileSync(
+      path.join(root, ".margin", "llm-settings.json"),
+      JSON.stringify({
+        activeId: "custom",
+        reasoningMode: "ludicrous",
+        providers: [{
+          id: "custom",
+          name: "Custom",
+          apiFormat: "openai",
+          authStyle: "bearer",
+          baseURL: "https://provider.test/v1",
+          model: "model-a",
+        }],
+      }),
+      "utf8",
+    );
+    expect(readLlmSettingsStore(root).reasoningMode).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).reasoningMode).toBe("auto");
+  });
+});
+
+describe("cc-switch profiles", () => {
+  let root: string;
+  const prev = { ...process.env };
+  const ENV_KEYS = [
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "MARGIN_API_KEY",
+    "MARGIN_BASE_URL",
+    "MARGIN_PROVIDER",
+    "MARGIN_MODEL",
+    "MARGIN_AUTH_STYLE",
+    "MARGIN_API_FORMAT",
+  ] as const;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-llm-ccswitch-"));
+    fs.mkdirSync(path.join(root, ".margin"), { recursive: true });
+    for (const k of ENV_KEYS) delete process.env[k];
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const settingsFileText = () =>
+    fs.readFileSync(path.join(root, ".margin", "llm-settings.json"), "utf8");
+
+  it("never persists apiKey or the placeholder for a cc-switch profile", async () => {
+    await saveLlmSettings(root, {
+      provider: {
+        id: "cc-switch-claude",
+        name: "CC Switch 本地代理（Claude）",
+        apiFormat: "anthropic",
+        baseURL: "http://127.0.0.1:15721",
+        model: "claude-sonnet-4-6",
+        authStyle: "bearer",
+        source: "cc-switch",
+        apiKey: "sk-sentinel-SECRET",
+      },
+    });
+
+    const store = readLlmSettingsStore(root);
+    expect(store.providers[0]?.apiKey).toBeUndefined();
+    const fileText = settingsFileText();
+    expect(fileText).not.toContain("sk-sentinel-SECRET");
+    expect(fileText).not.toContain("PROXY_MANAGED");
+  });
+
+  it("injects the placeholder in memory only for a loopback cc-switch profile", async () => {
+    await saveLlmSettings(root, {
+      provider: {
+        id: "cc-switch-claude",
+        name: "CC Switch 本地代理（Claude）",
+        apiFormat: "anthropic",
+        baseURL: "http://127.0.0.1:15721",
+        model: "claude-sonnet-4-6",
+        authStyle: "bearer",
+        source: "cc-switch",
+      },
+    });
+
+    expect(process.env.MARGIN_API_KEY).toBe("PROXY_MANAGED");
+    expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe("PROXY_MANAGED");
+    expect(process.env.MARGIN_BASE_URL).toBe("http://127.0.0.1:15721");
+  });
+
+  it("refuses the placeholder when a cc-switch profile points off-loopback", async () => {
+    await saveLlmSettings(root, {
+      provider: {
+        id: "cc-switch-claude",
+        name: "CC Switch 本地代理（Claude）",
+        apiFormat: "anthropic",
+        baseURL: "https://evil.example.com",
+        model: "claude-sonnet-4-6",
+        authStyle: "bearer",
+        source: "cc-switch",
+      },
+    });
+
+    expect(process.env.MARGIN_API_KEY).toBeUndefined();
+    expect(process.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it("presents a cc-switch profile honestly without fake key material", async () => {
+    const saved = await saveLlmSettings(root, {
+      provider: {
+        id: "cc-switch-claude",
+        name: "CC Switch 本地代理（Claude）",
+        apiFormat: "anthropic",
+        baseURL: "http://127.0.0.1:15721",
+        model: "claude-sonnet-4-6",
+        authStyle: "bearer",
+        source: "cc-switch",
+      },
+    });
+
+    const pub = publicLlmSettings(saved);
+    expect(pub.provider?.apiKeySet).toBe(true);
+    expect(pub.provider?.apiKeyHint).toBe("由 CC Switch 代理管理");
+    expect(JSON.stringify(pub)).not.toContain("PROXY_MANAGED");
+
+    await saveLlmSettings(root, {
+      provider: { id: "cc-switch-claude", baseURL: "https://evil.example.com" },
+    });
+    const offLoopback = publicLlmSettings(readLlmSettingsStore(root));
+    expect(offLoopback.provider?.apiKeySet).toBe(false);
+    expect(offLoopback.provider?.apiKeyHint).toBe("");
+  });
+
+  it("funnels the cc-switch-proxy preset into the same memory-only behavior", async () => {
+    const saved = await applyPreset(root, "cc-switch-proxy");
+    const profile = saved.providers.find((p) => p.id === "cc-switch-proxy");
+    expect(profile?.source).toBe("cc-switch");
+    expect(profile?.apiKey).toBeUndefined();
+
+    const fileText = settingsFileText();
+    expect(fileText).not.toContain("PROXY_MANAGED");
+
+    // Placeholder is still applied in memory for the loopback target.
+    expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe("PROXY_MANAGED");
+  });
+});

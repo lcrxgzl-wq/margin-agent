@@ -260,6 +260,24 @@ export async function openWorkspace(rootInput: string): Promise<Workspace> {
       messages_json TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS agent_session_history (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      messages_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS model_usage (
+      id TEXT PRIMARY KEY,
+      ts TEXT NOT NULL,
+      path TEXT NOT NULL,
+      model TEXT NOT NULL,
+      input INTEGER NOT NULL,
+      output INTEGER NOT NULL,
+      cache_read INTEGER NOT NULL,
+      cache_write INTEGER NOT NULL,
+      request_id TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_model_usage_ts ON model_usage(ts);
   `);
 
   const proposalColumns = db.prepare("PRAGMA table_info(proposals)").all() as Array<{ name: string }>;

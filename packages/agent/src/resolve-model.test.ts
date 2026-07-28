@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { resolveRuntimeApiKey, resolveRuntimeModel } from "./resolve-model.js";
+import { effectiveThinkingLevel, resolveRuntimeApiKey, resolveRuntimeModel } from "./resolve-model.js";
 
 const KEYS = [
   "MARGIN_API_KEY",
@@ -79,5 +79,36 @@ describe("resolveRuntimeApiKey", () => {
     expect(resolved.model.compat).toBeUndefined();
     expect(resolved.model.maxTokens).toBeLessThanOrEqual(8_192);
     expect(resolved.authStyle).toBe("apikey");
+  });
+});
+
+describe("effectiveThinkingLevel", () => {
+  it("omits reasoning controls in auto mode", () => {
+    expect(effectiveThinkingLevel("auto", { model: { reasoning: true }, isBuiltin: true }))
+      .toBeUndefined();
+    expect(effectiveThinkingLevel(undefined, { model: { reasoning: true }, isBuiltin: true }))
+      .toBeUndefined();
+  });
+
+  it("maps explicit modes for reasoning-capable builtin models", () => {
+    const resolved = { model: { reasoning: true }, isBuiltin: true };
+    expect(effectiveThinkingLevel("fast", resolved)).toBe("low");
+    expect(effectiveThinkingLevel("standard", resolved)).toBe("medium");
+    expect(effectiveThinkingLevel("deep", resolved)).toBe("high");
+  });
+
+  it("never leaks reasoning levels to non-compatible models", () => {
+    const builtinNoReasoning = { model: { reasoning: false }, isBuiltin: true };
+    expect(effectiveThinkingLevel("deep", builtinNoReasoning)).toBeUndefined();
+    const custom = { model: { reasoning: false }, isBuiltin: false };
+    expect(effectiveThinkingLevel("deep", custom)).toBeUndefined();
+    expect(effectiveThinkingLevel("deep", custom, false)).toBeUndefined();
+  });
+
+  it("honors an explicit custom-provider opt-in", () => {
+    const custom = { model: { reasoning: false }, isBuiltin: false };
+    expect(effectiveThinkingLevel("fast", custom, true)).toBe("low");
+    expect(effectiveThinkingLevel("deep", custom, true)).toBe("high");
+    expect(effectiveThinkingLevel("auto", custom, true)).toBeUndefined();
   });
 });

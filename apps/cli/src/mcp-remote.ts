@@ -24,6 +24,7 @@ type RemoteMcpStore = { servers: RemoteMcpServer[] };
 const MAX_SERVERS = 8;
 const MAX_TOOLS = 100;
 const MAX_RESULT_CHARS = 64_000;
+export const REMOTE_MCP_MAX_RESULT_CHARS = MAX_RESULT_CHARS;
 const MAX_TOKEN_CHARS = 8_192;
 const MAX_SCHEMA_CHARS = 32_000;
 const TIMEOUT_MS = 20_000;

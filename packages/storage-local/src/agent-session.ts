@@ -343,6 +343,12 @@ export function ensureAgentSessionSchema(ws: Workspace): void {
       messages_json TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS agent_session_history (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      messages_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
 }
 
@@ -456,4 +462,99 @@ export function loadAgentSession(ws: Workspace): PersistedAgentSession | null {
 export function clearAgentSession(ws: Workspace): void {
   ensureAgentSessionSchema(ws);
   ws.db.prepare(`DELETE FROM agent_sessions WHERE id = ?`).run(SESSION_ROW_ID);
+}
+
+const MAX_SESSION_HISTORY = 50;
+const MAX_SESSION_TITLE_CHARS = 40;
+
+export type AgentSessionSummary = {
+  sessionId: string;
+  updatedAt: string;
+  title: string;
+  documentId?: string;
+  turnCount: number;
+};
+
+/**
+ * Snapshot the active ("current") session row into history, upserted by
+ * sessionId. Re-archiving bumps updated_at so recently used sessions float
+ * to the top of the list. History is pruned to the latest MAX_SESSION_HISTORY.
+ * Returns false when the current row is missing or belongs to another session.
+ */
+export function archiveAgentSession(ws: Workspace, sessionId: string): boolean {
+  ensureAgentSessionSchema(ws);
+  const row = ws.db
+    .prepare(`SELECT session_id, messages_json FROM agent_sessions WHERE id = ?`)
+    .get(SESSION_ROW_ID) as { session_id: string; messages_json: string } | undefined;
+  if (!row || row.session_id !== sessionId) return false;
+  ws.db.prepare(
+    `INSERT INTO agent_session_history (id, session_id, messages_json, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       session_id=excluded.session_id,
+       messages_json=excluded.messages_json,
+       updated_at=excluded.updated_at`,
+  ).run(sessionId, row.session_id, row.messages_json, new Date().toISOString());
+  ws.db.prepare(
+    `DELETE FROM agent_session_history WHERE id NOT IN (
+       SELECT id FROM agent_session_history ORDER BY updated_at DESC LIMIT ?
+     )`,
+  ).run(MAX_SESSION_HISTORY);
+  return true;
+}
+
+/** Load a full session envelope from history (same shape as loadAgentSession). */
+export function loadAgentSessionEnvelope(
+  ws: Workspace,
+  sessionId: string,
+): PersistedAgentSession | null {
+  ensureAgentSessionSchema(ws);
+  const row = ws.db
+    .prepare(`SELECT session_id, messages_json, updated_at FROM agent_session_history WHERE id = ?`)
+    .get(sessionId) as
+    | { session_id: string; messages_json: string; updated_at: string }
+    | undefined;
+  if (!row) return null;
+  const parsed = parseSessionPayload(row.messages_json);
+  return {
+    sessionId: row.session_id,
+    documentId: parsed.documentId,
+    messages: parsed.messages,
+    clarificationRounds: parsed.clarificationRounds,
+    chatTurns: parsed.chatTurns,
+    threads: parsed.threads,
+    sourcePaths: parsed.sourcePaths,
+    task: parsed.task,
+    updatedAt: row.updated_at,
+  };
+}
+
+/** Remove a session from history (no-op when absent). */
+export function deleteAgentSession(ws: Workspace, sessionId: string): void {
+  ensureAgentSessionSchema(ws);
+  ws.db.prepare(`DELETE FROM agent_session_history WHERE id = ?`).run(sessionId);
+}
+
+/** History list, most recently used first. */
+export function listAgentSessions(ws: Workspace): AgentSessionSummary[] {
+  ensureAgentSessionSchema(ws);
+  const rows = ws.db
+    .prepare(
+      `SELECT id, messages_json, updated_at FROM agent_session_history ORDER BY updated_at DESC`,
+    )
+    .all() as Array<{ id: string; messages_json: string; updated_at: string }>;
+  return rows.map((row) => {
+    const parsed = parseSessionPayload(row.messages_json);
+    const firstUserTurn = parsed.chatTurns.find((turn) => turn.role === "user");
+    const title = firstUserTurn
+      ? firstUserTurn.text.replace(/\s+/g, " ").trim().slice(0, MAX_SESSION_TITLE_CHARS)
+      : "";
+    return {
+      sessionId: row.id,
+      updatedAt: row.updated_at,
+      title: title || "新会话",
+      documentId: parsed.documentId,
+      turnCount: parsed.chatTurns.length,
+    };
+  });
 }

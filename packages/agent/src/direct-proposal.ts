@@ -7,7 +7,12 @@ import {
   type ProposalTargetLanguage,
 } from "@margin/domain";
 import { composeDirectPrompt, getAgentProfile } from "@margin/harness";
-import { canonicalizeProviderBaseURL } from "@margin/llm";
+import {
+  canonicalizeProviderBaseURL,
+  extractUsage,
+  marginRequestHeaders,
+  reportModelUsage,
+} from "@margin/llm";
 
 type DirectProposalInput = {
   block: BlockSnapshot;
@@ -22,6 +27,8 @@ type DirectProposalInput = {
   targetLanguage?: ProposalTargetLanguage;
   sourceContext?: Array<{ sourceRef: string; text: string }>;
   workspaceSkillsRoot?: string;
+  disabledSkills?: readonly string[];
+  selectedSkills?: readonly string[];
   signal?: AbortSignal;
 };
 
@@ -86,6 +93,7 @@ function requestHeaders(
   const headers: Record<string, string> = {
     Accept: "application/json",
     "Content-Type": "application/json",
+    ...marginRequestHeaders(),
   };
   if (format === "anthropic") {
     headers["anthropic-version"] = "2023-06-01";
@@ -213,6 +221,16 @@ function mockProposal(input: DirectProposalInput): LlmProposalOutput {
   });
 }
 
+/** Stable persona/instruction block, sent as the system message so it precedes dynamic content. */
+function systemPromptFor(input: DirectProposalInput): string {
+  return composeDirectPrompt(input.harnessId, {
+    workspaceSkillsRoot: input.workspaceSkillsRoot,
+    instruction: input.instruction,
+    disabledSkills: input.disabledSkills,
+    selectedSkills: input.selectedSkills,
+  });
+}
+
 function promptFor(input: DirectProposalInput): string {
   const neighbors = (input.neighbors ?? [])
     .filter((block) => block.id !== input.block.id)
@@ -235,12 +253,7 @@ function promptFor(input: DirectProposalInput): string {
   const responseShape = selection
     ? '{"blockId":"...","replacement":"...","rationale":"...","risk":"language|structure|argument|fact","evidence":[]}'
     : '{"blockId":"...","after":"...","rationale":"...","risk":"language|structure|argument|fact","evidence":[]}';
-  return `${composeDirectPrompt(input.harnessId, {
-    workspaceSkillsRoot: input.workspaceSkillsRoot,
-    instruction: input.instruction,
-  })}
-
-Return exactly one JSON object with this shape:
+  return `Return exactly one JSON object with this shape:
 ${responseShape}
 
 Rules:
@@ -349,6 +362,7 @@ function applySelectedSpan(
 async function requestCompletion(
   format: ApiFormat,
   key: string,
+  system: string,
   prompt: string,
   externalSignal?: AbortSignal,
   modelOverride?: string,
@@ -363,12 +377,16 @@ async function requestCompletion(
       ? {
           model,
           max_tokens: 4096,
+          system,
           messages: [{ role: "user", content: prompt }],
         }
       : {
           model,
           max_tokens: 4096,
-          messages: [{ role: "user", content: prompt }],
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: prompt },
+          ],
         };
   const endpoints = endpointURLs(format);
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
@@ -377,9 +395,10 @@ async function requestCompletion(
     : timeoutSignal;
 
   for (const [index, endpoint] of endpoints.entries()) {
+    const headers = requestHeaders(format, key);
     const response = await fetch(endpoint, {
       method: "POST",
-      headers: requestHeaders(format, key),
+      headers,
       body: JSON.stringify(body),
       redirect: "manual",
       signal,
@@ -400,6 +419,15 @@ async function requestCompletion(
     }
     const text = completionText(format, payload);
     if (!text.trim()) throw new Error("LLM endpoint returned empty text");
+    const usage = extractUsage(format, payload);
+    if (usage) {
+      reportModelUsage({
+        path: "quick-edit",
+        model,
+        ...usage,
+        requestId: headers["X-Client-Request-Id"] ?? "",
+      });
+    }
     return text;
   }
   throw new Error("LLM completion endpoint was not found");
@@ -433,6 +461,7 @@ export async function generateDirectProposal(
   const raw = await requestCompletion(
     format,
     key,
+    systemPromptFor(input),
     promptFor(input),
     input.signal,
     profile.model,

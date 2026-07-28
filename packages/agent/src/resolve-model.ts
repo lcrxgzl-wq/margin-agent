@@ -3,6 +3,7 @@
  */
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import { canonicalizeProviderBaseURL } from "@margin/llm";
+import type { ReasoningMode } from "./types.js";
 
 type AnyModel = {
   id: string;
@@ -32,6 +33,8 @@ export type ResolvedRuntimeModel = {
   apiKey?: string;
   authStyle: "bearer" | "apikey";
   baseURL?: string;
+  /** True when the model id resolved to a pi builtin (provider-known capabilities). */
+  isBuiltin: boolean;
 };
 
 function apiFormat(): "openai" | "anthropic" {
@@ -142,6 +145,7 @@ export function resolveRuntimeModel(modelOverride?: string): ResolvedRuntimeMode
     return {
       provider: format,
       model,
+      isBuiltin: !!builtin,
       apiKey: undefined,
       authStyle: style,
       baseURL,
@@ -151,6 +155,7 @@ export function resolveRuntimeModel(modelOverride?: string): ResolvedRuntimeMode
   return {
     provider: format,
     model,
+    isBuiltin: !!builtin,
     apiKey: key,
     authStyle: style,
     baseURL,
@@ -163,4 +168,23 @@ export function hasRuntimeCredentials(): boolean {
     process.env.ANTHROPIC_AUTH_TOKEN ||
     process.env.MARGIN_BASE_URL
   );
+}
+
+
+/**
+ * Map the product reasoning mode to a Pi thinking level.
+ * Explicit modes apply only to reasoning-capable builtins, or to custom
+ * (non-builtin) providers that explicitly opted in. Anything else omits
+ * provider-specific reasoning controls entirely.
+ */
+export function effectiveThinkingLevel(
+  mode: ReasoningMode | undefined,
+  resolved: { model: { reasoning?: boolean }; isBuiltin: boolean },
+  reasoningOptIn?: boolean,
+): "low" | "medium" | "high" | undefined {
+  if (!mode || mode === "auto") return undefined;
+  const level = mode === "fast" ? "low" : mode === "standard" ? "medium" : "high";
+  if (resolved.model.reasoning === true) return level;
+  if (!resolved.isBuiltin && reasoningOptIn === true) return level;
+  return undefined;
 }

@@ -14,11 +14,14 @@ export type LlmSettingsPutBody = {
         apiKey?: string;
         baseURL?: string;
         authStyle?: "bearer" | "apikey";
+        reasoningOptIn?: boolean;
       };
   model?: string;
   apiKey?: string;
   baseURL?: string;
   authStyle?: "bearer" | "apikey";
+  reasoningOptIn?: boolean;
+  reasoningMode?: "auto" | "fast" | "standard" | "deep" | null;
   harnessId?: string | null;
 };
 
@@ -46,6 +49,7 @@ export function buildLlmSettingsUpdate(
     apiKey: body.apiKey ?? obj.apiKey,
     baseURL: body.baseURL ?? obj.baseURL,
     authStyle: body.authStyle ?? obj.authStyle,
+    reasoningOptIn: body.reasoningOptIn ?? obj.reasoningOptIn,
   };
   const defined = Object.fromEntries(
     Object.entries(merged).filter(([, value]) => value !== undefined),
@@ -53,6 +57,7 @@ export function buildLlmSettingsUpdate(
   return {
     clearApiKey: !!body.clearApiKey,
     harnessId,
+    reasoningMode: body.reasoningMode,
     provider: Object.keys(defined).length
       ? { ...defined, id: activeProviderId }
       : undefined,

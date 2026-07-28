@@ -6,6 +6,9 @@ import type {
   TableCellChange,
 } from "@margin/domain";
 
+/** Product-level reasoning mode; auto omits provider-specific reasoning controls. */
+export type ReasoningMode = "auto" | "fast" | "standard" | "deep";
+
 export type PaperAgentContext = {
   documentId: string;
   revision: number;
@@ -25,9 +28,17 @@ export type PaperAgentContext = {
   sourceContext?: Array<{ sourceRef: string; text: string }>;
   /** Workspace Skill root used only to compile explicitly selected Quick Edit skills. */
   skillsRoot?: string;
+  /** Persistently disabled Skills (workspace store off-set); auto = absent. */
+  disabledSkills?: string[];
+  /** Explicit one-turn Skills (structured ids) for this Quick Edit run. */
+  selectedSkills?: string[];
   signal?: AbortSignal;
   /** Prefer single-shot LLM proposals over full pi tool loop (snappier UX). */
   preferSimple?: boolean;
+  /** Product reasoning mode; explicit levels apply only to compatible/opted-in models. */
+  reasoningMode?: ReasoningMode;
+  /** Custom provider opt-in to reasoning controls (set after a passing connection test). */
+  reasoningOptIn?: boolean;
 };
 
 export type AgentComment = {

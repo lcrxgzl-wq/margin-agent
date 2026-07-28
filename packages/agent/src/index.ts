@@ -70,6 +70,19 @@ export {
   runOfflineSessionTurn,
 } from "./session-runner.js";
 export { createSessionTools } from "./session-tools.js";
+export {
+  createRemoteMcpTools,
+  namespaceRemoteMcpToolNames,
+  boundApprovalArgs,
+} from "./mcp-tools.js";
+export type {
+  RemoteMcpApprovalDecision,
+  RemoteMcpApprovalFn,
+  RemoteMcpApprovalRequest,
+  RemoteMcpBridge,
+  RemoteMcpCallableTool,
+  RemoteMcpCallResult,
+} from "./mcp-tools.js";
 export type { SessionTurnResult, SessionTurnInput } from "./session-runner.js";
 export type { WorkspaceBridge, SessionDocBag } from "./session-tools.js";
 export {
@@ -114,7 +127,9 @@ export async function runBlockScan(
   blockIds?: string[],
   onProgress?: ScanProgressHandler,
 ): Promise<PaperAgentResult> {
-  if (ctx.preferSimple) {
+  // Explicit one-turn Skill selections are only honored by the single-shot
+  // direct path (skills are inlined there); never silently dropped by pi scan.
+  if (ctx.preferSimple || ctx.selectedSkills?.length) {
     return runDirectBlockProposal(ctx, blockIds, onProgress);
   }
   const engine = resolveEngine();
@@ -166,6 +181,8 @@ async function runDirectBlockProposal(
     targetLanguage: ctx.targetLanguage,
     sourceContext: ctx.sourceContext,
     workspaceSkillsRoot: ctx.skillsRoot,
+    disabledSkills: ctx.disabledSkills,
+    selectedSkills: ctx.selectedSkills,
     signal: ctx.signal,
   });
   emit("生成修订提案", block.id);
@@ -186,7 +203,10 @@ async function runDirectBlockProposal(
   };
   const comments = getHeuristicComments(undefined, ctx.harnessId)?.([block]) ?? [];
   emit("完成（1 处提案）");
-  return { engine: "simple", proposals: [proposal], comments, steps };
+  const notes = ctx.selectedSkills?.length && !hasRuntimeCredentials()
+    ? [`explicit skills not applied offline (configure a model): ${ctx.selectedSkills.join(", ")}`]
+    : undefined;
+  return { engine: "simple", proposals: [proposal], comments, steps, notes };
 }
 
 /** Cross-paragraph selection: one whole-block proposal per covered paragraph,
@@ -224,6 +244,8 @@ async function runDirectMultiBlockProposal(
       targetLanguage: ctx.targetLanguage,
       sourceContext: ctx.sourceContext,
       workspaceSkillsRoot: ctx.skillsRoot,
+    disabledSkills: ctx.disabledSkills,
+    selectedSkills: ctx.selectedSkills,
       signal: ctx.signal,
     });
     proposals.push({
@@ -242,7 +264,10 @@ async function runDirectMultiBlockProposal(
   }
   const comments = getHeuristicComments(undefined, ctx.harnessId)?.(selected) ?? [];
   emit(`完成（${proposals.length} 处提案）`);
-  return { engine: "simple", proposals, comments, steps };
+  const notes = ctx.selectedSkills?.length && !hasRuntimeCredentials()
+    ? [`explicit skills not applied offline (configure a model): ${ctx.selectedSkills.join(", ")}`]
+    : undefined;
+  return { engine: "simple", proposals, comments, steps, notes };
 }
 
 export async function runSimpleBlockScan(

@@ -9,6 +9,14 @@ export { PROVIDER_PRESETS } from "./provider-presets.js";
 
 export type AuthStyle = "bearer" | "apikey";
 
+export type ReasoningMode = "auto" | "fast" | "standard" | "deep";
+
+function normalizeReasoningMode(value: unknown): ReasoningMode | undefined {
+  return value === "auto" || value === "fast" || value === "standard" || value === "deep"
+    ? value
+    : undefined;
+}
+
 export type LlmProviderProfile = {
   id: string;
   name: string;
@@ -20,6 +28,8 @@ export type LlmProviderProfile = {
   source?: string;
   websiteUrl?: string;
   currentInCcSwitch?: boolean;
+  /** Explicit opt-in to reasoning controls for a custom (non-builtin) provider. */
+  reasoningOptIn?: boolean;
 };
 
 export type LlmSettingsStore = {
@@ -27,6 +37,8 @@ export type LlmSettingsStore = {
   providers: LlmProviderProfile[];
   /** Selected revision harness; undefined falls back to the default harness. */
   harnessId?: string;
+  /** Product-level reasoning mode; default auto omits provider reasoning controls. */
+  reasoningMode?: ReasoningMode;
 };
 
 /** @deprecated flat shape — migrated on read */
@@ -53,10 +65,15 @@ export type LlmSettingsPublic = {
   }>;
   llmMode: "mock" | "byok";
   harnessId?: string;
+  reasoningMode: ReasoningMode;
   ccSwitch?: {
     detected: boolean;
     proxyBaseURL?: string;
     proxyEnabled?: boolean;
+    routes?: {
+      claude?: { baseURL: string; model?: string };
+      codex?: { baseURL: string; model?: string };
+    };
   };
 };
 
@@ -72,6 +89,7 @@ export type LlmProviderProfilePublic = {
   source?: string;
   websiteUrl?: string;
   currentInCcSwitch?: boolean;
+  reasoningOptIn?: boolean;
 };
 
 const FILE = "llm-settings.json";
@@ -161,12 +179,19 @@ function normalizeProfile(p: Partial<LlmProviderProfile>, i: number): LlmProvide
     apiFormat,
     baseURL: (p.baseURL || "").trim(),
     model: (p.model || (apiFormat === "anthropic" ? "claude-sonnet-4-6" : "gpt-4o-mini")).trim(),
-    apiKey: typeof p.apiKey === "string" ? p.apiKey : undefined,
+    // CC Switch routes never persist key material; the placeholder is memory-only.
+    apiKey:
+      p.source === "cc-switch"
+        ? undefined
+        : typeof p.apiKey === "string"
+          ? p.apiKey
+          : undefined,
     authStyle:
       apiFormat === "openai" || p.authStyle === "bearer" ? "bearer" : "apikey",
     source: p.source,
     websiteUrl: p.websiteUrl,
     currentInCcSwitch: p.currentInCcSwitch,
+    reasoningOptIn: p.reasoningOptIn === true ? true : undefined,
   };
 }
 
@@ -209,6 +234,22 @@ function validateProviderBaseURL(baseURL: string): void {
   }
 }
 
+/** Placeholder credential for CC Switch routes: memory-only, loopback-only. */
+export const CC_SWITCH_PLACEHOLDER_KEY = "PROXY_MANAGED";
+
+/** True when baseURL points at a loopback host (127.0.0.0/8, localhost, ::1). */
+export function isLoopbackBaseURL(baseURL: string): boolean {
+  try {
+    const url = new URL(baseURL.trim());
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    if (host === "localhost" || host === "::1") return true;
+    return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+  } catch {
+    return false;
+  }
+}
+
 export function readLlmSettingsStore(root: string): LlmSettingsStore {
   const abs = settingsPath(root);
   if (!fs.existsSync(abs)) return defaultStore();
@@ -228,7 +269,8 @@ export function readLlmSettingsStore(root: string): LlmSettingsStore {
       typeof raw.harnessId === "string" && raw.harnessId.trim()
         ? raw.harnessId.trim()
         : undefined;
-    return { activeId, providers, harnessId };
+    const reasoningMode = normalizeReasoningMode(raw.reasoningMode);
+    return { activeId, providers, harnessId, reasoningMode };
   } catch {
     return defaultStore();
   }
@@ -280,7 +322,14 @@ export function applyProfile(profile: LlmProviderProfile): void {
   delete process.env.ANTHROPIC_API_KEY;
   delete process.env.ANTHROPIC_AUTH_TOKEN;
 
-  const key = profile.apiKey?.trim();
+  // CC Switch profiles carry no persisted key; inject the placeholder in
+  // memory only when the target is loopback (defense in depth).
+  const key =
+    profile.source === "cc-switch"
+      ? isLoopbackBaseURL(profile.baseURL)
+        ? CC_SWITCH_PLACEHOLDER_KEY
+        : undefined
+      : profile.apiKey?.trim();
   if (key) {
     process.env.MARGIN_API_KEY = key;
     if (profile.apiFormat === "anthropic") {
@@ -296,6 +345,7 @@ export function applyProfile(profile: LlmProviderProfile): void {
 
 function profilePublic(p: LlmProviderProfile): LlmProviderProfilePublic {
   const key = p.apiKey?.trim() ?? "";
+  const proxyManaged = p.source === "cc-switch" && isLoopbackBaseURL(p.baseURL);
   return {
     id: p.id,
     name: p.name,
@@ -303,11 +353,12 @@ function profilePublic(p: LlmProviderProfile): LlmProviderProfilePublic {
     baseURL: p.baseURL,
     model: p.model,
     authStyle: p.authStyle,
-    apiKeySet: !!key,
-    apiKeyHint: key ? maskKey(key) : "",
+    apiKeySet: !!key || proxyManaged,
+    apiKeyHint: key ? maskKey(key) : proxyManaged ? "由 CC Switch 代理管理" : "",
     source: p.source,
     websiteUrl: p.websiteUrl,
     currentInCcSwitch: p.currentInCcSwitch,
+    reasoningOptIn: p.reasoningOptIn === true ? true : undefined,
   };
 }
 
@@ -333,6 +384,7 @@ export function publicLlmSettings(
     })),
     llmMode: keySet ? "byok" : "mock",
     harnessId: store.harnessId,
+    reasoningMode: store.reasoningMode ?? "auto",
     ccSwitch,
   };
 }
@@ -345,6 +397,8 @@ export type SaveLlmSettingsInput = {
   clearApiKey?: boolean;
   /** Set to a harness id, or null/"" to clear back to the default harness. */
   harnessId?: string | null;
+  /** Set the product reasoning mode; null/unknown resets to auto. */
+  reasoningMode?: ReasoningMode | null;
 };
 
 export async function writeLlmSettingsStore(
@@ -356,6 +410,7 @@ export async function writeLlmSettingsStore(
   const normalized: LlmSettingsStore = {
     activeId: store.activeId,
     harnessId: store.harnessId,
+    reasoningMode: store.reasoningMode,
     providers: store.providers.map((p, i) => {
       validateProviderBaseURL(p.baseURL || "");
       return normalizeProfile(p, i);
@@ -449,6 +504,10 @@ export async function saveLlmSettings(
     store = { ...store, harnessId };
   }
 
+  if (input.reasoningMode !== undefined) {
+    store = { ...store, reasoningMode: normalizeReasoningMode(input.reasoningMode) };
+  }
+
   return writeLlmSettingsStore(root, store);
 }
 
@@ -471,10 +530,10 @@ export async function applyPreset(
       baseURL: preset.baseURL,
       model: preset.model,
       authStyle: preset.authStyle,
-      source: "preset",
+      source: preset.id === "cc-switch-proxy" ? "cc-switch" : "preset",
       apiKey:
         apiKey?.trim() ||
-        (preset.id === "cc-switch-proxy" ? "PROXY_MANAGED" : existing?.apiKey),
+        (preset.id === "cc-switch-proxy" ? undefined : existing?.apiKey),
     },
   });
 }

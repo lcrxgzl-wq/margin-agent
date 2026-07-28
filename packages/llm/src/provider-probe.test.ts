@@ -4,6 +4,7 @@ import {
   discoverLlmModels,
   testLlmModelConnection,
 } from "./provider-probe.js";
+import { configureRequestPolicy, type ModelUsageEntry } from "./request-policy.js";
 
 function mockFetch(handler: typeof fetch) {
   vi.stubGlobal("fetch", vi.fn(handler));
@@ -287,6 +288,59 @@ describe("testLlmModelConnection", () => {
     expect(result.ok).toBe(true);
     expect(result.models).toEqual([]);
     expect(result.resolvedBaseURL).toBe("https://provider.test/v1");
+  });
+
+  it("sends policy headers and records probe usage when present", async () => {
+    configureRequestPolicy({ version: "0.2.0-test" });
+    const recorded: ModelUsageEntry[] = [];
+    configureRequestPolicy({ onUsage: (entry) => recorded.push(entry) });
+    let sentHeaders: Headers | undefined;
+    mockFetch(async (_input, init) => {
+      sentHeaders = new Headers(init?.headers);
+      return Response.json({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 12, completion_tokens: 3 },
+      });
+    });
+
+    const result = await testLlmModelConnection({
+      apiFormat: "openai",
+      baseURL: "https://provider.test/v1",
+      apiKey: "secret",
+      model: "gpt-test",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(sentHeaders?.get("user-agent")).toBe("margin-agent/0.2.0-test");
+    const requestId = sentHeaders?.get("x-client-request-id");
+    expect(requestId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(recorded).toEqual([{
+      path: "probe",
+      model: "gpt-test",
+      input: 12,
+      output: 3,
+      cacheRead: 0,
+      cacheWrite: 0,
+      requestId,
+    }]);
+    configureRequestPolicy({ onUsage: undefined });
+  });
+
+  it("does not record usage when the probe response omits it", async () => {
+    const recorded: ModelUsageEntry[] = [];
+    configureRequestPolicy({ onUsage: (entry) => recorded.push(entry) });
+    mockFetch(async () => Response.json({ choices: [{ message: { content: "ok" } }] }));
+
+    const result = await testLlmModelConnection({
+      apiFormat: "openai",
+      baseURL: "https://provider.test/v1",
+      apiKey: "secret",
+      model: "gpt-test",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(recorded).toEqual([]);
+    configureRequestPolicy({ onUsage: undefined });
   });
 
   it("retries OpenAI chat completions under /v1 after a 405", async () => {

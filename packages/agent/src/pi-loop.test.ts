@@ -39,7 +39,19 @@ vi.mock("@earendil-works/pi-agent-core", () => ({
   },
 }));
 
+const mockCompat = vi.hoisted(() => ({
+  streamSimpleCalls: [] as Array<{ options?: Record<string, unknown> }>,
+}));
+
+vi.mock("@earendil-works/pi-ai/compat", () => ({
+  streamSimple: (_model: unknown, _context: unknown, options?: Record<string, unknown>) => {
+    mockCompat.streamSimpleCalls.push({ options });
+    return {};
+  },
+}));
+
 const { runPiAgentLoop, summarizeToolArguments, trimAgentMessages } = await import("./pi-loop.js");
+const { configureRequestPolicy } = await import("@margin/llm");
 
 beforeEach(() => {
   mockAgent.abortCalls = 0;
@@ -48,6 +60,7 @@ beforeEach(() => {
   mockAgent.rejectPrompt = undefined;
   mockAgent.options = undefined;
   mockAgent.subscriber = undefined;
+  mockCompat.streamSimpleCalls.length = 0;
 });
 
 describe("runPiAgentLoop external cancellation", () => {
@@ -337,5 +350,103 @@ describe("Pi runtime boundaries", () => {
 
     await expect(toolRun).rejects.toThrow(/tool cancelled/);
     await expect(running).resolves.toMatchObject({ outcome: "aborted" });
+  });
+});
+
+describe("Pi request policy", () => {
+  const runToCompletion = async (opts: Record<string, unknown> = {}) => {
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: { id: "model-pi" },
+      timeoutMs: 10_000,
+      ...opts,
+    } as never);
+    mockAgent.resolvePrompt?.();
+    return running;
+  };
+
+  it("keeps thinkingLevel off unless an explicit level is requested", async () => {
+    await runToCompletion();
+    expect((mockAgent.options?.initialState as { thinkingLevel?: string }).thinkingLevel)
+      .toBe("off");
+
+    await runToCompletion({ thinkingLevel: "low" });
+    expect((mockAgent.options?.initialState as { thinkingLevel?: string }).thinkingLevel)
+      .toBe("low");
+  });
+
+  it("injects margin policy headers into every provider request via streamFn", async () => {
+    configureRequestPolicy({ version: "0.2.0-test" });
+    await runToCompletion();
+    const streamFn = mockAgent.options?.streamFn as (
+      model: unknown,
+      context: unknown,
+      options?: Record<string, unknown>,
+    ) => unknown;
+    expect(typeof streamFn).toBe("function");
+
+    streamFn({}, {}, { headers: { "X-Custom": "keep" }, sessionId: "s-1" });
+    expect(mockCompat.streamSimpleCalls).toHaveLength(1);
+    const options = mockCompat.streamSimpleCalls[0]!.options as {
+      headers: Record<string, string>;
+      sessionId?: string;
+    };
+    expect(options.headers["X-Custom"]).toBe("keep");
+    expect(options.headers["User-Agent"]).toBe("margin-agent/0.2.0-test");
+    expect(options.headers["X-Client-Request-Id"]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(options.sessionId).toBe("s-1");
+
+    streamFn({}, {}, {});
+    const second = mockCompat.streamSimpleCalls[1]!.options as { headers: Record<string, string> };
+    expect(second.headers["X-Client-Request-Id"])
+      .not.toBe(options.headers["X-Client-Request-Id"]);
+  });
+
+  it("aggregates assistant usage per loop and reports it best-effort", async () => {
+    const recorded: unknown[] = [];
+    configureRequestPolicy({ onUsage: (entry: unknown) => recorded.push(entry) });
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: { id: "model-pi" },
+      usagePath: "pi-chat",
+      timeoutMs: 10_000,
+    });
+    mockAgent.subscriber?.({
+      type: "message_end",
+      message: { role: "assistant", usage: { input: 10, output: 4, cacheRead: 6, cacheWrite: 2 } },
+    });
+    mockAgent.subscriber?.({
+      type: "message_end",
+      message: { role: "assistant", usage: { input: 5, output: 1, cacheRead: 0, cacheWrite: 0 } },
+    });
+    mockAgent.subscriber?.({ type: "message_end", message: { role: "user" } });
+    mockAgent.resolvePrompt?.();
+    await running;
+
+    expect(recorded).toEqual([
+      expect.objectContaining({
+        path: "pi-chat",
+        model: "model-pi",
+        input: 15,
+        output: 5,
+        cacheRead: 6,
+        cacheWrite: 2,
+      }),
+    ]);
+    expect((recorded[0] as { requestId: string }).requestId).toMatch(/^[0-9a-f-]{36}$/);
+    configureRequestPolicy({ onUsage: undefined });
+  });
+
+  it("does not report usage without a usagePath or without tokens", async () => {
+    const recorded: unknown[] = [];
+    configureRequestPolicy({ onUsage: (entry: unknown) => recorded.push(entry) });
+    await runToCompletion({ usagePath: "pi-scan" });
+    await runToCompletion();
+    expect(recorded).toEqual([]);
+    configureRequestPolicy({ onUsage: undefined });
   });
 });

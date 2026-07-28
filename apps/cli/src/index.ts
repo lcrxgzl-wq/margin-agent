@@ -39,11 +39,19 @@ import {
   listAgentTranscripts,
   loadAndApplyLlmSettings,
   readLlmSettingsStore,
+  readSkillSettings,
+  disabledSkillNames,
+  setSkillMode,
+  recordModelUsage,
   activeProfile,
   saveLlmSettings,
   publicLlmSettings,
   assertNotRegisteredDocumentWrite,
   saveAgentSession,
+  archiveAgentSession,
+  deleteAgentSession,
+  listAgentSessions,
+  loadAgentSessionEnvelope,
   listDocumentTimeline,
   type PersistedReviewThread,
   type Workspace,
@@ -54,6 +62,8 @@ import {
   runBlockScan,
   resolveEngine,
   type ToolAuditEvent,
+  type RemoteMcpApprovalRequest,
+  type RemoteMcpBridge,
 } from "@margin/agent";
 import {
   contentHash,
@@ -63,16 +73,18 @@ import {
 import {
   getHarness,
   importWorkspaceSkill,
-  listAvailableSkills,
   listHarnesses,
+  listSkillStates,
   removeWorkspaceSkill,
 } from "@margin/harness";
 import {
+  configureRequestPolicy,
   discoverLlmModels,
   testLlmModelConnection,
   type LlmProviderProbeInput,
 } from "@margin/llm";
 import {
+  chatAgentStateFromSession,
   clearChatAgentConversation,
   closeChatAgentDocument,
   isCloseDocumentRequest,
@@ -90,14 +102,26 @@ import {
   resolveLlmConnectionInput,
   type LlmConnectionBody,
 } from "./llm-connection.js";
+import {
+  ccSwitchPublicInfo,
+  connectCcSwitchRoute,
+  type CcSwitchRouteId,
+} from "./cc-switch-connect.js";
 import { setBoundedMap } from "./run-state.js";
 import { abortOnClientDisconnect } from "./stream-lifecycle.js";
 import {
+  callEnabledRemoteMcpTool,
   discoverWorkspaceRemoteMcp,
+  listEnabledRemoteMcpTools,
   publicRemoteMcpServers,
+  REMOTE_MCP_MAX_RESULT_CHARS,
   removeRemoteMcpServer,
   saveRemoteMcpServer,
 } from "./mcp-remote.js";
+import {
+  createMcpApprovalRegistry,
+  type McpApprovalAuditEntry,
+} from "./mcp-approvals.js";
 import { MARGIN_VERSION } from "./version.js";
 
 function llmMode(): "mock" | "byok" {
@@ -114,6 +138,44 @@ function llmMode(): "mock" | "byok" {
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/** One-use per-call remote MCP approvals (60s expiry; denied on cancel/disconnect/supersede). */
+const mcpApprovalRegistry = createMcpApprovalRegistry();
+
+/** Remote MCP bridge for the agent tool layer: lists enabled read-only tools from the local store. */
+function createRemoteMcpBridge(workspaceRoot: string): RemoteMcpBridge {
+  return {
+    listCallableTools: () =>
+      listEnabledRemoteMcpTools(workspaceRoot).map((tool) => ({
+        serverId: tool.serverId,
+        serverName: tool.serverName,
+        tool: tool.name,
+        description: tool.description,
+        schema: tool.inputSchema,
+      })),
+    callTool: async (serverId, tool, args) => {
+      try {
+        // callEnabledRemoteMcpTool re-lists remote tools and re-checks
+        // readOnly/destructive annotations immediately before the call.
+        const content = await callEnabledRemoteMcpTool(workspaceRoot, {
+          serverId,
+          name: tool,
+          arguments: args,
+        });
+        return {
+          content,
+          truncated: content.length >= REMOTE_MCP_MAX_RESULT_CHARS,
+        };
+      } catch (error) {
+        return {
+          content: "",
+          truncated: false,
+          remoteError: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
+  };
+}
 
 type RunState = {
   status: string;
@@ -161,17 +223,52 @@ async function main() {
   const port = Number(process.env.MARGIN_PORT ?? 8787);
   const token = randomUUID().replace(/-/g, "");
   const workspace = await openWorkspace(workspacePath);
+  configureRequestPolicy({
+    version: MARGIN_VERSION,
+    onUsage: (entry) => recordModelUsage(workspace, entry),
+  });
   await recoverDecidedProposals(workspace);
   await reconcileRegisteredDocxDocuments(workspace);
   loadAndApplyLlmSettings(workspacePath);
   const configuredProfileId = readLlmSettingsStore(workspacePath).harnessId;
   if (configuredProfileId) getHarness(configuredProfileId.trim());
 
-  const llmPublic = () => publicLlmSettings(readLlmSettingsStore(workspacePath));
+  const llmPublic = () =>
+    publicLlmSettings(
+      readLlmSettingsStore(workspacePath),
+      ccSwitchPublicInfo(),
+    );
   const resolveHarnessId = (requested?: string | null) => {
     const configured = readLlmSettingsStore(workspacePath).harnessId;
     const requestedId = typeof requested === "string" ? requested.trim() : "";
     return getHarness(requestedId || configured?.trim() || undefined).id;
+  };
+
+  /** Structured per-turn Skill ids: unknown / blocked / disabled all fail visibly. */
+  const resolveSelectedSkills = (raw: unknown):
+    | { ok: true; skills: string[] }
+    | { ok: false; error: string } => {
+    if (raw === undefined) return { ok: true, skills: [] };
+    if (!Array.isArray(raw) || raw.some((item) => typeof item !== "string")) {
+      return { ok: false, error: "selectedSkills 必须是字符串数组" };
+    }
+    const names = [...new Set(raw.map((item) => item.trim().toLowerCase()).filter(Boolean))];
+    if (names.length > 8) return { ok: false, error: "每轮最多显式选用 8 个 Skill" };
+    const store = readSkillSettings(workspacePath);
+    const scope = getHarness(resolveHarnessId()).skills.scope;
+    const states = new Map(
+      listSkillStates(path.join(workspacePath, ".margin", "skills"), scope, disabledSkillNames(store))
+        .map((skill) => [skill.name, skill.state] as const),
+    );
+    for (const name of names) {
+      const state = states.get(name);
+      if (!state) return { ok: false, error: `未知 Skill: ${name}` };
+      if (state === "blocked_by_profile") {
+        return { ok: false, error: `当前 Agent 模式无法使用 Skill: ${name}` };
+      }
+      if (state === "disabled") return { ok: false, error: `Skill 已关闭: ${name}` };
+    }
+    return { ok: true, skills: names };
   };
 
   const resolveConnectionDraft = (body: LlmConnectionBody = {}) =>
@@ -220,6 +317,48 @@ async function main() {
       sourcePaths: state.agent.sourcePaths,
       task: state.agent.task,
     });
+  /** GET /api/v1/session payload — also returned by session new/switch so the web reuses one hydrate path. */
+  const sessionPayload = () => {
+    const harness = getHarness(resolveHarnessId());
+    const opened = state.agent.bag.documentId
+      ? {
+          document: getDocument(workspace, state.agent.bag.documentId),
+          blocks: listBlocks(workspace, state.agent.bag.documentId),
+        }
+      : undefined;
+    return {
+      token,
+      workspace: workspacePath,
+      port,
+      llmMode: llmMode(),
+      engine: resolveEngine(),
+      llm: llmPublic(),
+      harness: { id: harness.id, title: harness.title },
+      clarificationRounds: state.agent.clarificationRounds ?? 0,
+      sourcePaths: state.agent.sourcePaths,
+      task: state.agent.task,
+      opened,
+      chat: {
+        turns: state.chat.list(),
+        maxTurns: 12,
+      },
+      review: {
+        threads: state.reviewThreads.filter(
+          (thread) => thread.documentId === state.agent.bag.documentId,
+        ),
+      },
+    };
+  };
+
+  /** Snapshot the active conversation into history when it holds any content. */
+  const archiveCurrentSession = () => {
+    const hasContent =
+      state.agent.agentMessages.length > 0 ||
+      state.chat.list().length > 0 ||
+      Boolean(state.agent.task);
+    if (hasContent) archiveAgentSession(workspace, state.agent.sessionId);
+  };
+
   const sourceExcerptCache = new Map<string, {
     mtimeMs: number;
     size: number;
@@ -259,6 +398,7 @@ async function main() {
       tableCell?: { row: number; column: number; address: string; before: string };
       sourcePaths?: string[];
       preferSimple?: boolean;
+      selectedSkills?: string[];
     },
     signal?: AbortSignal,
   ) => {
@@ -283,8 +423,11 @@ async function main() {
         });
         remainingSourceChars -= end;
       }
+      const scanLlmStore = readLlmSettingsStore(workspacePath);
       const scan = await runBlockScan(
         {
+          reasoningMode: scanLlmStore.reasoningMode,
+          reasoningOptIn: activeProfile(scanLlmStore).reasoningOptIn,
           documentId,
           revision: doc.revision,
           blocks,
@@ -297,6 +440,8 @@ async function main() {
           tableCell: opts?.tableCell,
           sourceContext,
           skillsRoot: path.join(workspace.root, ".margin", "skills"),
+          disabledSkills: disabledSkillNames(readSkillSettings(workspacePath)),
+          selectedSkills: opts?.selectedSkills,
           signal,
           preferSimple: opts?.preferSimple ?? false,
         },
@@ -383,6 +528,7 @@ async function main() {
       tableCell?: { row: number; column: number; address: string; before: string };
       sourcePaths?: string[];
       preferSimple?: boolean;
+      selectedSkills?: string[];
     },
   ) => {
     // Selection rewrite keeps prior pending proposals on other blocks.
@@ -498,35 +644,7 @@ async function main() {
 
   app.get("/api/v1/session", async (req) => {
     requireAuth(state, req.headers.authorization);
-    const harness = getHarness(resolveHarnessId());
-    const opened = state.agent.bag.documentId
-      ? {
-          document: getDocument(workspace, state.agent.bag.documentId),
-          blocks: listBlocks(workspace, state.agent.bag.documentId),
-        }
-      : undefined;
-    return {
-      token,
-      workspace: workspacePath,
-      port,
-      llmMode: llmMode(),
-      engine: resolveEngine(),
-      llm: llmPublic(),
-      harness: { id: harness.id, title: harness.title },
-      clarificationRounds: state.agent.clarificationRounds ?? 0,
-      sourcePaths: state.agent.sourcePaths,
-      task: state.agent.task,
-      opened,
-      chat: {
-        turns: state.chat.list(),
-        maxTurns: 12,
-      },
-      review: {
-        threads: state.reviewThreads.filter(
-          (thread) => thread.documentId === state.agent.bag.documentId,
-        ),
-      },
-    };
+    return sessionPayload();
   });
 
   app.get("/api/v1/settings/llm", async (req) => {
@@ -549,11 +667,14 @@ async function main() {
             apiKey?: string;
             baseURL?: string;
             authStyle?: "bearer" | "apikey";
+            reasoningOptIn?: boolean;
           };
       model?: string;
       apiKey?: string;
       baseURL?: string;
       authStyle?: "bearer" | "apikey";
+      reasoningOptIn?: boolean;
+      reasoningMode?: "auto" | "fast" | "standard" | "deep" | null;
       harnessId?: string | null;
     };
   }>("/api/v1/settings/llm", async (req, reply) => {
@@ -591,6 +712,30 @@ async function main() {
       resolvedBaseURL: result.resolvedBaseURL,
     };
   });
+
+  app.get("/api/v1/settings/llm/cc-switch", async (req) => {
+    requireAuth(state, req.headers.authorization);
+    return ccSwitchPublicInfo();
+  });
+
+  app.post<{ Body: { route?: string } }>(
+    "/api/v1/settings/llm/cc-switch/connect",
+    async (req, reply) => {
+      requireAuth(state, req.headers.authorization);
+      const route = req.body?.route;
+      if (route !== "claude" && route !== "codex") {
+        return reply.code(400).send({ error: "route 必须是 claude 或 codex" });
+      }
+      try {
+        await connectCcSwitchRoute(workspacePath, route as CcSwitchRouteId);
+        return llmPublic();
+      } catch (e) {
+        return reply
+          .code(502)
+          .send({ error: e instanceof Error ? e.message : String(e) });
+      }
+    },
+  );
 
   app.get("/api/v1/harnesses", async (req) => {
     requireAuth(state, req.headers.authorization);
@@ -746,9 +891,14 @@ async function main() {
       tableCell?: { row: number; column: number; address: string; before: string };
       sourcePaths?: string[];
       preferSimple?: boolean;
+      selectedSkills?: string[];
     };
   }>("/api/v1/documents/:id/proposal-runs", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
+    const selectedSkillsResult = resolveSelectedSkills(req.body?.selectedSkills);
+    if (!selectedSkillsResult.ok) {
+      return reply.code(400).send({ error: selectedSkillsResult.error });
+    }
     const documentId = req.params.id;
     const blocks = listBlocks(workspace, documentId);
     const selected =
@@ -832,6 +982,9 @@ async function main() {
         tableCell,
         sourcePaths,
         preferSimple: req.body?.preferSimple ?? false,
+        selectedSkills: selectedSkillsResult.skills.length
+          ? selectedSkillsResult.skills
+          : undefined,
       },
     );
     return reply.code(202).send({ runId });
@@ -1000,9 +1153,12 @@ async function main() {
   app.post("/api/v1/chat/clear", async (req) => {
     requireAuth(state, req.headers.authorization);
     await enqueueChat(async () => {
+      const clearedSessionId = state.agent.sessionId;
       state.chat.clear();
       clearChatAgentConversation(state.agent);
       persistSession();
+      // A cleared session must not linger in the history list.
+      deleteAgentSession(workspace, clearedSessionId);
     });
     return {
       ok: true,
@@ -1011,18 +1167,110 @@ async function main() {
     };
   });
 
+  app.get("/api/v1/sessions", async (req) => {
+    requireAuth(state, req.headers.authorization);
+    return {
+      sessions: listAgentSessions(workspace),
+      currentSessionId: state.agent.sessionId,
+    };
+  });
+
+  app.post("/api/v1/sessions/new", async (req) => {
+    requireAuth(state, req.headers.authorization);
+    await enqueueChat(async () => {
+      mcpApprovalRegistry.denyAllForSession(state.agent.sessionId, "session-switch");
+      archiveCurrentSession();
+      state.chat.clear();
+      clearChatAgentConversation(state.agent);
+      persistSession();
+    });
+    return sessionPayload();
+  });
+
+  app.post<{ Body: { sessionId?: string } }>("/api/v1/sessions/switch", async (req, reply) => {
+    requireAuth(state, req.headers.authorization);
+    const sessionId = typeof req.body?.sessionId === "string" ? req.body.sessionId.trim() : "";
+    if (!sessionId || sessionId.length > 200) {
+      return reply.code(400).send({ error: "sessionId required" });
+    }
+    if (sessionId === state.agent.sessionId) return sessionPayload();
+    const envelope = loadAgentSessionEnvelope(workspace, sessionId);
+    if (!envelope) return reply.code(404).send({ error: "未知会话" });
+    await enqueueChat(async () => {
+      mcpApprovalRegistry.denyAllForSession(state.agent.sessionId, "session-switch");
+      archiveCurrentSession();
+      state.agent = chatAgentStateFromSession(workspace, envelope);
+      state.chat.hydrate(envelope.chatTurns);
+      state.reviewThreads = envelope.threads.filter(
+        (thread) => thread.documentId === state.agent.bag.documentId,
+      );
+      persistSession();
+    });
+    return sessionPayload();
+  });
+
+  app.delete<{ Params: { id: string } }>("/api/v1/sessions/:id", async (req, reply) => {
+    requireAuth(state, req.headers.authorization);
+    const sessionId = req.params.id?.trim();
+    if (!sessionId) return reply.code(400).send({ error: "sessionId required" });
+    if (sessionId === state.agent.sessionId) {
+      return reply.code(409).send({ error: "不能删除当前会话" });
+    }
+    deleteAgentSession(workspace, sessionId);
+    return { ok: true };
+  });
+
   app.get("/api/v1/extensions/skills", async (req) => {
     requireAuth(state, req.headers.authorization);
     const skillsRoot = path.join(workspacePath, ".margin", "skills");
+    const store = readSkillSettings(workspacePath);
+    const scope = getHarness(resolveHarnessId()).skills.scope;
     return {
-      skills: listAvailableSkills(skillsRoot).map((skill) => ({
+      skills: listSkillStates(skillsRoot, scope, disabledSkillNames(store)).map((skill) => ({
         name: skill.name,
         description: skill.description,
         contentHash: skill.contentHash,
         source: skill.source ?? "bundled",
+        state: skill.state,
+        preference: store.skills[skill.name] ?? "auto",
+        overridesBundled: skill.overridesBundled,
       })),
     };
   });
+
+  app.put<{ Params: { name: string }; Body: { mode?: string } }>(
+    "/api/v1/extensions/skills/:name",
+    async (req, reply) => {
+      requireAuth(state, req.headers.authorization);
+      const mode = req.body?.mode;
+      if (mode !== "off" && mode !== "auto") {
+        return reply.code(400).send({ error: "mode 必须是 off 或 auto" });
+      }
+      const skillsRoot = path.join(workspacePath, ".margin", "skills");
+      const store = readSkillSettings(workspacePath);
+      const scope = getHarness(resolveHarnessId()).skills.scope;
+      const skill = listSkillStates(skillsRoot, scope, disabledSkillNames(store))
+        .find((entry) => entry.name === req.params.name);
+      if (!skill) return reply.code(404).send({ error: `未知 Skill: ${req.params.name}` });
+      // Profile scope is a hard upper bound: cannot re-enable what it forbids.
+      if (mode === "auto" && skill.state === "blocked_by_profile") {
+        return reply.code(409).send({ error: `当前 Agent 模式无法使用 Skill: ${skill.name}` });
+      }
+      await setSkillMode(workspacePath, skill.name, mode);
+      return {
+        ok: true,
+        skill: {
+          name: skill.name,
+          preference: mode,
+          state: mode === "off"
+            ? "disabled"
+            : skill.state === "blocked_by_profile"
+              ? "blocked_by_profile"
+              : "enabled",
+        },
+      };
+    },
+  );
 
   app.post<{ Body: { content?: string } }>("/api/v1/extensions/skills", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
@@ -1108,6 +1356,25 @@ async function main() {
     await removeRemoteMcpServer(workspacePath, req.params.id);
     return { ok: true };
   });
+
+  app.post<{ Params: { approvalId: string }; Body: { decision?: string } }>(
+    "/api/v1/extensions/mcp/approvals/:approvalId",
+    async (req, reply) => {
+      requireAuth(state, req.headers.authorization);
+      const decision = req.body?.decision;
+      if (decision !== "allow" && decision !== "deny") {
+        return reply.code(400).send({ error: "decision must be allow or deny" });
+      }
+      const result = mcpApprovalRegistry.resolve(req.params.approvalId, decision);
+      if (result.status === "expired") {
+        return reply.code(410).send({ error: "审批已超时失效" });
+      }
+      if (result.status === "unknown") {
+        return reply.code(404).send({ error: "审批不存在或已被处理" });
+      }
+      return { ok: true };
+    },
+  );
 
   app.post<{
     Params: { id: string };
@@ -1227,9 +1494,14 @@ async function main() {
       chatMode?: "direct" | "socratic";
       threadId?: string;
       harnessId?: string;
+      selectedSkills?: string[];
     };
   }>("/api/v1/chat", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
+    const selectedSkillsResult = resolveSelectedSkills(req.body?.selectedSkills);
+    if (!selectedSkillsResult.ok) {
+      return reply.code(400).send({ error: selectedSkillsResult.error });
+    }
     const message = (req.body?.message ?? "").trim();
     if (!message) return reply.code(400).send({ error: "message required" });
     const threadId = req.body?.threadId?.trim();
@@ -1242,9 +1514,11 @@ async function main() {
     try {
       const outcome = await enqueueChat(async () => {
         if (clearRequested) {
+          const clearedSessionId = state.agent.sessionId;
           state.chat.clear();
           clearChatAgentConversation(state.agent);
           persistSession();
+          deleteAgentSession(workspace, clearedSessionId);
           return { cleared: true as const, closed: false as const };
         }
         if (closeRequested) {
@@ -1285,6 +1559,9 @@ async function main() {
           sourcePaths: switchedDocument ? [] : req.body.sourcePaths,
           chatMode: req.body.chatMode === "socratic" ? "socratic" : "direct",
           harnessId: resolveHarnessId(req.body.harnessId),
+          selectedSkills: selectedSkillsResult.skills.length
+            ? selectedSkillsResult.skills
+            : undefined,
           threadId,
         });
         if (previousDocumentId && state.agent.bag.documentId !== previousDocumentId) {
@@ -1313,6 +1590,7 @@ async function main() {
         sourcePaths: turn.sourcePaths,
         cascadeOffer: turn.cascadeOffer,
         notes: turn.notes,
+        loadedSkills: turn.loadedSkills,
         task: turn.task,
       };
     } catch (e) {
@@ -1333,9 +1611,14 @@ async function main() {
       chatMode?: "direct" | "socratic";
       threadId?: string;
       harnessId?: string;
+      selectedSkills?: string[];
     };
   }>("/api/v1/chat/stream", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
+    const selectedSkillsResult = resolveSelectedSkills(req.body?.selectedSkills);
+    if (!selectedSkillsResult.ok) {
+      return reply.code(400).send({ error: selectedSkillsResult.error });
+    }
     const message = (req.body?.message ?? "").trim();
     if (!message) return reply.code(400).send({ error: "message required" });
     const threadId = req.body?.threadId?.trim();
@@ -1358,15 +1641,52 @@ async function main() {
       reply.raw.write(`${JSON.stringify(obj)}\n`);
     };
 
+    const runId = randomUUID();
+    const mcpApprovalAudit: McpApprovalAuditEntry[] = [];
+    // A new run supersedes any still-pending approvals of this session.
+    mcpApprovalRegistry.denyAllForSession(state.agent.sessionId, "superseded");
+    ac.signal.addEventListener("abort", () => {
+      for (const audit of mcpApprovalRegistry.denyAllForRun(runId, "run-cancelled")) {
+        mcpApprovalAudit.push(audit);
+      }
+    });
+    const remoteMcp = {
+      bridge: createRemoteMcpBridge(workspacePath),
+      requestApproval: async (request: RemoteMcpApprovalRequest): Promise<"allow" | "deny"> => {
+        const { approvalId, wait } = mcpApprovalRegistry.request({
+          workspaceRoot: workspacePath,
+          sessionId: state.agent.sessionId,
+          runId,
+          toolCallId: request.toolCallId,
+          serverId: request.serverId,
+          serverName: request.serverName,
+          tool: request.tool,
+          args: request.args,
+        });
+        send({
+          type: "approval_request",
+          approvalId,
+          server: { id: request.serverId, name: request.serverName },
+          tool: request.tool,
+          args: request.args,
+        });
+        const { outcome, audit } = await wait;
+        mcpApprovalAudit.push(audit);
+        return outcome.decision;
+      },
+    };
+
     try {
       if (!clearRequested) send({ type: "status", text: "正在处理…" });
       let streamed = false;
       const outcome = await enqueueChat(async () => {
         if (ac.signal.aborted) return { disconnected: true as const };
         if (clearRequested) {
+          const clearedSessionId = state.agent.sessionId;
           state.chat.clear();
           clearChatAgentConversation(state.agent);
           persistSession();
+          deleteAgentSession(workspace, clearedSessionId);
           return { cleared: true as const, closed: false as const };
         }
         if (closeRequested) {
@@ -1407,8 +1727,13 @@ async function main() {
           sourcePaths: switchedDocument ? [] : req.body.sourcePaths,
           chatMode: req.body.chatMode === "socratic" ? "socratic" : "direct",
           harnessId: resolveHarnessId(req.body.harnessId),
+          selectedSkills: selectedSkillsResult.skills.length
+            ? selectedSkillsResult.skills
+            : undefined,
           threadId,
           signal: ac.signal,
+          remoteMcp,
+          mcpApprovalAudit,
           onProgress: (phase) => {
             if (isUserFacingPhase(phase)) send({ type: "status", text: phase });
           },
@@ -1459,6 +1784,7 @@ async function main() {
         sourcePaths: turn.sourcePaths,
         cascadeOffer: turn.cascadeOffer,
         notes: turn.notes,
+        loadedSkills: turn.loadedSkills,
         task: turn.task,
       });
       reply.raw.end();

@@ -131,3 +131,55 @@ describe("PUT /api/v1/settings/llm update flow", () => {
     expect(active.apiKey).toBe("new-key");
   });
 });
+
+describe("reasoning fields", () => {
+  let root: string;
+  const prev = { ...process.env };
+
+  beforeEach(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-llm-patch-reasoning-"));
+    for (const key of ENV_KEYS) delete process.env[key];
+    await saveLlmSettings(root, {
+      provider: {
+        id: "custom",
+        apiFormat: "openai",
+        baseURL: "https://one.test/v1",
+        model: "model-a",
+        authStyle: "bearer",
+        apiKey: "saved-key",
+      },
+    });
+  });
+
+  afterEach(() => {
+    for (const key of ENV_KEYS) delete process.env[key];
+    Object.assign(process.env, prev);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("threads a reasoning mode without touching the provider patch", () => {
+    const update = buildLlmSettingsUpdate({ reasoningMode: "deep" }, "custom");
+    expect(update.reasoningMode).toBe("deep");
+    expect(update.provider).toBeUndefined();
+  });
+
+  it("threads a reasoning opt-in onto the active provider patch", () => {
+    const update = buildLlmSettingsUpdate({ reasoningOptIn: true }, "custom");
+    expect(update.provider).toEqual({ id: "custom", reasoningOptIn: true });
+  });
+
+  it("persists reasoning mode and opt-in through the update flow", async () => {
+    const before = activeProfile(readLlmSettingsStore(root));
+    await saveLlmSettings(
+      root,
+      buildLlmSettingsUpdate({ reasoningMode: "standard", reasoningOptIn: true }, before.id),
+    );
+
+    const store = readLlmSettingsStore(root);
+    expect(store.reasoningMode).toBe("standard");
+    expect(activeProfile(store).reasoningOptIn).toBe(true);
+
+    await saveLlmSettings(root, buildLlmSettingsUpdate({ reasoningMode: null }, before.id));
+    expect(readLlmSettingsStore(root).reasoningMode).toBeUndefined();
+  });
+});

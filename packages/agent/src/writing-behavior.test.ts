@@ -46,4 +46,35 @@ describe("writing-agent behavior gate", () => {
     expect(effects.loadedSkills?.[0]?.name).toBe("argument-revision-zh");
     expect(effects.loadedSkills?.[0]?.contentHash).toMatch(/^[a-f0-9]{16}$/);
   });
+
+  it("load_skill rejects persistently disabled skills visibly", async () => {
+    const bag: SessionDocBag = { revision: 0, blocks: [] };
+    const effects: import("./session-tools.js").SessionSideEffects = {};
+    const tools = createSessionTools(
+      {
+        listSourceFiles: () => [],
+        readText: () => ({ relativePath: "", text: "", bytes: 0 }),
+        writeText: async (relativePath, content) => ({
+          relativePath,
+          bytes: content.length,
+          created: true,
+        }),
+        openDocument: () => {
+          throw new Error("unused");
+        },
+      },
+      bag,
+      [],
+      [],
+      effects,
+      { harnessId: "social-science-zh", disabledSkills: ["argument-revision-zh"] },
+    );
+    const load = tools.find((t) => t.name === "load_skill")!;
+    await expect(load.execute("1", { name: "argument-revision-zh" }))
+      .rejects.toThrow(/Skill 已关闭/);
+    expect(effects.loadedSkills ?? []).toEqual([]);
+    // Non-disabled skills still load.
+    await load.execute("2", { name: "cascade-consistency-zh" });
+    expect(effects.loadedSkills?.[0]?.name).toBe("cascade-consistency-zh");
+  });
 });

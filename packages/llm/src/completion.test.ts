@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateProposal, streamDiscuss } from "./index.js";
+import { configureRequestPolicy, type ModelUsageEntry } from "./request-policy.js";
 
 const ENV_KEYS = [
   "ANTHROPIC_API_KEY",
@@ -68,6 +69,49 @@ describe("bounded completion adapter", () => {
       after: "Revised paragraph.",
     });
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("sends policy headers and records token usage on the legacy path", async () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_BASE_URL = "https://provider.test/v1";
+    process.env.MARGIN_API_KEY = "secret";
+    process.env.MARGIN_MODEL = "model-a";
+    configureRequestPolicy({ version: "0.2.0-test" });
+    const recorded: ModelUsageEntry[] = [];
+    configureRequestPolicy({ onUsage: (entry) => recorded.push(entry) });
+    let sentHeaders: Headers | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      sentHeaders = new Headers(init?.headers);
+      return Response.json({
+        choices: [{ message: { content: JSON.stringify({
+          blockId: "b1",
+          after: "Revised paragraph.",
+          rationale: "Clearer.",
+          risk: "language",
+          evidence: [],
+        }) } }],
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 25,
+          prompt_tokens_details: { cached_tokens: 64 },
+        },
+      });
+    }));
+
+    await expect(generateProposal({ block })).resolves.toMatchObject({ blockId: "b1" });
+    expect(sentHeaders?.get("user-agent")).toBe("margin-agent/0.2.0-test");
+    const requestId = sentHeaders?.get("x-client-request-id");
+    expect(requestId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(recorded).toEqual([{
+      path: "legacy",
+      model: "model-a",
+      input: 100,
+      output: 25,
+      cacheRead: 64,
+      cacheWrite: 0,
+      requestId,
+    }]);
+    configureRequestPolicy({ onUsage: undefined });
   });
 
   it("uses Anthropic Messages with the selected auth style", async () => {

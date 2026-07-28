@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { DocumentMeta, TableCellProposalDraft } from "@margin/domain";
-import { composeSystemPrompt, getAgentProfile, getHarness } from "@margin/harness";
+import { composeSystemPromptDetailed, getAgentProfile, getHarness } from "@margin/harness";
 import {
   emitTextChunks,
   generateProposal,
@@ -13,7 +13,11 @@ import { assertPiLoopCompleted } from "./pi-outcome.js";
 import { decideRoute } from "./policy/router.js";
 import { isUserFacingPhase, toolPhaseLabel } from "./progress.js";
 import type { Draft } from "./pi-tools.js";
-import { hasRuntimeCredentials, resolveRuntimeModel } from "./resolve-model.js";
+import {
+  effectiveThinkingLevel,
+  hasRuntimeCredentials,
+  resolveRuntimeModel,
+} from "./resolve-model.js";
 import {
   createSessionTools,
   type SessionDocBag,
@@ -22,7 +26,8 @@ import {
 } from "./session-tools.js";
 import { buildClarificationHint, isEditOrRewriteIntent } from "./clarification.js";
 import { formatOutlineHint, type CascadeCandidate } from "./cascade.js";
-import type { AgentComment, AgentWorkReport, ScanProgressHandler } from "./types.js";
+import type { AgentComment, AgentWorkReport, ReasoningMode, ScanProgressHandler } from "./types.js";
+import type { RemoteMcpApprovalFn, RemoteMcpBridge } from "./mcp-tools.js";
 
 export type SessionTurnInput = {
   message: string;
@@ -46,12 +51,22 @@ export type SessionTurnInput = {
   signal?: AbortSignal;
   /** Stable Pi session id for continuity / cache affinity. */
   sessionId?: string;
+  /** Product reasoning mode; explicit levels apply only to compatible/opted-in models. */
+  reasoningMode?: ReasoningMode;
+  /** Custom provider opt-in to reasoning controls (set after a passing connection test). */
+  reasoningOptIn?: boolean;
   /** direct = revise promptly; socratic = ask first, propose only when user greenlights. */
   chatMode?: "direct" | "socratic";
   /** Clarification turns already used in this rewrite/edit thread (0..3). */
   clarificationRound?: number;
   /** Read-only materials attached by the host for this turn. */
   sourcePaths?: string[];
+  /** Persistent off-set from the workspace skill store (auto = absent). */
+  disabledSkills?: string[];
+  /** Explicit one-turn Skills (structured ids), inlined into the system prompt. */
+  selectedSkills?: string[];
+  /** Remote MCP bridge + per-call approval (chat path only; scan passes none). */
+  remoteMcp?: { bridge: RemoteMcpBridge; requestApproval: RemoteMcpApprovalFn };
 };
 
 export type SessionTurnResult = {
@@ -145,6 +160,7 @@ export async function runPiSessionTurn(
   const profile = getAgentProfile(input.harnessId);
   const runtime = resolveRuntimeModel(profile.model);
   const { model, apiKey } = runtime;
+  const thinkingLevel = effectiveThinkingLevel(input.reasoningMode, runtime, input.reasoningOptIn);
   if (!hasRuntimeCredentials()) {
     throw new Error(
       "session agent requires API key or Base URL (configure in Settings / CC Switch)",
@@ -167,6 +183,8 @@ export async function runPiSessionTurn(
     enforceCascadeGate: selectionIds.length > 0 || cascadeIds.length > 0,
     cascadeUnlocked: cascadeIds.length > 0,
     sourcePaths: input.sourcePaths,
+    remoteMcp: input.remoteMcp,
+    disabledSkills: input.disabledSkills,
   });
   const steps: string[] = [];
 
@@ -216,16 +234,30 @@ export async function runPiSessionTurn(
     ? `\n\n[已挂资料，只读] ${sourcePaths.join("、")}。涉及资料的事实/引语须先 read_workspace_file 实际读取再起草；提案 evidence 用 read_workspace_file 返回的 sourceRef 填写。${sourceSkillHint}`
     : "";
 
+  // Explicit one-turn selections are inlined here; invalid ones throw visibly
+  // before any model call. Reported alongside load_skill results.
+  const systemSkills = composeSystemPromptDetailed(input.harnessId, "session", {
+    workspaceSkillsRoot: input.bridge.skillsRoot,
+    disabledSkills: input.disabledSkills,
+    selectedSkills: input.selectedSkills,
+  });
+  if (systemSkills.loadedSkills.length) {
+    effects.loadedSkills = [
+      ...(effects.loadedSkills ?? []),
+      ...systemSkills.loadedSkills,
+    ];
+  }
+
   const result = await runPiAgentLoop({
     prompt: `${input.message}${docHint}${outlineHint}${selection}${modeHint}${cascadeHint}${sourceHint}`,
-    systemPrompt: composeSystemPrompt(input.harnessId, "session", {
-      workspaceSkillsRoot: input.bridge.skillsRoot,
-    }),
+    systemPrompt: systemSkills.prompt,
     tools,
     messages: input.messages,
     model,
     apiKey,
     sessionId: input.sessionId,
+    thinkingLevel,
+    usagePath: "pi-chat",
     maxTurns: maxTurns(profile.limits.maxTurns),
     timeoutMs: timeoutMs(profile.limits.timeoutMs),
     maxContextMessages: profile.limits.maxContextMessages,
@@ -319,6 +351,10 @@ export async function runOfflineSessionTurn(
 
   const msg = input.message.trim();
   const notes = ["offline tool loop (no API key)"];
+  if (input.selectedSkills?.length) {
+    // Offline planner has no model to consume skill bodies — say so, never skip silently.
+    notes.push(`explicit skills not applied offline (configure a model): ${input.selectedSkills.join(", ")}`);
+  }
 
   const finish = async (
     partial: Omit<SessionTurnResult, "engine" | "messages" | "steps" | "notes"> & {
