@@ -15,10 +15,16 @@ Margin 将模型的每次修改限定为一条针对具体选区（一句话、�
 
 ## 要求
 
-- Node.js 22+
-- pnpm 11+（仓库已用 pnpm workspace）
+- Windows x64 便携版：无需安装 Node.js 或 npm
+- npm 安装：Node.js 22+
+- 源码开发：Node.js 22+、pnpm 11+
 
 ## 安装（最终用户）
+
+Windows x64 用户可从 [GitHub Releases](https://github.com/lcrxgzl-wq/margin-agent/releases) 下载
+`margin-agent-win-x64-vX.Y.Z.zip`，解压后双击“启动 Margin.cmd”。程序自带 Node.js；默认工作区是“文档\\Margin”，也可把论文文件夹拖到启动文件上。更新时替换程序目录即可，工作区与 `.margin` 记录不会被删除。
+
+已安装 Node.js 22+ 的用户也可使用 npm：
 
 ```bash
 npm i -g margin-agent
@@ -26,7 +32,7 @@ cd /path/to/你的论文目录
 margin-agent
 ```
 
-浏览器打开终端打印的带 token 的 URL（服务只监听 127.0.0.1）。在「设置」里配置 OpenAI 兼容或 Anthropic 的 Base URL + Key（BYOK）；未配置时使用离线模式。详见 `docs/USAGE.md`。
+浏览器会自动打开（服务只监听 127.0.0.1）。在「设置」里配置 OpenAI 兼容或 Anthropic 的 Base URL + Key（BYOK）；未配置时使用离线模式。详见 `docs/USAGE.md`。
 
 
 ## 快速开始（MVP）

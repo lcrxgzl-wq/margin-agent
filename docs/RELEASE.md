@@ -13,6 +13,8 @@
 cd apps/cli && npm version patch --no-git-tag-version && cd ../..  # 或 minor
 pnpm build && pnpm test && pnpm typecheck
 pnpm gate:release && pnpm gate:install
+# Windows x64：同时验证并生成便携 ZIP
+pnpm gate:portable:win
 ```
 
 ### 手动兜底（真实 TTY + passkey）
@@ -34,9 +36,11 @@ git tag vX.Y.Z
 git push && git push --tags
 ```
 
-tag 推送触发 `.github/workflows/publish.yml`：全部门禁（test/typecheck/build/gate:release/gate:install）→ `npm publish --provenance`。Actions 页面绿灯即发布完成。
+tag 推送触发 `.github/workflows/publish.yml`：全部门禁（test/typecheck/build/gate:release/gate:install）→ `npm publish --provenance` → Windows x64 便携包门禁 → 创建 GitHub Release 并上传 ZIP 与 SHA-256。Actions 页面绿灯即发布完成。
 
 ## 验证用户安装
+
+Windows x64 便携版：从 GitHub Release 下载 `margin-agent-win-x64-vX.Y.Z.zip`，核对同名 `.sha256`，解压后双击“启动 Margin.cmd”。该包自带 Node.js，不依赖系统 npm。
 
 ```bash
 npm i -g margin-agent
