@@ -146,7 +146,10 @@ async function main() {
   const extractionRoot = fs.mkdtempSync(path.join(tempParent, " 含空格 "));
   let server;
   try {
-    execFileSync(archiveTool, ["-xf", zipPath, "-C", extractionRoot], { stdio: "inherit" });
+    // bsdtar receives argv in the system ANSI codepage on Windows; a Unicode
+    // extraction path degrades to '?' on non-CJK locales (CI runners). chdir
+    // instead: CreateProcessW handles the Unicode cwd, argv stays ASCII.
+    execFileSync(archiveTool, ["-xf", zipPath], { cwd: extractionRoot, stdio: "inherit" });
     const bundleDir = path.join(extractionRoot, bundleName);
     const embeddedNode = path.join(bundleDir, "runtime", "node.exe");
     const launcher = path.join(bundleDir, "launcher.cjs");
