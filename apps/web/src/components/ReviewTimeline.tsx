@@ -4,7 +4,7 @@ import { listDocumentTimeline, type TimelineEntry } from "../api";
 
 function kindLabel(kind: string | null): string {
   if (kind === "Y") return "接受";
-  if (kind === "N") return "撤回";
+  if (kind === "N") return "拒绝";
   if (kind === "E") return "编辑";
   return kind || "—";
 }
@@ -59,7 +59,7 @@ export function ReviewTimeline({ documentId }: { documentId: string }) {
           </div>
           {error ? <p className="timeline-empty">{error}</p> : null}
           {!error && entries.length === 0 ? (
-            <p className="timeline-empty">尚无接受 / 撤回记录。</p>
+            <p className="timeline-empty">尚无接受 / 拒绝记录。</p>
           ) : null}
           <ul className="timeline-list">
             {entries.map((e) => (

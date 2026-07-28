@@ -8,11 +8,13 @@ import {
   listProposals,
   openDocument,
   resolveProposal,
+  resolveMcpApproval,
   saveSessionSources,
   startProposalRun,
   waitRun,
 } from "./api";
 import { buildSelectionCommand } from "./commands";
+import type { PendingMcpApproval } from "./mcpApproval";
 import type { TableCellSelection } from "./components/canvasTypes";
 import { buildDisclosureText } from "./disclosure";
 import {
@@ -63,6 +65,7 @@ export function useWorkspaceActions(options?: {
   const activeChatAbortRef = useRef<AbortController | null>(null);
   const activeProposalRunRef = useRef<{ runId: string; controller: AbortController } | null>(null);
   const [canCancel, setCanCancel] = useState(false);
+  const [pendingMcpApproval, setPendingMcpApproval] = useState<PendingMcpApproval | null>(null);
   storeRef.current = store;
   const assertDocumentClean = () => {
     if (store.documentDirty) {
@@ -279,8 +282,9 @@ export function useWorkspaceActions(options?: {
         store.appendMessage({ id: mid(), role: "assistant", text: "请先选中一段正文。" });
         return;
       }
+      const threadId = mid();
       store.openThread({
-        id: mid(),
+        id: threadId,
         anchor: {
           blockId,
           blockIds,
@@ -293,6 +297,19 @@ export function useWorkspaceActions(options?: {
         collapsed: false,
         createdAt: new Date().toISOString(),
       });
+      if (instruction?.trim()) {
+        void onSend(instruction, {
+          threadId,
+          selection: {
+            blockId,
+            blockIds,
+            text: selectionText,
+            selectionStart,
+            tableCell,
+            crossTableCells,
+          },
+        }).catch(messageError);
+      }
       return;
     }
     if (!blockId) {
@@ -310,7 +327,7 @@ export function useWorkspaceActions(options?: {
   const onAccept = async (proposalId: string) => {
     if (!store.doc) return;
     const document = store.doc;
-    const generation = store.beginBusy("正在写入 Accept…");
+    const generation = store.beginBusy("正在写入接受…");
     try {
       store.setReviewError(null);
       assertDocumentClean();
@@ -322,7 +339,7 @@ export function useWorkspaceActions(options?: {
         refreshProposals(document.id, result.document?.revision, true),
         refreshComments(document.id, result.document?.revision, true),
       ]);
-      store.appendMessage({ id: mid(), role: "assistant", text: "已 Accept 并写回文章。" });
+      store.appendMessage({ id: mid(), role: "assistant", text: "已接受并写回文章。" });
     } catch (error) {
       store.setReviewError(reviewErrorText(error));
       messageError(error);
@@ -335,7 +352,7 @@ export function useWorkspaceActions(options?: {
   const onEdit = async (proposalId: string, editedText: string) => {
     if (!store.doc) return;
     const document = store.doc;
-    const generation = store.beginBusy("正在写入 Edit…");
+    const generation = store.beginBusy("正在写入编辑后接受…");
     try {
       store.setReviewError(null);
       assertDocumentClean();
@@ -347,7 +364,7 @@ export function useWorkspaceActions(options?: {
         refreshProposals(document.id, result.document?.revision, true),
         refreshComments(document.id, result.document?.revision, true),
       ]);
-      store.appendMessage({ id: mid(), role: "assistant", text: "已 Edit 并写回文章。" });
+      store.appendMessage({ id: mid(), role: "assistant", text: "已编辑后接受并写回文章。" });
     } catch (error) {
       store.setReviewError(reviewErrorText(error));
       messageError(error);
@@ -360,7 +377,7 @@ export function useWorkspaceActions(options?: {
   const onUndo = async (proposalId: string) => {
     if (!store.doc) return;
     const document = store.doc;
-    const generation = store.beginBusy("正在撤回…");
+    const generation = store.beginBusy("正在拒绝…");
     try {
       store.setReviewError(null);
       assertDocumentClean();
@@ -370,7 +387,7 @@ export function useWorkspaceActions(options?: {
       store.appendMessage({
         id: mid(),
         role: "assistant",
-        text: "已 Undo，该改动不会写入正文。",
+        text: "已拒绝，该改动不会写入正文。",
       });
     } catch (error) {
       store.setReviewError(reviewErrorText(error));
@@ -422,7 +439,7 @@ export function useWorkspaceActions(options?: {
     if (!store.proposals.length) throw new Error("没有待确认改动");
     const document = store.doc;
     const count = store.proposals.length;
-    const generation = store.beginBusy(`正在撤回全部（${count}）…`);
+    const generation = store.beginBusy(`正在拒绝全部（${count}）…`);
     try {
       for (const proposal of store.proposals) {
         await resolveProposal(document, proposal.id, "N");
@@ -431,7 +448,7 @@ export function useWorkspaceActions(options?: {
       store.appendMessage({
         id: mid(),
         role: "assistant",
-        text: `已撤回 ${count} 处待确认改动。`,
+        text: `已拒绝 ${count} 处待确认改动。`,
       });
     } finally {
       store.endBusy(generation);
@@ -531,6 +548,8 @@ export function useWorkspaceActions(options?: {
   };
   const onSend = async (text: string, opts?: {
     cascadeBlockIds?: string[];
+    /** Structured one-turn Skill ids from the composer @picker. */
+    selectedSkills?: string[];
     threadId?: string;
     selection?: {
       blockId: string | null;
@@ -664,9 +683,19 @@ export function useWorkspaceActions(options?: {
               cascadeBlockIds: opts?.cascadeBlockIds,
               sourcePaths: store.doc ? store.sourcePaths : undefined,
               threadId: opts?.threadId,
+              selectedSkills: opts?.selectedSkills,
             },
             (event) => {
               if (event.type === "status") store.setStatusLine(event.text);
+              if (event.type === "approval_request") {
+                setPendingMcpApproval({
+                  approvalId: event.approvalId,
+                  serverId: event.server.id,
+                  serverName: event.server.name,
+                  tool: event.tool,
+                  args: event.args,
+                });
+              }
               if (event.type === "delta" && event.text) queueDelta(event.text);
             },
             controller.signal,
@@ -678,6 +707,8 @@ export function useWorkspaceActions(options?: {
           }
           if (deltaFrame !== null) window.cancelAnimationFrame(deltaFrame);
           flushDelta();
+          // Stream ended/errored/cancelled: any unresolved approval is closed by the server.
+          setPendingMcpApproval(null);
         }
         const switchedDocument =
           !!store.doc && !!done.opened && store.doc.id !== done.opened.document.id;
@@ -695,7 +726,11 @@ export function useWorkspaceActions(options?: {
           store.setSourcePaths(done.sourcePaths);
         }
         ensureBubble();
-        store.patchMessage(assistantId, { text: done.reply, task: done.task });
+        store.patchMessage(assistantId, {
+          text: done.reply,
+          task: done.task,
+          loadedSkills: done.loadedSkills,
+        });
         if (typeof done.clarificationRounds === "number") {
           store.setClarificationRounds(done.clarificationRounds);
         }
@@ -772,8 +807,19 @@ export function useWorkspaceActions(options?: {
     }
   };
 
+  const resolvePendingMcpApproval = async (decision: "allow" | "deny") => {
+    const pending = pendingMcpApproval;
+    setPendingMcpApproval(null);
+    if (!pending) return;
+    // Fail closed: if the decision never reaches the server, the pending
+    // approval expires to deny after 60s and zero remote calls happen.
+    await resolveMcpApproval(pending.approvalId, decision).catch(() => undefined);
+  };
+
   return {
     canCancel,
+    pendingMcpApproval,
+    resolvePendingMcpApproval,
     cancelCurrentRun: () => {
       activeChatAbortRef.current?.abort();
       const proposalRun = activeProposalRunRef.current;

@@ -144,6 +144,11 @@ export type SkillSummary = {
   description: string;
   contentHash: string;
   source: "bundled" | "workspace";
+  /** Server-resolved effective state (profile scope is a hard upper bound). */
+  state: "enabled" | "disabled" | "blocked_by_profile";
+  /** Persistent user preference; auto = default. */
+  preference: "off" | "auto";
+  overridesBundled?: boolean;
 };
 
 export type AgentTask = {
@@ -177,6 +182,16 @@ export async function importSkill(content: string) {
 export async function removeSkill(name: string) {
   return api<{ ok: true }>(`/api/v1/extensions/skills/${encodeURIComponent(name)}`, {
     method: "DELETE",
+  });
+}
+
+export async function setSkillMode(name: string, mode: "off" | "auto") {
+  return api<{
+    ok: true;
+    skill: { name: string; preference: "off" | "auto"; state: SkillSummary["state"] };
+  }>(`/api/v1/extensions/skills/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    body: JSON.stringify({ mode }),
   });
 }
 
@@ -268,6 +283,8 @@ export async function listDocumentTimeline(documentId: string, limit = 40) {
   );
 }
 
+export type ReasoningMode = "auto" | "fast" | "standard" | "deep";
+
 export type LlmProviderPublic = {
   id: string;
   name: string;
@@ -280,6 +297,7 @@ export type LlmProviderPublic = {
   source?: string;
   websiteUrl?: string;
   currentInCcSwitch?: boolean;
+  reasoningOptIn?: boolean;
 };
 
 export type LlmSettingsPublic = {
@@ -298,10 +316,15 @@ export type LlmSettingsPublic = {
   }>;
   llmMode: "mock" | "byok";
   harnessId?: string;
+  reasoningMode?: ReasoningMode;
   ccSwitch?: {
     detected: boolean;
     proxyBaseURL?: string;
     proxyEnabled?: boolean;
+    routes?: {
+      claude?: { baseURL: string; model?: string };
+      codex?: { baseURL: string; model?: string };
+    };
   };
   imported?: number;
   source?: string;
@@ -331,11 +354,47 @@ export async function saveLlmSettings(body: {
   apiKey?: string;
   baseURL?: string;
   authStyle?: "bearer" | "apikey";
+  reasoningOptIn?: boolean;
+  reasoningMode?: ReasoningMode | null;
   harnessId?: string | null;
 }) {
   return api<LlmSettingsPublic>("/api/v1/settings/llm", {
     method: "PUT",
     body: JSON.stringify(body),
+  });
+}
+
+export type CcSwitchStatus = {
+  detected: boolean;
+  proxyBaseURL?: string;
+  proxyEnabled?: boolean;
+  routes?: {
+    claude?: { baseURL: string; model?: string };
+    codex?: { baseURL: string; model?: string };
+  };
+};
+
+export async function getCcSwitchStatus() {
+  return api<CcSwitchStatus>("/api/v1/settings/llm/cc-switch");
+}
+
+/** 502 + error on failure; the active configuration is left untouched. */
+export async function connectCcSwitchRoute(route: "claude" | "codex") {
+  return api<LlmSettingsPublic>("/api/v1/settings/llm/cc-switch/connect", {
+    method: "POST",
+    body: JSON.stringify({ route }),
+  });
+}
+
+/** Import a workspace .docx as a Margin document (no model involved). */
+export async function importWorkspaceDocx(relativePath: string) {
+  return api<{
+    document: DocumentMeta;
+    blocks: Block[];
+    report?: { ok: boolean; flags?: string[] };
+  }>("/api/v1/documents/import-docx", {
+    method: "POST",
+    body: JSON.stringify({ relativePath }),
   });
 }
 
@@ -459,6 +518,7 @@ export async function startProposalRun(
     };
     sourcePaths?: string[];
     preferSimple?: boolean;
+    selectedSkills?: string[];
   },
 ) {
   return api<{ runId: string }>(`/api/v1/documents/${documentId}/proposal-runs`, {
@@ -474,6 +534,7 @@ export async function startProposalRun(
       tableCell: opts?.tableCell,
       sourcePaths: opts?.sourcePaths,
       preferSimple: opts?.preferSimple ?? false,
+      selectedSkills: opts?.selectedSkills,
     }),
   });
 }
@@ -591,12 +652,14 @@ export async function chatTurn(body: {
   selectionText?: string;
   selectionStart?: number;
   sourcePaths?: string[];
+  selectedSkills?: string[];
 }) {
   return api<{
     reply: string;
     closed?: boolean;
     runId?: string;
     sourcePaths?: string[];
+    loadedSkills?: Array<{ name: string; contentHash: string }>;
     opened?: { document: DocumentMeta; blocks: Block[] };
     run?: {
       engine?: string;
@@ -614,6 +677,13 @@ export type ChatStreamEvent =
   | { type: "delta"; text: string }
   | { type: "run"; runId: string }
   | {
+      type: "approval_request";
+      approvalId: string;
+      server: { id: string; name: string };
+      tool: string;
+      args: unknown;
+    }
+  | {
       type: "done";
       reply: string;
       runId?: string;
@@ -625,6 +695,7 @@ export type ChatStreamEvent =
       sourcePaths?: string[];
       closed?: boolean;
       cascadeOffer?: Array<{ blockId: string; reason: string; query?: string }>;
+      loadedSkills?: Array<{ name: string; contentHash: string }>;
       task?: AgentTask;
     }
   | { type: "error"; error: string };
@@ -642,6 +713,7 @@ export async function chatStream(
     sourcePaths?: string[];
     threadId?: string;
     harnessId?: string;
+    selectedSkills?: string[];
   },
   onEvent: (ev: ChatStreamEvent) => void,
   signal?: AbortSignal,
@@ -688,6 +760,20 @@ export async function chatStream(
   return lastDone;
 }
 
+/** One-use decision for a pending remote MCP approval (404 unknown / 410 expired). */
+export async function resolveMcpApproval(
+  approvalId: string,
+  decision: "allow" | "deny",
+) {
+  return api<{ ok: true }>(
+    `/api/v1/extensions/mcp/approvals/${encodeURIComponent(approvalId)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ decision }),
+    },
+  );
+}
+
 /** Strip leading markdown heading markers for display. */
 export function displayText(block: Block): string {
   if (block.kind === "heading") {
@@ -700,4 +786,62 @@ export function displayText(block: Block): string {
       .join("\n");
   }
   return block.text;
+}
+
+/** GET /api/v1/session payload — shared by boot hydrate and session new/switch. */
+export type SessionSnapshot = {
+  llm?: LlmSettingsPublic;
+  llmMode?: "mock" | "byok";
+  clarificationRounds?: number;
+  sourcePaths?: string[];
+  task?: AgentTask;
+  opened?: { document: DocumentMeta; blocks: Block[] };
+  chat?: {
+    turns: Array<{ role: "user" | "assistant"; text: string; threadId?: string }>;
+    maxTurns?: number;
+  };
+  review?: { threads: SessionReviewThread[] };
+};
+
+export type AgentSessionSummary = {
+  sessionId: string;
+  updatedAt: string;
+  title: string;
+  documentId?: string;
+  turnCount: number;
+};
+
+export async function getSession() {
+  return api<SessionSnapshot>("/api/v1/session");
+}
+
+export async function listSessions() {
+  return api<{ sessions: AgentSessionSummary[]; currentSessionId: string }>("/api/v1/sessions");
+}
+
+/** Archive the current conversation (when non-empty) and start a fresh session. */
+export async function newSession() {
+  return api<SessionSnapshot>("/api/v1/sessions/new", { method: "POST", body: "{}" });
+}
+
+/** Archive the current conversation, then restore a history session. */
+export async function switchSession(sessionId: string) {
+  return api<SessionSnapshot>("/api/v1/sessions/switch", {
+    method: "POST",
+    body: JSON.stringify({ sessionId }),
+  });
+}
+
+export async function deleteSession(sessionId: string) {
+  return api<{ ok: true }>(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Destroy the current conversation content (no archive; history row removed). */
+export async function clearCurrentSession() {
+  return api<{ ok: true; documentId?: string; sourcePaths?: string[] }>(
+    "/api/v1/chat/clear",
+    { method: "POST", body: "{}" },
+  );
 }

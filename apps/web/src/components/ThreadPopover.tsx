@@ -1,6 +1,8 @@
 import { ArrowUp, Check, Pencil, RotateCcw, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { PointerEvent } from "react";
 import type { Comment, Proposal } from "../api";
+import { submitEnterFrom } from "../ime";
 import { proposalChange } from "../proposalChange";
 import type { ReviewThread } from "../store";
 import type { ChatMessage } from "./Chat";
@@ -101,7 +103,7 @@ function ThreadProposalCard({
         <div className="review-actions">
           <button type="button" className="primary" disabled={disabled} onClick={() => { void Promise.resolve(onAccept(proposal.id)); }}><Check />Y 接受</button>
           <button type="button" disabled={disabled} onClick={() => { setEditedText(change.editValue); setEditing(true); }}><Pencil />E 编辑</button>
-          <button type="button" disabled={disabled} onClick={() => { void Promise.resolve(onUndo(proposal.id)); }}><X />N 撤回</button>
+          <button type="button" disabled={disabled} onClick={() => { void Promise.resolve(onUndo(proposal.id)); }}><X />N 拒绝</button>
           <button type="button" disabled={disabled} title="重新生成另一版" onClick={() => onRewrite(proposal.id, proposal.blockId)}><RotateCcw />重写</button>
         </div>
       )}
@@ -127,7 +129,8 @@ type Props = {
   onClose: () => void;
 };
 
-const POPOVER_WIDTH = 384;
+const POPOVER_WIDTH = 520;
+const MIN_SIZE = { width: 340, height: 260 };
 
 /** In-place anchored thread: discussion + pending proposals fused around one selection. */
 export function ThreadPopover({
@@ -148,6 +151,10 @@ export function ThreadPopover({
   onClose,
 }: Props) {
   const [draft, setDraft] = useState("");
+  const [drag, setDrag] = useState<{ dx: number; dy: number } | null>(null);
+  const [size, setSize] = useState<{ width: number; height: number } | null>(null);
+  const dragRef = useRef<{ pointerId: number; startX: number; startY: number; baseLeft: number; baseTop: number } | null>(null);
+  const resizeRef = useRef<{ pointerId: number; startX: number; startY: number; baseWidth: number; baseHeight: number } | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const excerpt = thread.anchor.tableCell?.before ?? thread.anchor.selectionText;
@@ -163,6 +170,57 @@ export function ThreadPopover({
     const maxHeight = Math.max(220, viewport.height - top - 16);
     return { left, top, maxHeight };
   }, [thread.pos]);
+
+  const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), Math.max(min, max));
+  const left = clamp(position.left + (drag?.dx ?? 0), 8, window.innerWidth - 96);
+  const top = clamp(position.top + (drag?.dy ?? 0), 8, window.innerHeight - 96);
+
+  const onHeadPointerDown = (event: PointerEvent<HTMLElement>) => {
+    if (event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
+    dragRef.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, baseLeft: left, baseTop: top };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const onHeadPointerMove = (event: PointerEvent<HTMLElement>) => {
+    const active = dragRef.current;
+    if (!active || active.pointerId !== event.pointerId) return;
+    setDrag({
+      dx: active.baseLeft + (event.clientX - active.startX) - position.left,
+      dy: active.baseTop + (event.clientY - active.startY) - position.top,
+    });
+  };
+  const onHeadPointerEnd = (event: PointerEvent<HTMLElement>) => {
+    if (dragRef.current?.pointerId === event.pointerId) dragRef.current = null;
+  };
+
+  const onResizePointerDown = (event: PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    const base = event.currentTarget.closest(".thread-popover")?.getBoundingClientRect();
+    resizeRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      baseWidth: size?.width ?? base?.width ?? POPOVER_WIDTH,
+      baseHeight: size?.height ?? base?.height ?? 360,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  };
+  const onResizePointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    const active = resizeRef.current;
+    if (!active || active.pointerId !== event.pointerId) return;
+    setSize({
+      width: clamp(active.baseWidth + (event.clientX - active.startX), MIN_SIZE.width, window.innerWidth - 24),
+      height: clamp(active.baseHeight + (event.clientY - active.startY), MIN_SIZE.height, window.innerHeight - 24),
+    });
+  };
+  const onResizePointerEnd = (event: PointerEvent<HTMLDivElement>) => {
+    if (resizeRef.current?.pointerId === event.pointerId) resizeRef.current = null;
+  };
+
+  useEffect(() => {
+    setDrag(null);
+    setSize(null);
+  }, [thread.id]);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -195,9 +253,21 @@ export function ThreadPopover({
         className="thread-popover"
         role="dialog"
         aria-label="选区线程"
-        style={{ left: position.left, top: position.top, maxHeight: position.maxHeight }}
+        style={{
+          left,
+          top,
+          maxHeight: size ? undefined : position.maxHeight,
+          width: size?.width,
+          height: size?.height,
+        }}
       >
-        <header className="thread-head">
+        <header
+          className="thread-head"
+          onPointerDown={onHeadPointerDown}
+          onPointerMove={onHeadPointerMove}
+          onPointerUp={onHeadPointerEnd}
+          onPointerCancel={onHeadPointerEnd}
+        >
           <blockquote className="thread-quote" title={excerpt}>
             {thread.anchor.tableCell ? `单元格 ${thread.anchor.tableCell.address}：` : ""}
             {excerpt.length > 96 ? `${excerpt.slice(0, 96)}…` : excerpt || "（整个段落）"}
@@ -250,7 +320,7 @@ export function ThreadPopover({
             disabled={busy}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+              if (submitEnterFrom(event)) {
                 event.preventDefault();
                 submit();
               }
@@ -267,6 +337,14 @@ export function ThreadPopover({
             <ArrowUp size={15} />
           </button>
         </footer>
+        <div
+          className="thread-resize"
+          aria-hidden
+          onPointerDown={onResizePointerDown}
+          onPointerMove={onResizePointerMove}
+          onPointerUp={onResizePointerEnd}
+          onPointerCancel={onResizePointerEnd}
+        />
       </section>
     </>
   );

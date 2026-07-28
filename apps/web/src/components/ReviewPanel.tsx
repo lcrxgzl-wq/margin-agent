@@ -251,7 +251,7 @@ export function ReviewPanel({
             <div className="review-actions">
               <button type="button" className="primary" disabled={disabled} onClick={() => { void Promise.resolve(onAccept(proposal.id)); }}><Check />Y 接受</button>
               <button type="button" disabled={disabled} onClick={() => { setEditedText(change.editValue); setEditing(true); }}><Pencil />E 编辑</button>
-              <button type="button" disabled={disabled} onClick={() => { void Promise.resolve(onUndo(proposal.id)); }}><X />N 撤回</button>
+              <button type="button" disabled={disabled} onClick={() => { void Promise.resolve(onUndo(proposal.id)); }}><X />N 拒绝</button>
               <button type="button" disabled={disabled} onClick={() => onRewrite(proposal.id, proposal.blockId)}><RotateCcw />重写</button>
             </div>
           )}
@@ -286,7 +286,7 @@ export function ReviewPanel({
           {historyError ? <p className="review-error">{historyError}</p> : null}
           {!historyError && !visibleHistory.length ? (
             <p className="review-history-empty">
-              {history.length ? "该筛选下没有记录。" : "尚无接受、编辑或撤回记录。"}
+              {history.length ? "该筛选下没有记录。" : "尚无接受、编辑或拒绝记录。"}
             </p>
           ) : null}
           <ol>

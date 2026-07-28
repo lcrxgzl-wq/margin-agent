@@ -6,7 +6,10 @@ import {
   findWorkspaceSkillOverwrite,
   groupSkills,
   mcpDiscoverPayload,
+  mentionableSkills,
   skillNameFromContent,
+  skillStateLabel,
+  skillToggleTarget,
 } from "./extensionsModel";
 
 describe("extensions model", () => {
@@ -111,5 +114,24 @@ describe("extensions model", () => {
     });
     expect(redirected.editingServerId).toBeNull();
     expect(redirected.storedTokenAvailable).toBe(false);
+  });
+  it("labels effective skill states and computes toggle targets", () => {
+    expect(skillStateLabel("enabled")).toBe("启用");
+    expect(skillStateLabel("disabled")).toBe("已关闭");
+    expect(skillStateLabel("blocked_by_profile")).toBe("当前模式不可用");
+    expect(skillToggleTarget("auto")).toBe("off");
+    expect(skillToggleTarget("off")).toBe("auto");
+  });
+
+  it("offers only enabled skills to the chat mention picker, filtered by query", () => {
+    const skills = [
+      { name: "argument-revision-zh", state: "enabled" as const },
+      { name: "format-tidy-zh", state: "disabled" as const },
+      { name: "socratic-revision-zh", state: "blocked_by_profile" as const },
+      { name: "argument-revision-zh", state: "enabled" as const },
+    ];
+    expect(mentionableSkills(skills, "").map((skill) => skill.name))
+      .toEqual(["argument-revision-zh"]);
+    expect(mentionableSkills(skills, "format")).toEqual([]);
   });
 });

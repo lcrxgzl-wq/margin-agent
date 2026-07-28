@@ -277,12 +277,12 @@ try {
   }
   await page.screenshot({ path: path.join(outDir, "05-accepted.png") });
 
-  step("4b. Save fallback strips marks; N 撤回 restores text");
+  step("4b. Save fallback strips marks; N 拒绝 restores text");
   const secondParas = (await api("/api/v1/session")).opened.blocks
     .filter((b) => b.kind !== "table" && b.text.trim().length > 40);
   const secondBlock = secondParas[1] ?? secondParas[0];
   if (!secondBlock) {
-    note("无第二段可用，跳过保存兜底/N 撤回场景");
+    note("无第二段可用，跳过保存兜底/N 拒绝场景");
   } else {
     if (!(await selectText(keywordOf(secondBlock.text)))) throw new Error("4b 无法选中第二段文本");
     await page.locator(".sel-bubble").waitFor({ state: "visible", timeout: 10_000 });
@@ -380,7 +380,7 @@ try {
       throw new Error(`保存后 docx 删除线 run 数异常：baseline=${strikeBaseline}, after=${strikeAfterSave}（修订标记泄漏进文件）`);
     }
 
-    // N 撤回：直接对最长段落生成提案并断言 marginMark 注入（第 58 轮 1206 字段落
+    // N 拒绝：直接对最长段落生成提案并断言 marginMark 注入（第 58 轮 1206 字段落
     // 曾因 before 整段逐字命中失败降级 rail，走查被迫"探测可注入段落"；Task 3
     // 片段级锚定后应可注入）。若仍注入失败，记录原因、撤回清理后退回探测兜底。
     const thirdParas = (await api("/api/v1/session")).opened.blocks
@@ -397,7 +397,7 @@ try {
         if ((await proposalCount()) > 0) break;
         await page.waitForTimeout(500);
       }
-      if ((await proposalCount()) !== 1) throw new Error(`4b N 撤回场景 expected 1 proposal, got ${await proposalCount()}`);
+      if ((await proposalCount()) !== 1) throw new Error(`4b N 拒绝场景 expected 1 proposal, got ${await proposalCount()}`);
       return (await listProposed())[0];
     };
     const waitMarkInjected = async (proposalId, timeoutMs = 15_000) => {
@@ -418,10 +418,10 @@ try {
       await page.waitForTimeout(400);
       await page.waitForFunction(() => {
         const button = [...document.querySelectorAll(".review-panel button")]
-          .find((candidate) => candidate.textContent?.includes("N 撤回"));
+          .find((candidate) => candidate.textContent?.includes("N 拒绝"));
         return Boolean(button && !button.disabled);
       }, null, { timeout: 20_000 });
-      await page.locator(".review-panel button", { hasText: "N 撤回" }).first().click();
+      await page.locator(".review-panel button", { hasText: "N 拒绝" }).first().click();
       await page.waitForTimeout(800);
       await page.getByRole("tab", { name: /对话/ }).click();
       await page.waitForTimeout(300);
@@ -457,7 +457,7 @@ try {
       }
     }
     if (!thirdProposal) {
-      note("无可用段落，跳过 N 撤回场景");
+      note("无可用段落，跳过 N 拒绝场景");
     } else {
       if (await page.locator(".thread-backdrop").count()) {
         await page.locator(".thread-backdrop").click({ position: { x: 8, y: 8 } });
@@ -468,21 +468,21 @@ try {
       // 按钮在 busy/dirty/reviewBusy 时禁用——等其可用。
       await page.waitForFunction(() => {
         const button = [...document.querySelectorAll(".review-panel button")]
-          .find((candidate) => candidate.textContent?.includes("N 撤回"));
+          .find((candidate) => candidate.textContent?.includes("N 拒绝"));
         return Boolean(button && !button.disabled);
       }, null, { timeout: 20_000 });
-      await page.locator(".review-panel button", { hasText: "N 撤回" }).first().click();
+      await page.locator(".review-panel button", { hasText: "N 拒绝" }).first().click();
       await page.waitForTimeout(800);
       await waitMarks(false);
       const rejectedState = await officeState();
       const compactRejectedText = rejectedState.text.replace(/\s+/g, "");
       if (!compactRejectedText.includes(thirdProposal.before.replace(/\s+/g, "").slice(0, 30))) {
-        throw new Error("N 撤回后原文未还原");
+        throw new Error("N 拒绝后原文未还原");
       }
       if (compactRejectedText.includes(thirdProposal.after.replace(/\s+/g, "").slice(0, 30))) {
-        throw new Error("N 撤回后正文仍残留 after 文本");
+        throw new Error("N 拒绝后正文仍残留 after 文本");
       }
-      if ((await proposalCount()) !== 0) throw new Error("N 撤回后仍有 pending 提案残留");
+      if ((await proposalCount()) !== 0) throw new Error("N 拒绝后仍有 pending 提案残留");
       await page.getByRole("tab", { name: /对话/ }).click();
       await page.waitForTimeout(300);
     }
@@ -647,7 +647,7 @@ try {
     );
   } catch {
     const empty = await page.locator(".review-history").textContent().catch(() => "");
-    throw new Error(`历史视图无条目（接受/撤回记录缺失）: ${empty?.slice(0, 120)}`);
+    throw new Error(`历史视图无条目（接受/拒绝记录缺失）: ${empty?.slice(0, 120)}`);
   }
   const historyText = await page.locator(".review-history").textContent();
   if (!/→\s*Y 接受/.test(historyText ?? "")) {

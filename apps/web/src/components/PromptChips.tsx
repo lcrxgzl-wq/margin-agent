@@ -9,12 +9,24 @@ type Props = {
   busy: boolean;
   visible: boolean;
   onSend: (text: string) => void;
+  /** Direct .docx picker (no model involved); rendered as the first chip. */
+  onOpenDocx?: () => void;
 };
 
-export function PromptChips({ busy, visible, onSend }: Props) {
+export function PromptChips({ busy, visible, onSend, onOpenDocx }: Props) {
   if (!visible) return null;
   return (
     <div className="prompt-chips" aria-label="快捷开始">
+      {onOpenDocx ? (
+        <button
+          type="button"
+          className="chip"
+          disabled={busy}
+          onClick={onOpenDocx}
+        >
+          打开 DOCX
+        </button>
+      ) : null}
       {CHIPS.map((c) => (
         <button
           key={c.label}

@@ -3,6 +3,33 @@ export type ExtensionSkill = {
   source: "bundled" | "workspace";
 };
 
+export type SkillEffectiveState = "enabled" | "disabled" | "blocked_by_profile";
+
+export function skillStateLabel(state: SkillEffectiveState): string {
+  if (state === "enabled") return "启用";
+  if (state === "disabled") return "已关闭";
+  return "当前模式不可用";
+}
+
+/** The PUT target when the user toggles a skill row. */
+export function skillToggleTarget(preference: "off" | "auto"): "off" | "auto" {
+  return preference === "off" ? "auto" : "off";
+}
+
+/** Skills offered by the chat @ picker: enabled only, deduped by name. */
+export function mentionableSkills<T extends { name: string; state: SkillEffectiveState }>(
+  skills: T[],
+  query: string,
+): T[] {
+  const q = query.trim().toLowerCase();
+  const seen = new Set<string>();
+  return skills.filter((skill) => {
+    if (skill.state !== "enabled" || seen.has(skill.name)) return false;
+    seen.add(skill.name);
+    return !q || skill.name.toLowerCase().includes(q);
+  });
+}
+
 export type ExtensionMcpTool = {
   name: string;
   description: string;

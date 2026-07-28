@@ -7,31 +7,33 @@ import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { Download, MessageSquare, X } from "lucide-react";
+import { Download, FolderOpen, MessageSquare, X } from "lucide-react";
 import {
   api,
   isNativeDocx,
   listComments,
   listProposals,
   saveSessionThreads,
-  type Block,
+  getSession,  type Block,
   type DocumentMeta,
   type LlmSettingsPublic,
   type SessionReviewThread,
-} from "./api";
+  type SessionSnapshot,} from "./api";
 import { Chat } from "./components/Chat";
 import { AnchorRail } from "./components/AnchorRail";
-import { Extensions } from "./components/Extensions";
+import { McpApprovalDialog } from "./components/McpApprovalDialog";
+import { OpenDocxDialog } from "./components/OpenDocxDialog";
 import { RewritePrompt } from "./components/RewritePrompt";
 import { SelectionBubble } from "./components/SelectionBubble";
 import { SelectionMenu } from "./components/SelectionMenu";
-import { Settings } from "./components/Settings";
+import { SettingsHub } from "./components/SettingsHub";
+import { SessionMenu } from "./components/SessionMenu";
 import { ThreadPopover } from "./components/ThreadPopover";
 import type { CanvasFocusRequest } from "./components/canvasTypes";
 import { clampFloatRect, defaultFloatRect, type FloatRect } from "./layoutGeometry";
 import { MarginStoreProvider, useMarginStore, type ReviewThread, type SelectionInput, type ThreadAnchor } from "./store";
 import { useWorkspaceActions } from "./useWorkspaceActions";
-import { polishIntent, translationIntent } from "./selectionEditIntent";
+import { polishIntent, translateAssistInstruction, translationIntent } from "./selectionEditIntent";
 import { selectionEditUnavailableReason } from "./selectionSafety";
 
 const Canvas = lazy(() =>
@@ -70,7 +72,8 @@ function Workspace() {
   const [focusRequest, setFocusRequest] = useState<CanvasFocusRequest | null>(null);
   const [officeReady, setOfficeReady] = useState(false);
   const [sessionHydrated, setSessionHydrated] = useState(false);
-  const [extensionsOpen, setExtensionsOpen] = useState(false);
+  const [docxPickerOpen, setDocxPickerOpen] = useState(false);
+  const [sessionsOpen, setSessionsOpen] = useState(false);
   const [dockWidth, setDockWidth] = useState(() => {
     const saved = localStorage.getItem("margin_dock_width");
     const parsed = saved === null ? Number.NaN : Number(saved);
@@ -222,123 +225,122 @@ function Workspace() {
     window.addEventListener("blur", finish, { once: true });
   };
 
+  /** Shared hydrate for boot / 新会话 / 恢复历史会话 / 清空记录 (identical snapshot shape). */
+  const applySessionSnapshot = async (
+    session: SessionSnapshot,
+    opts?: { keepEmptyMessages?: boolean },
+  ) => {
+    if (session.llm) storeRef.current.setLlm(session.llm);
+    if (typeof session.clarificationRounds === "number") {
+      storeRef.current.setClarificationRounds(session.clarificationRounds);
+    }
+    if (session.opened) {
+      storeRef.current.setDocBundle(session.opened.document, session.opened.blocks);
+      const [proposals, comments] = await Promise.all([
+        listProposals(session.opened.document.id),
+        listComments(session.opened.document.id),
+      ]);
+      if (
+        storeRef.current.doc?.id !== session.opened.document.id ||
+        storeRef.current.doc.revision !== session.opened.document.revision
+      ) return;
+      storeRef.current.setProposals(proposals.proposals);
+      storeRef.current.setComments(comments.comments ?? []);
+      storeRef.current.setThreads((session.review?.threads ?? [])
+        .filter((thread) => thread.documentId === session.opened?.document.id)
+        .map((thread) => ({
+          id: thread.id,
+          anchor: thread.anchor,
+          pos: null,
+          collapsed: true,
+          createdAt: thread.createdAt,
+        })));
+      const interruptedBlockId = session.task?.status === "interrupted"
+        ? session.task.selection?.blockIds[0]
+        : undefined;
+      if (interruptedBlockId) {
+        storeRef.current.setSelection({
+          blockId: interruptedBlockId,
+          text: session.task?.selection?.text ?? "",
+          selectionStart: session.task?.selection?.start,
+          anchor: null,
+        });
+      } else if (!storeRef.current.selection.blockId) {
+        const thread = [...proposals.proposals].reverse().find((proposal) =>
+          proposal.operation?.scope === "selection" || proposal.tableCell,
+        );
+        if (thread?.operation?.selection) {
+          storeRef.current.setSelection({
+            blockId: thread.blockId,
+            text: thread.operation.selection.before,
+            selectionStart: thread.operation.selection.start,
+            anchor: null,
+          });
+        } else if (thread?.tableCell) {
+          storeRef.current.setSelection({
+            blockId: thread.blockId,
+            text: thread.tableCell.before,
+            selectionStart: 0,
+            tableCell: thread.tableCell,
+            anchor: null,
+          });
+        }
+      }
+    } else if (storeRef.current.doc) {
+      // The target session has no open document — close the canvas too.
+      storeRef.current.clearDocument();
+    }
+    if (session.sourcePaths) storeRef.current.setSourcePaths(session.sourcePaths);
+    const restoredThreadIds = new Set(
+      (session.opened ? session.review?.threads ?? [] : [])
+        .filter((thread) => thread.documentId === session.opened?.document.id)
+        .map((thread) => thread.id),
+    );
+    const turns = session.chat?.turns?.filter((turn) =>
+      turn.text?.trim() && (!turn.threadId || restoredThreadIds.has(turn.threadId)),
+    ) ?? [];
+    const hydratedMessages: import("./components/Chat").ChatMessage[] = turns.map((t) => ({
+      id: crypto.randomUUID(),
+      role: t.role,
+      text: t.text,
+      threadId: t.threadId,
+    }));
+    if (session.task) {
+      if (session.task.status === "interrupted") {
+        hydratedMessages.push({
+          id: crypto.randomUUID(),
+          role: "assistant",
+          text: `上轮任务已中断：${session.task.objective}`,
+          task: session.task,
+        });
+      } else {
+        let lastAssistant = -1;
+        for (let index = hydratedMessages.length - 1; index >= 0; index -= 1) {
+          if (hydratedMessages[index]?.role === "assistant") {
+            lastAssistant = index;
+            break;
+          }
+        }
+        if (lastAssistant >= 0) hydratedMessages[lastAssistant] = {
+          ...hydratedMessages[lastAssistant],
+          task: session.task,
+        };
+      }
+    }
+    // Boot keeps the greeting when the session is empty; new/switch/clear always replace.
+    if (hydratedMessages.length || !opts?.keepEmptyMessages) {
+      storeRef.current.setMessages(hydratedMessages);
+    }
+  };
+
   useEffect(() => {
     let active = true;
     const sessionGeneration = documentStateRef.current.generation;
-    void api<{
-      llm?: LlmSettingsPublic;
-      llmMode?: "mock" | "byok";
-      clarificationRounds?: number;
-      sourcePaths?: string[];
-      task?: import("./api").AgentTask;
-      opened?: { document: DocumentMeta; blocks: Block[] };
-      chat?: {
-        turns: Array<{ role: "user" | "assistant"; text: string; threadId?: string }>;
-        maxTurns?: number;
-      };
-      review?: { threads: SessionReviewThread[] };
-    }>("/api/v1/session")
+    void getSession()
       .then(async (session) => {
         if (!active || documentStateRef.current.generation !== sessionGeneration) return;
-        if (session.llm) store.setLlm(session.llm);
-        if (typeof session.clarificationRounds === "number") {
-          store.setClarificationRounds(session.clarificationRounds);
-        }
-        if (session.opened) {
-          store.setDocBundle(session.opened.document, session.opened.blocks);
-          const [proposals, comments] = await Promise.all([
-            listProposals(session.opened.document.id),
-            listComments(session.opened.document.id),
-          ]);
-          if (!active) return;
-          if (
-            storeRef.current.doc?.id !== session.opened.document.id ||
-            storeRef.current.doc.revision !== session.opened.document.revision
-          ) return;
-          store.setProposals(proposals.proposals);
-          store.setComments(comments.comments ?? []);
-          store.setThreads((session.review?.threads ?? [])
-            .filter((thread) => thread.documentId === session.opened?.document.id)
-            .map((thread) => ({
-              id: thread.id,
-              anchor: thread.anchor,
-              pos: null,
-              collapsed: true,
-              createdAt: thread.createdAt,
-            })));
-          const interruptedBlockId = session.task?.status === "interrupted"
-            ? session.task.selection?.blockIds[0]
-            : undefined;
-          if (interruptedBlockId) {
-            store.setSelection({
-              blockId: interruptedBlockId,
-              text: session.task?.selection?.text ?? "",
-              selectionStart: session.task?.selection?.start,
-              anchor: null,
-            });
-          } else if (!storeRef.current.selection.blockId) {
-            const thread = [...proposals.proposals].reverse().find((proposal) =>
-              proposal.operation?.scope === "selection" || proposal.tableCell,
-            );
-            if (thread?.operation?.selection) {
-              store.setSelection({
-                blockId: thread.blockId,
-                text: thread.operation.selection.before,
-                selectionStart: thread.operation.selection.start,
-                anchor: null,
-              });
-            } else if (thread?.tableCell) {
-              store.setSelection({
-                blockId: thread.blockId,
-                text: thread.tableCell.before,
-                selectionStart: 0,
-                tableCell: thread.tableCell,
-                anchor: null,
-              });
-            }
-          }
-        }
-        if (session.sourcePaths) store.setSourcePaths(session.sourcePaths);
-        const restoredThreadIds = new Set(
-          (session.opened ? session.review?.threads ?? [] : [])
-            .filter((thread) => thread.documentId === session.opened?.document.id)
-            .map((thread) => thread.id),
-        );
-        const turns = session.chat?.turns?.filter((turn) =>
-          turn.text?.trim() && (!turn.threadId || restoredThreadIds.has(turn.threadId)),
-        ) ?? [];
-        if (turns.length || session.task?.status === "interrupted") {
-          const hydratedMessages: import("./components/Chat").ChatMessage[] = turns.map((t) => ({
-              id: crypto.randomUUID(),
-              role: t.role,
-              text: t.text,
-              threadId: t.threadId,
-            }));
-          if (session.task) {
-            if (session.task.status === "interrupted") {
-              hydratedMessages.push({
-                id: crypto.randomUUID(),
-                role: "assistant",
-                text: `上轮任务已中断：${session.task.objective}`,
-                task: session.task,
-              });
-            } else {
-              let lastAssistant = -1;
-              for (let index = hydratedMessages.length - 1; index >= 0; index -= 1) {
-                if (hydratedMessages[index]?.role === "assistant") {
-                  lastAssistant = index;
-                  break;
-                }
-              }
-              if (lastAssistant >= 0) hydratedMessages[lastAssistant] = {
-                ...hydratedMessages[lastAssistant],
-                task: session.task,
-              };
-            }
-          }
-          store.setMessages(hydratedMessages);
-        }
-        setSessionHydrated(true);
+        await applySessionSnapshot(session, { keepEmptyMessages: true });
+        if (active) setSessionHydrated(true);
       })
       .catch((error) => {
         if (active) store.setBootError(error instanceof Error ? error.message : String(error));
@@ -464,6 +466,16 @@ function Workspace() {
               <button
                 type="button"
                 className="icon-button"
+                title="打开 DOCX"
+                aria-label="打开 DOCX"
+                disabled={store.busy}
+                onClick={() => setDocxPickerOpen(true)}
+              >
+                <FolderOpen size={17} strokeWidth={1.8} />
+              </button>
+              <button
+                type="button"
+                className="icon-button"
                 title="导出 Word"
                 aria-label="导出 Word"
                 disabled={store.busy || store.documentDirty}
@@ -586,7 +598,8 @@ function Workspace() {
         onCancel={actions.canCancel ? actions.cancelCurrentRun : undefined}
         onContinueTask={() => void actions.onSend("继续").catch(actions.messageError)}
         onOpenSettings={() => store.setSettingsOpen(true)}
-        onOpenExtensions={() => setExtensionsOpen(true)}
+        onOpenSessions={() => setSessionsOpen(true)}
+        onOpenDocx={() => setDocxPickerOpen(true)}
         onClearSelection={clearSelectionEverywhere}
         layoutMode={layoutMode}
         onLayoutModeChange={setLayoutMode}
@@ -629,14 +642,46 @@ function Workspace() {
           {store.proposals.length ? <span>{store.proposals.length}</span> : null}
         </button>
       ) : null}
-      <Settings
+      <SettingsHub
         open={store.settingsOpen}
+        initialTab="model"
         onClose={() => store.setSettingsOpen(false)}
         onSaved={(settings) => {
           store.setLlm(settings);
         }}
       />
-      <Extensions open={extensionsOpen} onClose={() => setExtensionsOpen(false)} />
+      <SessionMenu
+        open={sessionsOpen}
+        busy={store.busy}
+        documentDirty={store.documentDirty}
+        onClose={() => setSessionsOpen(false)}
+        onApplySnapshot={applySessionSnapshot}
+      />
+      <OpenDocxDialog
+        open={docxPickerOpen}
+        onClose={() => setDocxPickerOpen(false)}
+        onOpened={(document, blocks, report) => {
+          store.setDocBundle(document, blocks);
+          void Promise.all([listProposals(document.id), listComments(document.id)])
+            .then(([proposals, comments]) => {
+              if (storeRef.current.doc?.id !== document.id || storeRef.current.doc.revision !== document.revision) return;
+              store.setProposals(proposals.proposals);
+              store.setComments(comments.comments ?? []);
+            })
+            .catch(actions.messageError);
+          if (report && !report.ok) {
+            store.appendMessage({
+              id: crypto.randomUUID(),
+              role: "assistant",
+              text: `已导入 ${document.relativePath}，但结构检查有告警：${(report.flags ?? []).join("、") || "未知"}`,
+            });
+          }
+        }}
+      />
+      <McpApprovalDialog
+        approval={actions.pendingMcpApproval}
+        onDecision={actions.resolvePendingMcpApproval}
+      />
       <RewritePrompt
         open={!!store.rewritePrompt}
         excerpt={store.rewritePrompt?.excerpt}
@@ -680,13 +725,13 @@ function Workspace() {
           onTranslate={() => {
             const intent = translationIntent(store.menu!.text);
             actions.dispatchSelection(
-              "rewrite_directed",
+              "discuss",
               store.menu!.blockId,
               store.menu!.text,
-              intent.instruction,
+              translateAssistInstruction(intent.targetLanguage),
               store.menu!.selectionStart,
-              intent.operation,
-              intent.targetLanguage,
+              undefined,
+              undefined,
               store.menu!.tableCell,
               store.menu!.blockIds,
               store.menu!.crossTableCells,
@@ -742,13 +787,13 @@ function Workspace() {
         onTranslate={() => {
           const intent = translationIntent(store.selection.text);
           actions.dispatchSelection(
-            "rewrite_directed",
+            "discuss",
             store.selection.blockId,
             store.selection.text,
-            intent.instruction,
+            translateAssistInstruction(intent.targetLanguage),
             store.selection.selectionStart,
-            intent.operation,
-            intent.targetLanguage,
+            undefined,
+            undefined,
             store.selection.tableCell,
             store.selection.blockIds,
             store.selection.crossTableCells,

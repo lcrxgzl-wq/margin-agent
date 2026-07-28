@@ -232,9 +232,10 @@ async function verifyLlmSetupFlow(page) {
   await page.route("**/api/v1/settings/llm/test", testHandler);
   await page.route("**/api/v1/settings/llm", saveHandler);
   try {
-    await page.getByRole("button", { name: "模型设置" }).click();
-    const settings = page.getByRole("dialog", { name: "API 设置" });
+    await page.getByRole("button", { name: "设置", exact: true }).click();
+    const settings = page.getByRole("dialog", { name: "设置", exact: true });
     await settings.waitFor({ state: "visible", timeout: 5_000 });
+    await settings.getByRole("tab", { name: "模型" }).click();
     const address = settings.locator('input[autocomplete="url"]');
     await address.fill("https://gateway.margin.test/v1");
     await settings.getByRole("radio", { name: "Anthropic" }).click();
@@ -342,10 +343,10 @@ async function verifyStopControl(page) {
 }
 
 async function verifyWorkspaceSkillLifecycle(page) {
-  await page.getByRole("button", { name: "扩展模块" }).click();
-  const modal = page.getByRole("dialog", { name: "扩展模块" });
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  const modal = page.getByRole("dialog", { name: "设置", exact: true });
   await modal.waitFor({ state: "visible", timeout: 5_000 });
-  await modal.getByRole("tab", { name: "Skills" }).click();
+  await modal.getByRole("tab", { name: "方法" }).click();
   await modal.locator(".extensions-import textarea").fill(
     "---\nname: gate-review-skill\ndescription: Gate-only review method\n---\n\nRead evidence before proposing edits.",
   );
@@ -354,13 +355,13 @@ async function verifyWorkspaceSkillLifecycle(page) {
   await imported.waitFor({ timeout: 5_000 });
   const screenshot = path.join(artifactDir, "office-extensions.png");
   await modal.screenshot({ path: screenshot });
-  await modal.getByRole("tab", { name: "MCP" }).click();
+  await modal.getByRole("tab", { name: "外部工具" }).click();
   await modal.getByText("尚未配置 MCP。", { exact: true }).waitFor({ timeout: 5_000 });
-  await modal.getByRole("tab", { name: "Skills" }).click();
+  await modal.getByRole("tab", { name: "方法" }).click();
   page.once("dialog", (dialog) => dialog.accept());
   await modal.getByRole("button", { name: "移除 gate-review-skill" }).click();
   await imported.waitFor({ state: "detached", timeout: 5_000 });
-  await modal.getByRole("button", { name: "关闭扩展" }).click();
+  await modal.getByRole("button", { name: "关闭设置" }).click();
   return screenshot;
 }
 
@@ -498,23 +499,56 @@ async function main() {
         bubbleLabels.some((label) => /^译[中英]$/.test(label)),
       `selection bubble did not converge to anchored-thread actions: ${JSON.stringify(bubbleLabels)}`,
     );
+    // Translation is a writing aid shown inside the thread window — it must
+    // never enter the proposal pipeline or touch the document.
     await page.locator(".sel-bubble button").filter({ hasText: /^译[中英]$/ }).click();
+    await page.locator(".thread-popover").waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator('.thread-popover .thread-message[data-role="user"]').filter({ hasText: "译成" })
+      .waitFor({ state: "visible", timeout: 5_000 });
+    await page.waitForFunction(() => {
+      const composer = document.querySelector(".thread-popover .thread-composer textarea");
+      const replies = [...document.querySelectorAll('.thread-popover .thread-message[data-role="assistant"]')];
+      const reply = replies.at(-1);
+      return Boolean(
+        composer && !composer.disabled && reply?.textContent &&
+          reply.textContent.trim().length > 2 && reply.textContent.trim() !== "…",
+      );
+    }, undefined, { timeout: 30_000 });
+    const proposalsAfterTranslate = await apiJson(baseUrl, token, `/api/v1/documents/${chat.opened.document.id}/proposals?status=proposed`);
+    invariant(
+      !proposalsAfterTranslate.proposals.some((proposal) => proposal.operation?.kind === "translate"),
+      "assist translation leaked into the proposal pipeline",
+    );
+    const blocksAfterTranslate = await apiJson(baseUrl, token, `/api/v1/documents/${chat.opened.document.id}/blocks`);
+    invariant(
+      blocksAfterTranslate.blocks.find((block) => block.id === translationBlock.id)?.text === translationBlock.text,
+      "assist translation changed the document",
+    );
+    await page.locator(".thread-backdrop").click({ position: { x: 8, y: 8 } });
+    await page.locator(".thread-popover").waitFor({ state: "detached", timeout: 5_000 });
+    // Rewrite keeps the structured-proposal path: accept + idempotent replay coverage stays.
+    const rewriteRange = await page.locator(".office-editor").evaluate((element, selection) => {
+      return Reflect.get(element, "__marginOfficeTestSelect")?.(selection, 0) ?? null;
+    }, translationSelection);
+    invariant(rewriteRange, `could not reselect rewrite sample: ${translationSelection}`);
+    await page.locator(".sel-bubble").waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator(".sel-bubble button").filter({ hasText: "改写" }).click();
     await page.locator(".thread-popover").waitFor({ state: "visible", timeout: 10_000 });
     await page.locator(".thread-popover .review-fragment.before del").waitFor({ state: "visible", timeout: 30_000 });
     const reviewedSource = (await page.locator(".thread-popover .review-fragment.before del").textContent())?.trim();
     invariant(reviewedSource === translationSelection, `review did not isolate selected source: ${JSON.stringify({ translationSelection, reviewedSource })}`);
-    invariant((await page.locator(".thread-popover .review-heading strong").textContent())?.trim() === "翻译", "selection operation was not preserved as translation");
+    invariant((await page.locator(".thread-popover .review-heading strong").textContent())?.trim() === "改写", "selection operation was not preserved as rewrite");
     const reviewedReplacement = (await page.locator(".thread-popover .review-fragment.after ins").textContent())?.trim() ?? "";
     invariant(reviewedReplacement.length > 0, "review replacement is empty");
     invariant(reviewedReplacement !== translationBlock.text, "review rendered the full mixed-language block as the replacement");
     const blocksBeforeAccept = await apiJson(baseUrl, token, `/api/v1/documents/${chat.opened.document.id}/blocks`);
     const proposalsBeforeAccept = await apiJson(baseUrl, token, `/api/v1/documents/${chat.opened.document.id}/proposals?status=proposed`);
-    const translationProposal = proposalsBeforeAccept.proposals.find((proposal) => proposal.operation?.kind === "translate");
-    invariant(translationProposal, "structured translation proposal was not persisted");
+    const translationProposal = proposalsBeforeAccept.proposals.find((proposal) => proposal.operation?.kind === "rewrite");
+    invariant(translationProposal, "structured rewrite proposal was not persisted");
     invariant(translationProposal.blockId === translationBlock.id, "selection was attached to the wrong OOXML block");
     invariant(
       blocksBeforeAccept.blocks.find((block) => block.id === translationBlock.id)?.text === translationBlock.text,
-      "translation proposal changed the document before Accept",
+      "rewrite proposal changed the document before Accept",
     );
     invariant(await page.locator(".office-review-rail").count() === 0, "legacy Office review rail is still mounted");
     const pageWidthDuringReview = await page.locator('.office-editor canvas[data-index="0"]').evaluate((canvas) => canvas.getBoundingClientRect().width);

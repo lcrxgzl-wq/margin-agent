@@ -34,6 +34,17 @@ export const polishIntent: SelectionEditIntent = {
   instruction: "润色所选文本，使表达准确、克制、符合学术写作习惯；保持原意、事实和引文，不新增证据。",
 };
 
+/**
+ * Translation as writing aid: discussed inside the thread popover, never a
+ * proposal. Must not start with 翻译/译成 (selectionEditIntent would turn it
+ * into a rewrite) and must avoid 重写/润色/改写/修订 (offline planner trigger).
+ */
+export function translateAssistInstruction(targetLanguage: ProposalTargetLanguage = "en"): string {
+  return targetLanguage === "en"
+    ? "把选区译成规范的学术英语，只在本窗口给出译文供参考，不写入正文。"
+    : "把选区译成简体中文，只在本窗口给出译文供参考，不写入正文。";
+}
+
 export function selectionEditIntent(text: string, selectionText = ""): SelectionEditIntent | null {
   const value = text.trim();
   if (!value || value.length > 240) return null;

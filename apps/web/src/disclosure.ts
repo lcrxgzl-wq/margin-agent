@@ -38,17 +38,17 @@ export function buildDisclosureText(packet: unknown): string {
     `【AI 使用披露草稿】`,
     ``,
     `文稿《${path}》在修订过程中使用了本地 AI 辅助工具（Margin）。`,
-    `AI 仅提出修改建议；是否采纳由作者本人逐条审阅决定，AI 无权直接定稿。`,
+    `AI 仅提出修改建议；是否接受由作者本人逐条审阅决定，AI 无权直接定稿。`,
     ``,
-    `统计：提案 ${proposals.length} 处；采纳/改写后采纳 ${accepted.length} 处；拒绝 ${rejected.length} 处；其余待决或未记录。`,
+    `统计：提案 ${proposals.length} 处；接受/编辑后接受 ${accepted.length} 处；拒绝 ${rejected.length} 处；其余待决或未记录。`,
     ``,
   ];
   if (accepted.length) {
-    lines.push(`已采纳或改写后采纳的条目：`);
+    lines.push(`已接受或编辑后接受的条目：`);
     accepted.slice(0, 40).forEach(({ proposal, decision }, i) => {
       lines.push(
         `${i + 1}. [${proposal.risk || "language"}] ${proposal.rationale || "（无理由）"}${
-          decision?.kind === "E" ? "（作者编辑后采纳）" : ""
+          decision?.kind === "E" ? "（作者编辑后接受）" : ""
         }`,
       );
     });

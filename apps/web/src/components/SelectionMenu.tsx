@@ -45,7 +45,7 @@ export function SelectionMenu({
         <button type="button" disabled={editDisabled} title={editDisabledReason || undefined} onClick={onRewriteDirected}>
           按指令重写
         </button>
-        <button type="button" disabled={editDisabled} title={editDisabledReason || undefined} onClick={onTranslate}>
+        <button type="button" onClick={onTranslate}>
           {translationLabel}
         </button>
         <button type="button" disabled={editDisabled} title={editDisabledReason || undefined} onClick={onPolish}>

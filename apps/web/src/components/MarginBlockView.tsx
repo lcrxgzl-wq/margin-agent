@@ -123,7 +123,7 @@ export function MarginBlockView({ node }: NodeViewProps) {
                 disabled={busy}
                 onClick={() => onUndo(proposal.id)}
               >
-                撤回
+                拒绝
               </button>
               <button
                 className="btn ghost"

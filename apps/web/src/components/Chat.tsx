@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
-  Blocks,
   CircleAlert,
   Crosshair,
   Globe,
+  History,
   Layers,
   ListChecks,
   MessageSquare,
@@ -16,15 +16,18 @@ import {
   Settings2,
   Square,
   Sun,
+  X,
 } from "lucide-react";
 import { ATTENTION_COPY, attentionMode } from "../attention";
-import type { AgentTask, Comment, Proposal } from "../api";
+import { listSkills, type AgentTask, type Comment, type Proposal, type SkillSummary } from "../api";
 import type { CascadeCandidate, ReviewThread } from "../store";
 import { CascadeCard } from "./CascadeCard";
 import { hasMarkdown, Markdown } from "./Markdown";
 import { PromptChips } from "./PromptChips";
 import { ReviewPanel } from "./ReviewPanel";
 import { SourcePicker } from "./SourcePicker";
+import { mentionableSkills } from "../extensionsModel";
+import { submitEnterFrom } from "../ime";
 
 export type ChatMessage = {
   id: string;
@@ -32,6 +35,8 @@ export type ChatMessage = {
   text: string;
   task?: AgentTask;
   threadId?: string;
+  /** Skills actually loaded this turn (explicit selection or load_skill), name + hash. */
+  loadedSkills?: Array<{ name: string; contentHash: string }>;
 };
 
 type Props = {
@@ -52,11 +57,12 @@ type Props = {
   onCascadeConfirm?: (blockIds: string[]) => void;
   composerPrefill?: string | null;
   onComposerPrefillConsumed?: () => void;
-  onSend: (text: string) => void;
+  onSend: (text: string, opts?: { selectedSkills?: string[] }) => void;
   onCancel?: () => void;
   onContinueTask?: () => void;
   onOpenSettings?: () => void;
-  onOpenExtensions?: () => void;
+  onOpenSessions?: () => void;
+  onOpenDocx?: () => void;
   onClearSelection?: () => void;
   layoutMode?: "dock" | "float" | "focus";
   onLayoutModeChange?: (mode: "dock" | "float" | "focus") => void;
@@ -102,7 +108,8 @@ export function Chat({
   onCancel,
   onContinueTask,
   onOpenSettings,
-  onOpenExtensions,
+  onOpenSessions,
+  onOpenDocx,
   onClearSelection,
   layoutMode,
   onLayoutModeChange,
@@ -126,6 +133,9 @@ export function Chat({
   onThemeModeChange,
 }: Props) {
   const [draft, setDraft] = useState("");
+  const [skillOptions, setSkillOptions] = useState<SkillSummary[]>([]);
+  const [pickedSkills, setPickedSkills] = useState<SkillSummary[]>([]);
+  const [skillQuery, setSkillQuery] = useState<string | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const followTail = useRef(true);
@@ -161,12 +171,105 @@ export function Chat({
     return () => window.clearTimeout(t);
   }, [composerPrefill, onComposerPrefillConsumed]);
 
+  // Load the enabled skill list lazily the first time the @ picker opens.
+  useEffect(() => {
+    if (skillQuery === null || skillOptions.length) return;
+    let active = true;
+    void listSkills()
+      .then((result) => {
+        if (active) setSkillOptions(result.skills);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [skillQuery, skillOptions.length]);
+
+  const updateDraft = (value: string, caret: number) => {
+    setDraft(value);
+    const before = value.slice(0, caret);
+    const match = before.match(/(?:^|[\s，。；、（(])@([a-z0-9-]{0,64})$/i);
+    setSkillQuery(match ? (match[1] ?? "").toLowerCase() : null);
+  };
+
+  const skillMatches = skillQuery === null
+    ? []
+    : mentionableSkills(skillOptions, skillQuery)
+        .filter((skill) => !pickedSkills.some((picked) => picked.name === skill.name))
+        .slice(0, 6);
+
+  const pickSkill = (skill: SkillSummary) => {
+    const caret = inputRef.current?.selectionStart ?? draft.length;
+    setDraft(
+      `${draft.slice(0, caret).replace(/@([a-z0-9-]{0,64})$/i, "")}${draft.slice(caret)}`,
+    );
+    setPickedSkills((current) =>
+      current.some((picked) => picked.name === skill.name) ? current : [...current, skill],
+    );
+    setSkillQuery(null);
+    inputRef.current?.focus();
+  };
+
+  const removeSkill = (name: string) => {
+    setPickedSkills((current) => current.filter((skill) => skill.name !== name));
+  };
+
   const submit = () => {
     const t = draft.trim();
     if (!t || busy) return;
     setDraft("");
-    onSend(t);
+    setSkillQuery(null);
+    // Structured one-turn selection: ids travel in the request body,
+    // never as raw @text, and chips clear after send.
+    const ids = pickedSkills.map((skill) => skill.name);
+    setPickedSkills([]);
+    onSend(t, { selectedSkills: ids.length ? ids : undefined });
   };
+
+  const handleComposerKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Escape" && skillQuery !== null) {
+      setSkillQuery(null);
+      return;
+    }
+    // IME composition (isComposing) Enter confirms a candidate; never submit.
+    if (submitEnterFrom(e)) {
+      e.preventDefault();
+      if (skillQuery !== null && skillMatches.length) pickSkill(skillMatches[0]!);
+      else submit();
+    }
+  };
+
+  const skillControls = (
+    <>
+      {pickedSkills.length ? (
+        <div className="skill-chips" aria-label="本轮选用的 Skill">
+          {pickedSkills.map((skill) => (
+            <span key={skill.name} className="skill-chip" title={skill.description}>
+              @{skill.name}
+              <button
+                type="button"
+                className="skill-chip-remove"
+                aria-label={`移除 ${skill.name}`}
+                onClick={() => removeSkill(skill.name)}
+              ><X size={11} /></button>
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {skillQuery !== null && skillMatches.length ? (
+        <ul className="skill-picker" role="listbox" aria-label="选择 Skill">
+          {skillMatches.map((skill) => (
+            <li key={skill.name}>
+              <button type="button" role="option" aria-selected={false} onClick={() => pickSkill(skill)}>
+                <strong>@{skill.name}</strong>
+                <small>{skill.description}</small>
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </>
+  );
 
   const visibleMessages = messages
     // Anchored discussions have their own focused surface and inbox; rendering
@@ -198,20 +301,26 @@ export function Chat({
             <button type="button" className="icon-button theme-cycle" aria-label="切换主题" title={`主题：${themeMode === "system" ? "跟随系统" : themeMode === "light" ? "浅色" : "深色"}`} onClick={cycleTheme}>{themeIcon}</button>
           ) : null}
           {llmMode !== "byok" ? <span className="connection-warning" title="当前为离线模式" aria-label="当前为离线模式"><CircleAlert /></span> : null}
+          {onOpenSessions ? (
+            <button
+              type="button"
+              className="icon-button sessions-trigger"
+              title="会话"
+              aria-label="会话管理"
+              onClick={onOpenSessions}
+            >
+              <History size={17} strokeWidth={1.8} />
+            </button>
+          ) : null}
           {onOpenSettings ? (
             <button
               type="button"
               className="icon-button settings-trigger"
-              title="模型设置"
-              aria-label="模型设置"
+              title="设置"
+              aria-label="设置"
               onClick={onOpenSettings}
             >
               <Settings2 size={17} strokeWidth={1.8} />
-            </button>
-          ) : null}
-          {onOpenExtensions ? (
-            <button type="button" className="icon-button" title="扩展模块" aria-label="扩展模块" onClick={onOpenExtensions}>
-              <Blocks size={17} strokeWidth={1.8} />
             </button>
           ) : null}
         </div>
@@ -229,23 +338,19 @@ export function Chat({
           <div className="chat-hero">
             <p className="hero-eyebrow">本地写作 Agent</p>
             <h1 className="brand">Margin</h1>
-            <p className="hero-line">打开文稿，讨论论证，提出可撤回的修订——定稿由你 Accept。</p>
+            <p className="hero-line">打开文稿，讨论论证，修订逐条由你裁决——定稿由你接受。</p>
           </div>
           <div className="composer-wrap landing-composer">
             <div className={`composer-card${busy ? " busy" : ""}`}>
+              {skillControls}
               <textarea
                 ref={inputRef}
                 value={draft}
                 placeholder="问我任何事，或说「打开样章」…"
                 rows={2}
                 disabled={busy}
-                onChange={(e) => setDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    submit();
-                  }
-                }}
+                onChange={(e) => updateDraft(e.target.value, e.target.selectionStart ?? e.target.value.length)}
+                onKeyDown={handleComposerKey}
               />
               <div className="composer-footer">
                 <span className="composer-hint">Enter 发送</span>
@@ -261,7 +366,7 @@ export function Chat({
                 </button>
               </div>
             </div>
-            <PromptChips busy={busy} visible onSend={onSend} />
+            <PromptChips busy={busy} visible onSend={onSend} onOpenDocx={onOpenDocx} />
           </div>
         </div>
       ) : (
@@ -306,6 +411,13 @@ export function Chat({
                 <div className={`bubble ${m.role}`}>
                   {m.role === "assistant" && hasMarkdown(m.text) ? <Markdown text={m.text} /> : m.text}
                 </div>
+                {m.role === "assistant" && m.loadedSkills?.length ? (
+                  <div className="loaded-skills">
+                    已加载方法：{m.loadedSkills
+                      .map((skill) => `${skill.name} · ${skill.contentHash.slice(0, 8)}`)
+                      .join("、")}
+                  </div>
+                ) : null}
                 {m.role === "assistant" && m.task ? (
                   <TaskReceipt task={m.task} onContinue={onContinueTask} />
                 ) : null}
@@ -361,6 +473,7 @@ export function Chat({
               </div>
             ) : null}
             <div className={`composer-card${busy ? " busy" : ""}`}>
+              {skillControls}
               <textarea
                 ref={inputRef}
                 value={draft}
@@ -373,13 +486,8 @@ export function Chat({
                 }
                 rows={draft.length > 80 ? 4 : 2}
                 disabled={busy}
-                onChange={(e) => setDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    submit();
-                  }
-                }}
+                onChange={(e) => updateDraft(e.target.value, e.target.selectionStart ?? e.target.value.length)}
+                onKeyDown={handleComposerKey}
               />
               <div className="composer-footer">
                 <div className="composer-tools">

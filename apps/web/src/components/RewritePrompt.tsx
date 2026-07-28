@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import { useDialogFocus } from "../dialogFocus";
+import { submitEnterFrom } from "../ime";
 
 type Props = {
   open: boolean;
@@ -12,12 +14,18 @@ type Props = {
 export function RewritePrompt({ open, excerpt, busy, onCancel, onSubmit }: Props) {
   const [text, setText] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  useDialogFocus({
+    active: open,
+    containerRef: panelRef,
+    initialFocusRef: inputRef,
+    canClose: () => !busy,
+    onEscape: onCancel,
+  });
 
   useEffect(() => {
-    if (!open) return;
-    setText("");
-    const t = window.setTimeout(() => inputRef.current?.focus(), 30);
-    return () => window.clearTimeout(t);
+    if (open) setText("");
   }, [open]);
 
   if (!open) return null;
@@ -29,10 +37,12 @@ export function RewritePrompt({ open, excerpt, busy, onCancel, onSubmit }: Props
   };
 
   return (
-    <div className="rewrite-prompt-backdrop" role="presentation" onClick={onCancel}>
+    <div className="rewrite-prompt-backdrop" role="presentation" onClick={busy ? undefined : onCancel}>
       <div
+        ref={panelRef}
         className="rewrite-prompt"
         role="dialog"
+        aria-modal="true"
         aria-label="按指令重写"
         onClick={(e) => e.stopPropagation()}
       >
@@ -46,11 +56,11 @@ export function RewritePrompt({ open, excerpt, busy, onCancel, onSubmit }: Props
           placeholder="例如：更克制、补理论桥接、去掉口号式表述…"
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
+            // IME composition Enter confirms a candidate; never submit.
+            if (submitEnterFrom(e)) {
               e.preventDefault();
               submit();
             }
-            if (e.key === "Escape") onCancel();
           }}
         />
         <div className="rewrite-prompt-actions">

@@ -17,7 +17,7 @@ describe("buildDisclosureText", () => {
       ],
     });
 
-    expect(text).toContain("采纳/改写后采纳 2 处；拒绝 1 处");
-    expect(text).toContain("补充限定（作者编辑后采纳）");
+    expect(text).toContain("接受/编辑后接受 2 处；拒绝 1 处");
+    expect(text).toContain("补充限定（作者编辑后接受）");
   });
 });

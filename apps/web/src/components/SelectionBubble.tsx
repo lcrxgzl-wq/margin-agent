@@ -39,7 +39,7 @@ export function SelectionBubble({
       <button type="button" disabled={busy || editDisabled} title={editDisabledReason || undefined} onClick={onRewrite}>
         改写
       </button>
-      <button type="button" disabled={busy || editDisabled} title={editDisabledReason || undefined} onClick={onTranslate}>
+      <button type="button" disabled={busy} onClick={onTranslate}>
         {translationLabel}
       </button>
       <button type="button" disabled={busy} onClick={onDiscuss}>
