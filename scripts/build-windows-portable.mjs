@@ -174,17 +174,17 @@ try {
     "endlocal",
     "",
   ].join("\r\n");
-  fs.writeFileSync(path.join(bundleDir, "启动 Margin.cmd"), cmd, "utf8");
+  fs.writeFileSync(path.join(bundleDir, "Start Margin.cmd"), cmd, "utf8");
 
   const readme = `Margin ${manifest.version} Windows x64 便携版\r\n\r\n` +
-    `1. 双击“启动 Margin.cmd”。首次启动会创建“文档\\Margin”工作区。\r\n` +
-    `2. 也可以把一个论文文件夹拖到“启动 Margin.cmd”上，以该文件夹作为工作区。\r\n` +
+    `1. 双击“Start Margin.cmd”。首次启动会创建“文档\\Margin”工作区。\r\n` +
+    `2. 也可以把一个论文文件夹拖到“Start Margin.cmd”上，以该文件夹作为工作区。\r\n` +
     `3. 浏览器会自动打开。运行期间请保留终端窗口，关闭窗口即可停止 Margin。\r\n` +
     `4. 更新时替换本程序目录即可；工作区、文稿和 .margin 记录保存在程序目录之外。\r\n\r\n` +
     `Margin 只监听 127.0.0.1。调用模型时，选区和必要上下文会发送到你配置的模型服务商。\r\n` +
     `项目：https://github.com/lcrxgzl-wq/margin-agent\r\n` +
     `许可：MIT\r\n`;
-  fs.writeFileSync(path.join(bundleDir, "使用说明.txt"), readme, "utf8");
+  fs.writeFileSync(path.join(bundleDir, "README.txt"), readme, "utf8");
   fs.copyFileSync(path.join(root, "LICENSE"), path.join(bundleDir, "MARGIN_LICENSE.txt"));
   fs.copyFileSync(path.join(root, "THIRD_PARTY_NOTICES.md"), path.join(bundleDir, "THIRD_PARTY_NOTICES.md"));
   fs.writeFileSync(path.join(bundleDir, "PORTABLE_MANIFEST.json"), `${JSON.stringify({
@@ -199,7 +199,7 @@ try {
   fs.rmSync(checksumPath, { force: true });
   run(archiveTool, ["--format", "zip", "-cf", zipPath, "-C", payloadDir, bundleName]);
   for (const required of [
-    `${bundleName}/启动 Margin.cmd`,
+    `${bundleName}/Start Margin.cmd`,
     `${bundleName}/runtime/node.exe`,
     `${bundleName}/app/node_modules/margin-agent/dist/index.js`,
   ]) {

@@ -153,7 +153,7 @@ async function main() {
     const bundleDir = path.join(extractionRoot, bundleName);
     const embeddedNode = path.join(bundleDir, "runtime", "node.exe");
     const launcher = path.join(bundleDir, "launcher.cjs");
-    const commandFile = path.join(bundleDir, "启动 Margin.cmd");
+    const commandFile = path.join(bundleDir, "Start Margin.cmd");
     const appManifestPath = path.join(bundleDir, "app", "node_modules", "margin-agent", "package.json");
     for (const required of [
       embeddedNode,

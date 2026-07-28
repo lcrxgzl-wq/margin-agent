@@ -40,7 +40,7 @@ tag 推送触发 `.github/workflows/publish.yml`：全部门禁（test/typecheck
 
 ## 验证用户安装
 
-Windows x64 便携版：从 GitHub Release 下载 `margin-agent-win-x64-vX.Y.Z.zip`，核对同名 `.sha256`，解压后双击“启动 Margin.cmd”。该包自带 Node.js，不依赖系统 npm。
+Windows x64 便携版：从 GitHub Release 下载 `margin-agent-win-x64-vX.Y.Z.zip`，核对同名 `.sha256`，解压后双击“Start Margin.cmd”。该包自带 Node.js，不依赖系统 npm。
 
 ```bash
 npm i -g margin-agent

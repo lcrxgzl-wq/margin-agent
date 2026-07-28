@@ -22,7 +22,7 @@ Margin 将模型的每次修改限定为一条针对具体选区（一句话、�
 ## 安装（最终用户）
 
 Windows x64 用户可从 [GitHub Releases](https://github.com/lcrxgzl-wq/margin-agent/releases) 下载
-`margin-agent-win-x64-vX.Y.Z.zip`，解压后双击“启动 Margin.cmd”。程序自带 Node.js；默认工作区是“文档\\Margin”，也可把论文文件夹拖到启动文件上。更新时替换程序目录即可，工作区与 `.margin` 记录不会被删除。
+`margin-agent-win-x64-vX.Y.Z.zip`，解压后双击“Start Margin.cmd”。程序自带 Node.js；默认工作区是“文档\\Margin”，也可把论文文件夹拖到启动文件上。更新时替换程序目录即可，工作区与 `.margin` 记录不会被删除。
 
 已安装 Node.js 22+ 的用户也可使用 npm：
 
@@ -50,12 +50,14 @@ DOCX 是 Word 主路径的规范文件；Markdown 仅保留旧文稿兼容。人
 
 ## 多工作区
 
-每个 CLI 进程只服务一个工作区。需要同时处理两个工作区时，打开两个终端，使用不同路径和端口：
+每个 CLI 进程只服务一个工作区，默认监听 8787 端口。需要同时处理两个工作区时，打开两个终端，指定不同端口：
 
 ```bash
-MARGIN_PORT=8787 pnpm --filter @margin/cli dev -- E:\论文A
-MARGIN_PORT=8788 pnpm --filter @margin/cli dev -- E:\论文B
+MARGIN_PORT=8787 margin-agent E:\论文A
+MARGIN_PORT=8788 margin-agent E:\论文B
 ```
+
+启动时报 `EADDRINUSE: address already in use 127.0.0.1:8787`，说明 8787 已被占用——通常是已有一个 margin-agent 实例在运行（检查已打开的终端窗口），或上一个进程尚未退出。关掉它，或按上面方式换个端口。便携版启动器会自动挑选空闲端口，无需处理。
 
 ## BYOK
 
