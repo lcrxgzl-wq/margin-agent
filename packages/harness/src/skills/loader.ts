@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseDocument } from "yaml";
 import type { SkillScope } from "../index.js";
 
 export type SkillMeta = {
@@ -20,6 +21,12 @@ export type LoadedSkill = SkillMeta & {
 
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/;
 
+type SkillFrontmatter = {
+  name?: unknown;
+  description?: unknown;
+  packs?: unknown;
+};
+
 function packageSkillsRoot(): string {
   const here = path.dirname(fileURLToPath(import.meta.url));
   // Workspace package: ../../skills. Bundled margin-agent: ../skills.
@@ -32,13 +39,22 @@ export function parseSkillMarkdown(filePath: string, raw: string): LoadedSkill |
   if (!m) return null;
   const fm = m[1] ?? "";
   const body = (m[2] ?? "").trim();
-  const nameMatch = fm.match(/^name:\s*(.+)$/m);
-  const descMatch = fm.match(/^description:\s*(.+)$/m);
-  const name = nameMatch?.[1]?.trim();
-  const description = descMatch?.[1]?.trim();
+  const document = parseDocument(fm, { schema: "core" });
+  if (document.errors.length) return null;
+  const metadata = document.toJS({ maxAliasCount: 0 }) as SkillFrontmatter | null;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return null;
+  const name = typeof metadata.name === "string" ? metadata.name.trim() : "";
+  const description = typeof metadata.description === "string" ? metadata.description.trim() : "";
   if (!name || !description) return null;
-  const packsMatch = fm.match(/^packs:\s*(.+)$/m);
-  const packs = packsMatch?.[1]?.split(",").map((pack) => pack.trim().toLowerCase()).filter(Boolean);
+  const rawPacks = Array.isArray(metadata.packs)
+    ? metadata.packs
+    : typeof metadata.packs === "string"
+      ? metadata.packs.split(",")
+      : [];
+  const packs = rawPacks
+    .filter((pack): pack is string => typeof pack === "string")
+    .map((pack) => pack.trim().toLowerCase())
+    .filter(Boolean);
   const contentHash = createHash("sha256").update(raw).digest("hex").slice(0, 16);
   return { name, description, filePath, contentHash, body, ...(packs?.length ? { packs } : {}) };
 }
@@ -77,12 +93,13 @@ export function listAvailableSkills(workspaceSkillsRoot?: string, scope: SkillSc
     ...listBundledSkills().filter((skill) => !overridden.has(skill.name)),
     ...workspace,
   ].sort((left, right) => left.name.localeCompare(right.name));
-  if (scope === "core") {
-    return merged.filter(
-      (skill) => !skill.packs || skill.packs.includes("core") || skill.packs.includes("office"),
-    );
-  }
-  return merged;
+  return merged.filter((skill) => isSkillAllowedInScope(skill, scope));
+}
+
+export function isSkillAllowedInScope(skill: SkillMeta, scope: SkillScope): boolean {
+  if (scope === "none") return false;
+  if (scope === "all") return true;
+  return !skill.packs || skill.packs.includes("core") || skill.packs.includes("office");
 }
 
 export function loadBundledSkill(

@@ -4,13 +4,17 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   composeDirectPrompt,
+  composeDirectPromptDetailed,
   composeSystemPrompt,
+
+  composeSystemPromptDetailed,
   directIdentity,
   getHarness,
   importWorkspaceSkill,
   listAvailableSkills,
   listBundledSkills,
   listHarnesses,
+  listSkillStates,
   loadBundledSkill,
   loadAvailableSkill,
   removeWorkspaceSkill,
@@ -116,6 +120,78 @@ describe("harness", () => {
     const names = (scope: "all" | "core") => listAvailableSkills(root, scope).map((s) => s.name);
     expect(names("core")).not.toContain("case-pack-skill");
     expect(names("all")).toContain("case-pack-skill");
+  });
+
+  it("parses quoted YAML fields and array packs consistently", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-skills-yaml-"));
+    roots.push(root);
+    await importWorkspaceSkill(root, `---\nname: "quoted-skill"\ndescription: 'Quoted metadata'\npacks:\n  - Academic\n---\n\nBody.`);
+
+    expect(listAvailableSkills(root, "all")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "quoted-skill", description: "Quoted metadata", packs: ["academic"] }),
+    ]));
+    expect(listAvailableSkills(root, "core").some((skill) => skill.name === "quoted-skill")).toBe(false);
+  });
+
+  it("resolves effective states from profile scope and user disablement", () => {
+    const office = listSkillStates(undefined, "core", ["format-tidy-zh"]);
+    expect(office.find((skill) => skill.name === "format-tidy-zh")?.state).toBe("disabled");
+    expect(office.find((skill) => skill.name === "argument-revision-zh")?.state)
+      .toBe("blocked_by_profile");
+  });
+
+  it("rejects unavailable explicit direct Skills instead of silently skipping", () => {
+    expect(() => composeDirectPromptDetailed("minimal", { selectedSkills: ["format-tidy-zh"] }))
+      .toThrow(/不允许使用 Skill/);
+    expect(() => composeDirectPromptDetailed("office-zh", { selectedSkills: ["argument-revision-zh"] }))
+      .toThrow(/无法使用 Skill/);
+    expect(() => composeDirectPromptDetailed("social-science-zh", {
+      selectedSkills: ["argument-revision-zh"],
+      disabledSkills: ["argument-revision-zh"],
+    })).toThrow(/Skill 已关闭/);
+  });
+
+  it("inlines explicitly selected session Skills with hashes and visible errors", () => {
+    const detailed = composeSystemPromptDetailed("social-science-zh", "session", {
+      selectedSkills: ["argument-revision-zh"],
+    });
+    expect(detailed.prompt).toContain('<skill name="argument-revision-zh">');
+    expect(detailed.prompt).toContain("本轮作者显式选用以下 Skill");
+    expect(detailed.loadedSkills).toEqual([
+      { name: "argument-revision-zh", contentHash: expect.stringMatching(/^[a-f0-9]{16}$/) },
+    ]);
+
+    expect(composeSystemPromptDetailed("social-science-zh", "session").loadedSkills).toEqual([]);
+    expect(() => composeSystemPromptDetailed("minimal", "session", {
+      selectedSkills: ["format-tidy-zh"],
+    })).toThrow(/不允许使用 Skill/);
+    expect(() => composeSystemPromptDetailed("office-zh", "session", {
+      selectedSkills: ["argument-revision-zh"],
+    })).toThrow(/无法使用 Skill/);
+    expect(() => composeSystemPromptDetailed("social-science-zh", "session", {
+      selectedSkills: ["unknown-skill"],
+    })).toThrow(/无法使用 Skill/);
+    expect(() => composeSystemPromptDetailed("social-science-zh", "session", {
+      selectedSkills: ["argument-revision-zh"],
+      disabledSkills: ["argument-revision-zh"],
+    })).toThrow(/Skill 已关闭/);
+  });
+
+  it("fails visibly when an explicitly selected session Skill exceeds the turn budget", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-skills-oversize-"));
+    roots.push(root);
+    const raw = `---
+name: huge-skill
+description: Oversized explicit selection
+---
+
+${"长".repeat(26_000)}`;
+    await importWorkspaceSkill(root, raw);
+
+    expect(() => composeSystemPromptDetailed("social-science-zh", "session", {
+      workspaceSkillsRoot: root,
+      selectedSkills: ["huge-skill"],
+    })).toThrow(/超出本轮容量/);
   });
 
   it("loads bundled skills", () => {

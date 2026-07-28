@@ -1,5 +1,6 @@
 import {
   formatSkillsForPrompt,
+  isSkillAllowedInScope,
   listBundledSkills,
   listAvailableSkills,
   loadBundledSkill,
@@ -249,61 +250,169 @@ export type ComposeSystemPromptOptions = {
   /** When false, omit bundled skills index (e.g. minimal / scan). Default: true for session non-minimal. */
   includeSkills?: boolean;
   workspaceSkillsRoot?: string;
+  disabledSkills?: readonly string[];
+  /** Explicit one-turn Skills (structured ids): inlined into the prompt, bounded, visible errors. */
+  selectedSkills?: readonly string[];
 };
+
+const MAX_SESSION_SKILL_CHARS = 24_000;
+
+export type SystemPromptResult = {
+  prompt: string;
+  loadedSkills: Array<{ name: string; contentHash: string }>;
+};
+
+export function composeSystemPromptDetailed(
+  harnessId: string | undefined,
+  mode: "session" | "scan",
+  opts?: ComposeSystemPromptOptions,
+): SystemPromptResult {
+  const harness = getHarness(harnessId);
+  const includeSkills =
+    opts?.includeSkills ?? (mode === "session" && harness.skills.scope !== "none");
+  let prompt = `${harness.instructions}\n风格：${harness.styleHint}\n\n${runtimeToolAppendix(harness, mode)}`;
+  const selected = [...new Set((opts?.selectedSkills ?? []).map((name) => name.toLowerCase()))];
+  if (selected.length && harness.skills.scope === "none") {
+    throw new Error("当前 Agent 模式不允许使用 Skill");
+  }
+  const disabled = new Set(opts?.disabledSkills ?? []);
+  if (includeSkills) {
+    prompt += formatSkillsForPrompt(
+      listAvailableSkills(opts?.workspaceSkillsRoot, harness.skills.scope)
+        .filter((skill) => !disabled.has(skill.name)),
+    );
+  }
+  const loadedSkills: SystemPromptResult["loadedSkills"] = [];
+  if (selected.length) {
+    const available = new Set(
+      listAvailableSkills(opts?.workspaceSkillsRoot, harness.skills.scope).map((skill) => skill.name),
+    );
+    for (const name of selected) {
+      if (disabled.has(name)) throw new Error(`Skill 已关闭: ${name}`);
+      if (!available.has(name)) throw new Error(`当前 Agent 模式无法使用 Skill: ${name}`);
+    }
+    let used = 0;
+    const bodies: string[] = [];
+    for (const name of selected) {
+      const skill = loadAvailableSkill(name, opts?.workspaceSkillsRoot, harness.skills.scope);
+      const block = `<skill name="${skill.name}">\n${skill.body}\n</skill>`;
+      if (used + block.length > MAX_SESSION_SKILL_CHARS) {
+        throw new Error(`所选 Skill 超出本轮容量: ${name}`);
+      }
+      bodies.push(block);
+      loadedSkills.push({ name: skill.name, contentHash: skill.contentHash });
+      used += block.length;
+    }
+    prompt += `\n\n本轮作者显式选用以下 Skill，优先遵循其方法：\n${bodies.join("\n\n")}`;
+  }
+  return { prompt, loadedSkills };
+}
 
 export function composeSystemPrompt(
   harnessId: string | undefined,
   mode: "session" | "scan",
   opts?: ComposeSystemPromptOptions,
 ): string {
-  const harness = getHarness(harnessId);
-  const includeSkills =
-    opts?.includeSkills ?? (mode === "session" && harness.skills.scope !== "none");
-  let prompt = `${harness.instructions}\n风格：${harness.styleHint}\n\n${runtimeToolAppendix(harness, mode)}`;
-  if (includeSkills) {
-    prompt += formatSkillsForPrompt(listAvailableSkills(opts?.workspaceSkillsRoot, harness.skills.scope));
-  }
-  return prompt;
+  return composeSystemPromptDetailed(harnessId, mode, opts).prompt;
 }
 
 export type ComposeDirectPromptOptions = {
   workspaceSkillsRoot?: string;
   instruction?: string;
+  disabledSkills?: readonly string[];
+  selectedSkills?: readonly string[];
 };
 
 const MAX_DIRECT_SKILL_CHARS = 24_000;
 
 /** Compile the same profile for a single-call Quick Edit, inlining only selected skills. */
-export function composeDirectPrompt(
+export type DirectPromptResult = {
+  prompt: string;
+  loadedSkills: Array<{ name: string; contentHash: string }>;
+};
+
+export function composeDirectPromptDetailed(
   harnessId: string | undefined,
   opts?: ComposeDirectPromptOptions,
-): string {
+): DirectPromptResult {
   const profile = getAgentProfile(harnessId);
   const instructions = `${profile.instructions}\n风格：${profile.styleHint}`;
-  if (profile.skills.scope === "none") return instructions;
+  const selected = (opts?.selectedSkills ?? []).map((name) => name.toLowerCase());
   const referenced = [...(opts?.instruction ?? "").matchAll(/@([a-z0-9][a-z0-9-]{0,63})\b/gi)]
     .map((match) => match[1]!.toLowerCase());
-  const requested = [...new Set([...profile.skills.direct, ...referenced])];
+  const explicit = [...new Set([...selected, ...referenced])];
+  if (profile.skills.scope === "none") {
+    if (explicit.length) throw new Error("当前 Agent 模式不允许使用 Skill");
+    return { prompt: instructions, loadedSkills: [] };
+  }
+  const disabled = new Set(opts?.disabledSkills ?? []);
+  const requested = [...new Set([
+    ...profile.skills.direct.filter((name) => !disabled.has(name)),
+    ...explicit,
+  ])];
   const available = new Set(
     listAvailableSkills(opts?.workspaceSkillsRoot, profile.skills.scope).map((skill) => skill.name),
   );
+  for (const name of explicit) {
+    if (disabled.has(name)) throw new Error(`Skill 已关闭: ${name}`);
+    if (!available.has(name)) throw new Error(`当前 Agent 模式无法使用 Skill: ${name}`);
+  }
   let used = 0;
   const bodies: string[] = [];
+  const loadedSkills: DirectPromptResult["loadedSkills"] = [];
   for (const name of requested) {
     if (!available.has(name)) continue;
     const skill = loadAvailableSkill(name, opts?.workspaceSkillsRoot, profile.skills.scope);
     const block = `<skill name="${skill.name}">\n${skill.body}\n</skill>`;
-    if (used + block.length > MAX_DIRECT_SKILL_CHARS) continue;
+    if (used + block.length > MAX_DIRECT_SKILL_CHARS) {
+      if (explicit.includes(name)) throw new Error(`所选 Skill 超出本轮容量: ${name}`);
+      continue;
+    }
     bodies.push(block);
+    loadedSkills.push({ name: skill.name, contentHash: skill.contentHash });
     used += block.length;
   }
-  return bodies.length
-    ? `${instructions}\n\n本轮为单次 Quick Edit，不调用工具。遵循以下已选 Skill：\n${bodies.join("\n\n")}`
-    : instructions;
+  return {
+    prompt: bodies.length
+      ? `${instructions}\n\n本轮为单次 Quick Edit，不调用工具。遵循以下已选 Skill：\n${bodies.join("\n\n")}`
+      : instructions,
+    loadedSkills,
+  };
+}
+
+export function composeDirectPrompt(
+  harnessId: string | undefined,
+  opts?: ComposeDirectPromptOptions,
+): string {
+  return composeDirectPromptDetailed(harnessId, opts).prompt;
+}
+
+export type SkillEffectiveState = SkillMeta & {
+  state: "enabled" | "disabled" | "blocked_by_profile";
+  overridesBundled: boolean;
+};
+
+export function listSkillStates(
+  workspaceSkillsRoot: string | undefined,
+  scope: SkillScope,
+  disabledSkills: readonly string[] = [],
+): SkillEffectiveState[] {
+  const disabled = new Set(disabledSkills);
+  const bundledNames = new Set(listBundledSkills().map((skill) => skill.name));
+  return listAvailableSkills(workspaceSkillsRoot, "all").map((skill) => ({
+    ...skill,
+    state: !isSkillAllowedInScope(skill, scope)
+      ? "blocked_by_profile" as const
+      : disabled.has(skill.name)
+        ? "disabled" as const
+        : "enabled" as const,
+    overridesBundled: skill.source === "workspace" && bundledNames.has(skill.name),
+  }));
 }
 
 export {
   formatSkillsForPrompt,
+  isSkillAllowedInScope,
   listBundledSkills,
   listAvailableSkills,
   loadBundledSkill,
