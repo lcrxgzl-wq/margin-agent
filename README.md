@@ -96,6 +96,10 @@ pnpm gate:office -- "E:\path\paper.docx"
 - 产品宪法：`MARGIN_PLAN.md`
 - 长程里程碑：`ROADMAP.md`（经 GPT sol 审定：**Go with changes**）
 
+## 致谢
+
+Agent 壳基于 [pi](https://github.com/earendil-works/pi)（Mario Zechner，MIT）构建；DOCX 适配层部分派生自 canvas-editor 生态（见 `THIRD_PARTY_NOTICES.md`）。
+
 ## 许可
 
 MIT（本地）。云端中转/计费为专有，不在本 Phase。
