@@ -1024,6 +1024,10 @@ textarea {
   justify-items: start;
 }
 
+.turn.system {
+  justify-items: center;
+}
+
 .turn-meta {
   font-size: 0.66rem;
   font-weight: 600;
@@ -1068,6 +1072,18 @@ textarea {
   letter-spacing: 0;
   box-shadow: none;
   white-space: pre-wrap;
+}
+
+.bubble.system {
+  max-width: min(100%, 30rem);
+  background: transparent;
+  border: 1px dashed var(--assistant-border);
+  border-radius: 999px;
+  box-shadow: none;
+  color: var(--mute);
+  font-size: 0.78rem;
+  padding: 0.3rem 0.85rem;
+  text-align: center;
 }
 
 .bubble.assistant .md {
@@ -2262,7 +2278,7 @@ textarea {
   overflow-wrap: anywhere;
 }
 
-.settings-field input,
+.settings-field input:not([type="checkbox"]),
 .settings-field select,
 .settings-model-group > input,
 .settings-model-group > select {
@@ -2277,7 +2293,7 @@ textarea {
   font: inherit;
 }
 
-.settings-field input:focus,
+.settings-field input:not([type="checkbox"]):focus,
 .settings-field select:focus,
 .settings-model-group > input:focus,
 .settings-model-group > select:focus {

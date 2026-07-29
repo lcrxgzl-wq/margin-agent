@@ -285,6 +285,8 @@ export async function listDocumentTimeline(documentId: string, limit = 40) {
 
 export type ReasoningMode = "auto" | "fast" | "standard" | "deep";
 
+export type ContextTier = "eco" | "standard" | "max";
+
 export type LlmProviderPublic = {
   id: string;
   name: string;
@@ -317,6 +319,12 @@ export type LlmSettingsPublic = {
   llmMode: "mock" | "byok";
   harnessId?: string;
   reasoningMode?: ReasoningMode;
+  /** Pi session timeout in ms; absent means the profile default applies. */
+  agentTimeoutMs?: number;
+  /** Context budget tier; absent means the standard tier applies. */
+  contextTier?: ContextTier;
+  /** Automatic context compaction; absent means enabled (default). */
+  compactionAuto?: boolean;
   ccSwitch?: {
     detected: boolean;
     proxyBaseURL?: string;
@@ -356,6 +364,9 @@ export async function saveLlmSettings(body: {
   authStyle?: "bearer" | "apikey";
   reasoningOptIn?: boolean;
   reasoningMode?: ReasoningMode | null;
+  agentTimeoutMs?: number | null;
+  contextTier?: ContextTier | null;
+  compactionAuto?: boolean | null;
   harnessId?: string | null;
 }) {
   return api<LlmSettingsPublic>("/api/v1/settings/llm", {
@@ -797,7 +808,7 @@ export type SessionSnapshot = {
   task?: AgentTask;
   opened?: { document: DocumentMeta; blocks: Block[] };
   chat?: {
-    turns: Array<{ role: "user" | "assistant"; text: string; threadId?: string }>;
+    turns: Array<{ role: "user" | "assistant" | "system"; text: string; threadId?: string }>;
     maxTurns?: number;
   };
   review?: { threads: SessionReviewThread[] };
@@ -842,6 +853,14 @@ export async function deleteSession(sessionId: string) {
 export async function clearCurrentSession() {
   return api<{ ok: true; documentId?: string; sourcePaths?: string[] }>(
     "/api/v1/chat/clear",
+    { method: "POST", body: "{}" },
+  );
+}
+
+/** Manual context compaction (409 when there is nothing to compact). */
+export async function compactSession() {
+  return api<{ tokensBefore: number; tokensAfter: number; summary: string }>(
+    "/api/v1/sessions/compact",
     { method: "POST", body: "{}" },
   );
 }

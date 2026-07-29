@@ -1,9 +1,17 @@
 import { useEffect, useState } from "react";
 import { Check } from "lucide-react";
 import {
+  AGENT_TIMEOUT_DEFAULT_SECONDS,
+  AGENT_TIMEOUT_MAX_SECONDS,
+  AGENT_TIMEOUT_MIN_SECONDS,
+  agentTimeoutMsToSeconds,
+  agentTimeoutSecondsToMs,
+} from "../../agentTimeout";
+import {
   getLlmSettings,
   listHarnesses,
   saveLlmSettings,
+  type ContextTier,
   type HarnessSummary,
   type LlmSettingsPublic,
   type ReasoningMode,
@@ -22,6 +30,12 @@ const REASONING_MODES: Array<{ id: ReasoningMode; label: string; hint: string }>
   { id: "deep", label: "深入", hint: "更强推理，兼容模型才生效" },
 ];
 
+const CONTEXT_TIERS: Array<{ id: ContextTier; label: string; hint: string }> = [
+  { id: "eco", label: "节省", hint: "更小上下文与预算，token 成本最低" },
+  { id: "standard", label: "标准", hint: "默认档位，上下文与成本均衡" },
+  { id: "max", label: "最强", hint: "最大上下文与预算，效果最好，token 成本最高" },
+];
+
 /** Agent 档位（修订模式）与推理强度。自定义服务的推理 opt-in 在模型页高级设置里。 */
 export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
   const [harnesses, setHarnesses] = useState<HarnessSummary[]>([]);
@@ -30,6 +44,12 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
   const [savedHarnessId, setSavedHarnessId] = useState("");
   const [reasoningMode, setReasoningMode] = useState<ReasoningMode>("auto");
   const [savedReasoningMode, setSavedReasoningMode] = useState<ReasoningMode>("auto");
+  const [contextTier, setContextTier] = useState<ContextTier>("standard");
+  const [savedContextTier, setSavedContextTier] = useState<ContextTier>("standard");
+  const [compactionAuto, setCompactionAuto] = useState(true);
+  const [savedCompactionAuto, setSavedCompactionAuto] = useState(true);
+  const [timeoutInput, setTimeoutInput] = useState("");
+  const [savedTimeoutInput, setSavedTimeoutInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -52,6 +72,15 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
         setSavedHarnessId(currentHarness);
         setReasoningMode(currentReasoning);
         setSavedReasoningMode(currentReasoning);
+        const currentTier = settings.contextTier ?? "standard";
+        setContextTier(currentTier);
+        setSavedContextTier(currentTier);
+        const currentCompactionAuto = settings.compactionAuto !== false;
+        setCompactionAuto(currentCompactionAuto);
+        setSavedCompactionAuto(currentCompactionAuto);
+        const currentTimeout = agentTimeoutMsToSeconds(settings.agentTimeoutMs);
+        setTimeoutInput(currentTimeout);
+        setSavedTimeoutInput(currentTimeout);
       })
       .catch((reason) => {
         if (active) setError(reason instanceof Error ? reason.message : String(reason));
@@ -71,11 +100,23 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
   if (!open) return null;
 
   const busy = loading || saving;
-  const dirty = harnessId !== savedHarnessId || reasoningMode !== savedReasoningMode;
+  const dirty =
+    harnessId !== savedHarnessId ||
+    reasoningMode !== savedReasoningMode ||
+    contextTier !== savedContextTier ||
+    compactionAuto !== savedCompactionAuto ||
+    timeoutInput !== savedTimeoutInput;
   const harnessDefaultTitle = harnesses.find((h) => h.id === harnessDefaultId)?.title ?? "";
 
   const save = async () => {
     if (!dirty) return;
+    const agentTimeoutMs = agentTimeoutSecondsToMs(timeoutInput);
+    if (agentTimeoutMs === undefined) {
+      setError(
+        `请求超时需为 ${AGENT_TIMEOUT_MIN_SECONDS}–${AGENT_TIMEOUT_MAX_SECONDS} 的整数秒，或留空使用默认值。`,
+      );
+      return;
+    }
     setSaving(true);
     setError(null);
     setNotice(null);
@@ -83,10 +124,16 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
       const settings = await saveLlmSettings({
         harnessId: harnessId || null,
         reasoningMode,
+        agentTimeoutMs,
+        contextTier,
+        compactionAuto,
       });
       onSaved?.(settings);
       setSavedHarnessId(harnessId);
       setSavedReasoningMode(reasoningMode);
+      setSavedContextTier(contextTier);
+      setSavedCompactionAuto(compactionAuto);
+      setSavedTimeoutInput(timeoutInput);
       setNotice("已保存 Agent 设置。");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -142,6 +189,64 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
           自动以外的档位仅对兼容模型生效；自定义服务需在模型页高级设置中明确启用推理控制。
         </small>
       </div>
+
+      <div className="settings-field" role="radiogroup" aria-label="上下文档位">
+        <span>上下文档位</span>
+        <div className="reasoning-mode-list">
+          {CONTEXT_TIERS.map((tier) => (
+            <label key={tier.id} className="reasoning-mode">
+              <input
+                type="radio"
+                name="context-tier"
+                role="radio"
+                aria-checked={contextTier === tier.id}
+                checked={contextTier === tier.id}
+                disabled={busy}
+                onChange={() => setContextTier(tier.id)}
+              />
+              <strong>{tier.label}</strong>
+              <small>{tier.hint}</small>
+            </label>
+          ))}
+        </div>
+        <small className="settings-field-note">
+          决定选区内联长度、大纲规模与上下文预算；档位越高，单次请求消耗的 token 越多。
+        </small>
+      </div>
+
+      <div className="settings-field">
+        <span>自动压缩上下文</span>
+        <label className="settings-field-inline">
+          <input
+            type="checkbox"
+            checked={compactionAuto}
+            disabled={busy}
+            onChange={(event) => setCompactionAuto(event.target.checked)}
+            aria-label="自动压缩上下文"
+          />
+          <span>接近上下文上限时自动摘要旧对话</span>
+        </label>
+        <small className="settings-field-note">
+          压缩前记录会完整存档；关闭后超长对话将退化为直接截断。节省（eco）档位始终不启用摘要。
+        </small>
+      </div>
+
+      <label className="settings-field">
+        <span>请求超时（秒）</span>        <input
+          type="number"
+          min={AGENT_TIMEOUT_MIN_SECONDS}
+          max={AGENT_TIMEOUT_MAX_SECONDS}
+          step={1}
+          value={timeoutInput}
+          disabled={busy}
+          placeholder={String(AGENT_TIMEOUT_DEFAULT_SECONDS)}
+          onChange={(event) => setTimeoutInput(event.target.value)}
+          aria-label="请求超时"
+        />
+        <small className="settings-field-note">
+          单次 Agent 请求的最长等待（{AGENT_TIMEOUT_MIN_SECONDS}–{AGENT_TIMEOUT_MAX_SECONDS} 秒）；留空使用默认 {AGENT_TIMEOUT_DEFAULT_SECONDS} 秒
+        </small>
+      </label>
 
       {notice ? <p className="settings-msg ok" role="status">{notice}</p> : null}
       {error ? <p className="settings-msg err" role="alert">{error}</p> : null}

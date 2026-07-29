@@ -26,3 +26,27 @@ describe("waitRun", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("compactSession", () => {
+  it("posts to /api/v1/sessions/compact and returns token counts", async () => {
+    vi.stubGlobal("location", { href: "http://127.0.0.1/#token=test-token" });
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => undefined,
+    });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      statusText: "",
+      json: async () => ({ tokensBefore: 90_000, tokensAfter: 20_000, summary: "摘要" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { compactSession } = await import("./api");
+
+    const result = await compactSession();
+    expect(result).toEqual({ tokensBefore: 90_000, tokensAfter: 20_000, summary: "摘要" });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v1/sessions/compact");
+    expect(init.method).toBe("POST");
+  });
+});

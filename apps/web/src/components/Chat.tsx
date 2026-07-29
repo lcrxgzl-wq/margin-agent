@@ -31,7 +31,7 @@ import { submitEnterFrom } from "../ime";
 
 export type ChatMessage = {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   text: string;
   task?: AgentTask;
   threadId?: string;
@@ -407,7 +407,7 @@ export function Chat({
                 key={m.id}
                 className={`turn ${m.role}`}
               >
-                <div className="turn-meta">{m.role === "user" ? "你" : "Margin"}</div>
+                <div className="turn-meta">{m.role === "user" ? "你" : m.role === "system" ? "系统" : "Margin"}</div>
                 <div className={`bubble ${m.role}`}>
                   {m.role === "assistant" && hasMarkdown(m.text) ? <Markdown text={m.text} /> : m.text}
                 </div>

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Plus, Trash2, X } from "lucide-react";
+import { Plus, Shrink, Trash2, X } from "lucide-react";
 import {
   clearCurrentSession,
+  compactSession,
   deleteSession,
   getSession,
   listSessions,
@@ -31,9 +32,10 @@ export function SessionMenu({ open, busy, documentDirty = false, onClose, onAppl
   const panelRef = useRef<HTMLDivElement>(null);
   const [sessions, setSessions] = useState<AgentSessionSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  /** Action in flight: "new" | "clear" | sessionId | `del:${sessionId}`. */
+  /** Action in flight: "new" | "clear" | "compact" | sessionId | `del:${sessionId}`. */
   const [pending, setPending] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [compactResult, setCompactResult] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -49,6 +51,7 @@ export function SessionMenu({ open, busy, documentDirty = false, onClose, onAppl
     if (!open) return;
     setConfirmClear(false);
     setError(null);
+    setCompactResult(null);
     setSessions(null);
     void refresh();
   }, [open, refresh]);
@@ -110,6 +113,16 @@ export function SessionMenu({ open, busy, documentDirty = false, onClose, onAppl
       await applyAndClose(await getSession());
     });
 
+  const handleCompact = () =>
+    void run("compact", async () => {
+      const result = await compactSession();
+      // The server appended a system chat turn; hydrate so it shows at once.
+      await onApplySnapshot(await getSession());
+      setCompactResult(
+        `已压缩：约 ${result.tokensBefore} → ${result.tokensAfter} tokens，压缩前记录已存档`,
+      );
+    });
+
   const locked = Boolean(busy || pending);
 
   return (
@@ -147,6 +160,21 @@ export function SessionMenu({ open, busy, documentDirty = false, onClose, onAppl
           >
             <Plus size={15} aria-hidden /> 新会话
           </button>
+
+          <button
+            type="button"
+            className="btn ghost session-compact-btn"
+            disabled={locked}
+            title="把当前对话压缩为摘要，释放上下文预算；压缩前记录会存档"
+            onClick={handleCompact}
+          >
+            <Shrink size={15} aria-hidden />
+            {pending === "compact" ? "正在压缩…" : "压缩上下文"}
+          </button>
+
+          {compactResult ? (
+            <p className="settings-msg ok" role="status">{compactResult}</p>
+          ) : null}
 
           <section className="session-history" aria-label="历史会话">
             <h3>历史会话</h3>
