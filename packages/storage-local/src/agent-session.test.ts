@@ -446,3 +446,24 @@ describe("agent session history", () => {
     }
   });
 });
+
+describe("chat turn system role", () => {
+  it("persists system chat turns through save/load", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-system-"));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, "a.md"), "# hi\n", "utf8");
+    const ws = await openWorkspace(root);
+    saveAgentSession(ws, {
+      sessionId: "sess-sys",
+      messages: [],
+      chatTurns: [
+        { role: "user", text: "问题" },
+        { role: "system", text: "上下文已压缩：约 90000 → 20000 tokens（压缩前记录已存档）" },
+        { role: "assistant", text: "回答" },
+      ],
+      sourcePaths: [],
+    });
+    const loaded = loadAgentSession(ws);
+    expect(loaded?.chatTurns.map((turn) => turn.role)).toEqual(["user", "system", "assistant"]);
+  });
+});

@@ -47,6 +47,23 @@ export { AnalysisRunStore } from "./data/store.js";
 export { buildOutline, searchBlocks } from "./outline.js";
 export { toolPhaseLabel, isUserFacingPhase } from "./progress.js";
 export { runPiAgentLoop } from "./pi-loop.js";
+export {
+  COMPACTION_SUMMARY_PREFIX,
+  createPiSummarizer,
+  findLastContextTokens,
+  findSafeCutIndex,
+  keepRecentTokensForTier,
+  orchestrateCompaction,
+  pruneToolOutputs,
+  PRUNED_TOOL_OUTPUT_PLACEHOLDER,
+} from "./compaction.js";
+export type {
+  CompactionEvent,
+  CompactionOutcome,
+  CompactionReason,
+  ContextTierName,
+  SummarizerFn,
+} from "./compaction.js";
 export { PiLoopFailure } from "./pi-outcome.js";
 export type {
   PiLoopOptions,

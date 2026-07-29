@@ -336,6 +336,141 @@ describe("reasoning settings", () => {
     expect(readLlmSettingsStore(root).reasoningMode).toBeUndefined();
     expect(publicLlmSettings(readLlmSettingsStore(root)).reasoningMode).toBe("auto");
   });
+
+  it("persists an explicit agent timeout and clears it with null", async () => {
+    expect(readLlmSettingsStore(root).agentTimeoutMs).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).agentTimeoutMs).toBeUndefined();
+
+    await saveLlmSettings(root, { agentTimeoutMs: 180_000 });
+    expect(readLlmSettingsStore(root).agentTimeoutMs).toBe(180_000);
+    expect(publicLlmSettings(readLlmSettingsStore(root)).agentTimeoutMs).toBe(180_000);
+
+    await saveLlmSettings(root, { agentTimeoutMs: null });
+    expect(readLlmSettingsStore(root).agentTimeoutMs).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).agentTimeoutMs).toBeUndefined();
+  });
+
+  it("rejects invalid agent timeouts at save", async () => {
+    await expect(saveLlmSettings(root, { agentTimeoutMs: 999 })).rejects.toThrow(
+      /agentTimeoutMs|超时/,
+    );
+    await expect(saveLlmSettings(root, { agentTimeoutMs: 600_001 })).rejects.toThrow(
+      /agentTimeoutMs|超时/,
+    );
+    await expect(saveLlmSettings(root, { agentTimeoutMs: 120_000.5 })).rejects.toThrow(
+      /agentTimeoutMs|超时/,
+    );
+    expect(readLlmSettingsStore(root).agentTimeoutMs).toBeUndefined();
+  });
+
+  it("ignores invalid persisted agent timeouts", () => {
+    fs.writeFileSync(
+      path.join(root, ".margin", "llm-settings.json"),
+      JSON.stringify({
+        activeId: "custom",
+        agentTimeoutMs: 5,
+        providers: [{
+          id: "custom",
+          name: "Custom",
+          apiFormat: "openai",
+          authStyle: "bearer",
+          baseURL: "https://provider.test/v1",
+          model: "model-a",
+        }],
+      }),
+      "utf8",
+    );
+    expect(readLlmSettingsStore(root).agentTimeoutMs).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).agentTimeoutMs).toBeUndefined();
+  });
+
+  it("persists an explicit context tier and clears it with null", async () => {
+    expect(readLlmSettingsStore(root).contextTier).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).contextTier).toBeUndefined();
+
+    await saveLlmSettings(root, { contextTier: "max" });
+    expect(readLlmSettingsStore(root).contextTier).toBe("max");
+    expect(publicLlmSettings(readLlmSettingsStore(root)).contextTier).toBe("max");
+
+    await saveLlmSettings(root, { contextTier: "eco" });
+    expect(readLlmSettingsStore(root).contextTier).toBe("eco");
+
+    await saveLlmSettings(root, { contextTier: null });
+    expect(readLlmSettingsStore(root).contextTier).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).contextTier).toBeUndefined();
+  });
+
+  it("rejects invalid context tiers at save", async () => {
+    await expect(
+      saveLlmSettings(root, { contextTier: "ludicrous" as never }),
+    ).rejects.toThrow(/contextTier/);
+    expect(readLlmSettingsStore(root).contextTier).toBeUndefined();
+  });
+
+  it("ignores invalid persisted context tiers", () => {
+    fs.writeFileSync(
+      path.join(root, ".margin", "llm-settings.json"),
+      JSON.stringify({
+        activeId: "custom",
+        contextTier: "ludicrous",
+        providers: [{
+          id: "custom",
+          name: "Custom",
+          apiFormat: "openai",
+          authStyle: "bearer",
+          baseURL: "https://provider.test/v1",
+          model: "model-a",
+        }],
+      }),
+      "utf8",
+    );
+    expect(readLlmSettingsStore(root).contextTier).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).contextTier).toBeUndefined();
+  });
+
+  it("persists an explicit compactionAuto=false and clears it with null", async () => {
+    expect(readLlmSettingsStore(root).compactionAuto).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).compactionAuto).toBeUndefined();
+
+    await saveLlmSettings(root, { compactionAuto: false });
+    expect(readLlmSettingsStore(root).compactionAuto).toBe(false);
+    expect(publicLlmSettings(readLlmSettingsStore(root)).compactionAuto).toBe(false);
+
+    await saveLlmSettings(root, { compactionAuto: true });
+    expect(readLlmSettingsStore(root).compactionAuto).toBe(true);
+
+    await saveLlmSettings(root, { compactionAuto: null });
+    expect(readLlmSettingsStore(root).compactionAuto).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).compactionAuto).toBeUndefined();
+  });
+
+  it("rejects invalid compactionAuto values at save", async () => {
+    await expect(
+      saveLlmSettings(root, { compactionAuto: "yes" as never }),
+    ).rejects.toThrow(/compactionAuto/);
+    expect(readLlmSettingsStore(root).compactionAuto).toBeUndefined();
+  });
+
+  it("ignores invalid persisted compactionAuto values", () => {
+    fs.writeFileSync(
+      path.join(root, ".margin", "llm-settings.json"),
+      JSON.stringify({
+        activeId: "custom",
+        compactionAuto: "yes",
+        providers: [{
+          id: "custom",
+          name: "Custom",
+          apiFormat: "openai",
+          authStyle: "bearer",
+          baseURL: "https://provider.test/v1",
+          model: "model-a",
+        }],
+      }),
+      "utf8",
+    );
+    expect(readLlmSettingsStore(root).compactionAuto).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).compactionAuto).toBeUndefined();
+  });
 });
 
 describe("cc-switch profiles", () => {

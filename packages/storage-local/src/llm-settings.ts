@@ -17,6 +17,28 @@ function normalizeReasoningMode(value: unknown): ReasoningMode | undefined {
     : undefined;
 }
 
+export const AGENT_TIMEOUT_MIN_MS = 1_000;
+export const AGENT_TIMEOUT_MAX_MS = 600_000;
+
+function normalizeAgentTimeoutMs(value: unknown): number | undefined {
+  return typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= AGENT_TIMEOUT_MIN_MS &&
+    value <= AGENT_TIMEOUT_MAX_MS
+    ? value
+    : undefined;
+}
+
+export type ContextTier = "eco" | "standard" | "max";
+
+function normalizeContextTier(value: unknown): ContextTier | undefined {
+  return value === "eco" || value === "standard" || value === "max" ? value : undefined;
+}
+
+function normalizeCompactionAuto(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
 export type LlmProviderProfile = {
   id: string;
   name: string;
@@ -39,6 +61,12 @@ export type LlmSettingsStore = {
   harnessId?: string;
   /** Product-level reasoning mode; default auto omits provider reasoning controls. */
   reasoningMode?: ReasoningMode;
+  /** User-configured pi session timeout (ms); undefined falls back to env/profile. */
+  agentTimeoutMs?: number;
+  /** Context budget tier; undefined falls back to the standard preset. */
+  contextTier?: ContextTier;
+  /** Automatic context compaction; undefined falls back to true (on). */
+  compactionAuto?: boolean;
 };
 
 /** @deprecated flat shape — migrated on read */
@@ -66,6 +94,12 @@ export type LlmSettingsPublic = {
   llmMode: "mock" | "byok";
   harnessId?: string;
   reasoningMode: ReasoningMode;
+  /** Present only when the user configured an explicit pi session timeout. */
+  agentTimeoutMs?: number;
+  /** Present only when the user configured an explicit context tier. */
+  contextTier?: ContextTier;
+  /** Present only when the user toggled automatic context compaction. */
+  compactionAuto?: boolean;
   ccSwitch?: {
     detected: boolean;
     proxyBaseURL?: string;
@@ -270,7 +304,10 @@ export function readLlmSettingsStore(root: string): LlmSettingsStore {
         ? raw.harnessId.trim()
         : undefined;
     const reasoningMode = normalizeReasoningMode(raw.reasoningMode);
-    return { activeId, providers, harnessId, reasoningMode };
+    const agentTimeoutMs = normalizeAgentTimeoutMs(raw.agentTimeoutMs);
+    const contextTier = normalizeContextTier(raw.contextTier);
+    const compactionAuto = normalizeCompactionAuto(raw.compactionAuto);
+    return { activeId, providers, harnessId, reasoningMode, agentTimeoutMs, contextTier, compactionAuto };
   } catch {
     return defaultStore();
   }
@@ -385,6 +422,9 @@ export function publicLlmSettings(
     llmMode: keySet ? "byok" : "mock",
     harnessId: store.harnessId,
     reasoningMode: store.reasoningMode ?? "auto",
+    agentTimeoutMs: store.agentTimeoutMs,
+    contextTier: store.contextTier,
+    compactionAuto: store.compactionAuto,
     ccSwitch,
   };
 }
@@ -399,6 +439,12 @@ export type SaveLlmSettingsInput = {
   harnessId?: string | null;
   /** Set the product reasoning mode; null/unknown resets to auto. */
   reasoningMode?: ReasoningMode | null;
+  /** Set the pi session timeout in ms (1000-600000); null clears back to default. */
+  agentTimeoutMs?: number | null;
+  /** Set the context tier (eco/standard/max); null clears back to the default. */
+  contextTier?: ContextTier | null;
+  /** Set automatic context compaction; null clears back to the default (on). */
+  compactionAuto?: boolean | null;
 };
 
 export async function writeLlmSettingsStore(
@@ -411,6 +457,9 @@ export async function writeLlmSettingsStore(
     activeId: store.activeId,
     harnessId: store.harnessId,
     reasoningMode: store.reasoningMode,
+    agentTimeoutMs: store.agentTimeoutMs,
+    contextTier: store.contextTier,
+    compactionAuto: store.compactionAuto,
     providers: store.providers.map((p, i) => {
       validateProviderBaseURL(p.baseURL || "");
       return normalizeProfile(p, i);
@@ -506,6 +555,42 @@ export async function saveLlmSettings(
 
   if (input.reasoningMode !== undefined) {
     store = { ...store, reasoningMode: normalizeReasoningMode(input.reasoningMode) };
+  }
+
+  if (input.agentTimeoutMs !== undefined) {
+    if (input.agentTimeoutMs === null) {
+      store = { ...store, agentTimeoutMs: undefined };
+    } else {
+      const agentTimeoutMs = normalizeAgentTimeoutMs(input.agentTimeoutMs);
+      if (agentTimeoutMs === undefined) {
+        throw new Error("agentTimeoutMs 必须是 1000–600000 之间的整数毫秒");
+      }
+      store = { ...store, agentTimeoutMs };
+    }
+  }
+
+  if (input.contextTier !== undefined) {
+    if (input.contextTier === null) {
+      store = { ...store, contextTier: undefined };
+    } else {
+      const contextTier = normalizeContextTier(input.contextTier);
+      if (contextTier === undefined) {
+        throw new Error("contextTier 必须是 eco / standard / max");
+      }
+      store = { ...store, contextTier };
+    }
+  }
+
+  if (input.compactionAuto !== undefined) {
+    if (input.compactionAuto === null) {
+      store = { ...store, compactionAuto: undefined };
+    } else {
+      const compactionAuto = normalizeCompactionAuto(input.compactionAuto);
+      if (compactionAuto === undefined) {
+        throw new Error("compactionAuto 必须是布尔值");
+      }
+      store = { ...store, compactionAuto };
+    }
   }
 
   return writeLlmSettingsStore(root, store);

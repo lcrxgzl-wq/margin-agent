@@ -2,8 +2,14 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
   PiLoopFailure,
-  runSessionTurn,
+  getHarness,
+  hasRuntimeCredentials,
   nextClarificationRound,
+  orchestrateCompaction,
+  resolveRuntimeModel,
+  runSessionTurn,
+  type CompactionEvent,
+  type SummarizerFn,
   type AgentMessage,
   type SessionDocBag,
   type SessionTurnResult,
@@ -14,14 +20,17 @@ import {
 } from "@margin/agent";
 import type { BlockSnapshot, DocumentMeta } from "@margin/domain";
 import {
+  archiveAgentSession,
   activeProfile,
   assertNotRegisteredDocumentWrite,
   getDocument,
   importExternalDocxDocument,
+  latestAgentCompactionSummary,
   listBlocks,
   listWorkspaceSourceFiles,
   listRegisteredDocumentPaths,
   loadAgentSession,
+  loadAgentSessionEnvelope,
   openDocument,
   readWorkspaceSource,
   readLlmSettingsStore,
@@ -29,6 +38,7 @@ import {
   disabledSkillNames,
   readNativeDocxTableCell,
   replaceDocumentComments,
+  saveAgentCompaction,
   saveAgentSession,
   saveProposal,
   saveAgentTranscript,
@@ -45,6 +55,7 @@ import {
   isDocumentOpenStatusMessage,
   parseExplicitLocalDocxPath,
 } from "./local-document-intent.js";
+import { buildDomainSnapshot, buildProposalHint, buildSessionSummaryNote } from "./conversation-notes.js";
 
 const MAX_SOURCE_PATHS = 50;
 
@@ -120,7 +131,7 @@ export function restoreChatAgentState(workspace: Workspace): ChatAgentState {
 
 /** Short chat turns for UI hydrate (may be empty on legacy sessions). */
 export function loadPersistedChatTurns(workspace: Workspace): Array<{
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   text: string;
   threadId?: string;
 }> {
@@ -274,6 +285,191 @@ export function clearChatAgentConversation(state: ChatAgentState): void {
   state.task = undefined;
 }
 
+/** Append a rule-based "[Margin 记录]" user-role note to the pi transcript (model-visible memory). */
+export function appendConversationNote(state: ChatAgentState, note: string): void {
+  const text = note.trim();
+  if (!text) return;
+  state.agentMessages.push({
+    role: "user" as const,
+    content: text,
+    timestamp: Date.now(),
+  } as AgentMessage);
+}
+
+/**
+ * New-session flow: archive the current transcript, reset conversation state,
+ * then seed a deterministic summary note so the next session inherits context.
+ */
+export function rotateChatSessionWithSummary(
+  workspace: Workspace,
+  state: ChatAgentState,
+  hasChatTurns: boolean,
+): void {
+  const previousSessionId = state.sessionId;
+  const hasContent =
+    state.agentMessages.length > 0 || hasChatTurns || Boolean(state.task);
+  const archived = hasContent
+    ? archiveAgentSession(workspace, previousSessionId)
+    : false;
+  clearChatAgentConversation(state);
+  if (!archived) return;
+  const envelope = loadAgentSessionEnvelope(workspace, previousSessionId);
+  const note = envelope
+    ? buildSessionSummaryNote(workspace, envelope)
+    : undefined;
+  if (note) appendConversationNote(state, note);
+}
+
+const compactionConversationNote = (event: CompactionEvent): string =>
+  `[Margin 记录] 上下文已压缩：约 ${event.tokensBefore} → ${event.tokensAfter} tokens，压缩前记录已存档`;
+
+const compactionChatTurnText = (event: CompactionEvent): string =>
+  `上下文已压缩：约 ${event.tokensBefore} → ${event.tokensAfter} tokens（压缩前记录已存档）`;
+
+const compactionSwapWarning = (event: CompactionEvent): string =>
+  `[Margin 警告] 压缩换血校验未通过（eventId: ${event.eventId}）：压缩前记录已存档，但转录未替换，请以存档为准`;
+
+/** role + content equality, tolerant of array-vs-string content blocks. */
+function sameMessageIdentity(
+  left: AgentMessage | undefined,
+  right: AgentMessage | undefined,
+): boolean {
+  if (!left || !right) return false;
+  const a = left as { role?: unknown; content?: unknown };
+  const b = right as { role?: unknown; content?: unknown };
+  return a.role === b.role && JSON.stringify(a.content) === JSON.stringify(b.content);
+}
+
+/**
+ * Settle one compaction event on the host side: archive the compaction-time
+ * snapshot (messagesBefore — not the possibly-grown current transcript),
+ * swap the live transcript's messagesBefore prefix for messagesAfter, then
+ * leave a model-visible note and a UI-visible system chat turn.
+ * Idempotent per eventId: a repeated settle is a no-op.
+ *
+ * Swap safety: pi only appends messages, so the compaction-time view must be
+ * a prefix of the turn-end transcript (verified by length + last-message
+ * identity). The overflow path is detected by the messagesAfter head already
+ * sitting at the transcript head. When neither holds, the archive is kept
+ * but the transcript is left untouched (宁缺毋错) with a warning note.
+ */
+export function settleCompactionEvent(
+  workspace: Workspace,
+  state: ChatAgentState,
+  chat: ChatMemory,
+  event: CompactionEvent,
+): boolean {
+  const archived = saveAgentCompaction(workspace, {
+    sessionId: state.sessionId,
+    eventId: event.eventId,
+    reason: event.reason,
+    tokensBefore: event.tokensBefore,
+    tokensAfter: event.tokensAfter,
+    summary: event.summary,
+    previousSummary: latestAgentCompactionSummary(workspace, state.sessionId),
+    messages: event.messagesBefore,
+  });
+  if (archived.duplicate) return false;
+  const current = state.agentMessages;
+  // Overflow path: pi-loop already wrote the compacted transcript back.
+  const alreadyApplied = sameMessageIdentity(current[0], event.messagesAfter[0]);
+  if (!alreadyApplied) {
+    const prefixIntact =
+      event.messagesBefore.length > 0 &&
+      current.length >= event.messagesBefore.length &&
+      sameMessageIdentity(
+        current[event.messagesBefore.length - 1],
+        event.messagesBefore[event.messagesBefore.length - 1],
+      );
+    if (!prefixIntact) {
+      const warning = compactionSwapWarning(event);
+      appendConversationNote(state, warning);
+      chat.remember("system", warning);
+      return true;
+    }
+    state.agentMessages = [
+      ...event.messagesAfter,
+      ...current.slice(event.messagesBefore.length),
+    ];
+  }
+  appendConversationNote(state, compactionConversationNote(event));
+  chat.remember("system", compactionChatTurnText(event));
+  return true;
+}
+
+/** Manual compaction failures map to 409 at the route layer. */
+export class ManualCompactionError extends Error {}
+
+/**
+ * POST /sessions/compact core: force a fresh summarization of the current
+ * transcript (reason "manual"), then settle through the same path as
+ * automatic compactions and persist the session envelope.
+ */
+export async function compactChatAgentConversation(opts: {
+  workspace: Workspace;
+  agentState: ChatAgentState;
+  chat: ChatMemory;
+  harnessId?: string;
+  /** Test seam; defaults to pi generateSummary via the active model. */
+  summarizer?: SummarizerFn;
+  signal?: AbortSignal;
+}): Promise<{ tokensBefore: number; tokensAfter: number; summary: string }> {
+  const { workspace, agentState, chat } = opts;
+  if (!agentState.agentMessages.length) {
+    throw new ManualCompactionError("当前会话没有可压缩的内容");
+  }
+  const settings = readLlmSettingsStore(workspace.root);
+  const tier = settings.contextTier ?? "standard";
+  if (tier === "eco") {
+    throw new ManualCompactionError("当前为节省（eco）档位，不启用 LLM 摘要压缩；请在设置中切换上下文档位");
+  }
+  if (!hasRuntimeCredentials()) {
+    throw new ManualCompactionError("需要先在设置中配置模型 API Key，才能压缩上下文");
+  }
+  const profile = getHarness(opts.harnessId);
+  const runtime = resolveRuntimeModel(profile.model);
+  const outcome = await orchestrateCompaction({
+    messages: agentState.agentMessages,
+    model: runtime.model as never,
+    contextWindow: runtime.model.contextWindow,
+    tier,
+    force: true,
+    summarizer: opts.summarizer,
+    previousSummary: latestAgentCompactionSummary(workspace, agentState.sessionId),
+    domainSnapshot: agentState.bag.documentId
+      ? buildDomainSnapshot(workspace, agentState.bag.documentId) || undefined
+      : undefined,
+    signal: opts.signal,
+  });
+  if (outcome.kind !== "compacted") {
+    const detail = outcome.kind === "failed" ? outcome.error : outcome.reason;
+    throw new ManualCompactionError(`上下文压缩未执行：${detail}`);
+  }
+  settleCompactionEvent(workspace, agentState, chat, {
+    eventId: outcome.eventId,
+    reason: "manual",
+    tokensBefore: outcome.tokensBefore,
+    tokensAfter: outcome.tokensAfter,
+    summary: outcome.summary,
+    messagesBefore: agentState.agentMessages,
+    messagesAfter: outcome.messages,
+  });
+  saveAgentSession(workspace, {
+    sessionId: agentState.sessionId,
+    documentId: agentState.bag.documentId,
+    messages: agentState.agentMessages,
+    clarificationRounds: agentState.clarificationRounds,
+    chatTurns: chat.list(),
+    sourcePaths: agentState.sourcePaths,
+    task: agentState.task,
+  });
+  return {
+    tokensBefore: outcome.tokensBefore,
+    tokensAfter: outcome.tokensAfter,
+    summary: outcome.summary,
+  };
+}
+
 /** Detach the active document and all document-scoped Agent context. */
 export function closeChatAgentDocument(state: ChatAgentState): void {
   state.sessionId = randomUUID();
@@ -365,10 +561,15 @@ export async function runChatAgentTurn(opts: {
     task: agentState.task,
   });
   const clarificationRound = agentState.clarificationRounds ?? 0;
+  const proposalHint = agentState.bag.documentId
+    ? buildProposalHint(workspace, agentState.bag.documentId)
+    : "";
   const localDocxPath = parseExplicitLocalDocxPath(message);
   const verifyDocumentOpen =
     !agentState.bag.documentId && isDocumentOpenStatusMessage(message);
 
+  const llmSettings = readLlmSettingsStore(workspace.root);
+  const compactionEvents: CompactionEvent[] = [];
   let turn: SessionTurnResult;
   try {
     turn = localDocxPath
@@ -394,10 +595,21 @@ export async function runChatAgentTurn(opts: {
         };
         })()
       : await runSessionTurn({
-        reasoningMode: readLlmSettingsStore(workspace.root).reasoningMode,
-        reasoningOptIn: activeProfile(readLlmSettingsStore(workspace.root)).reasoningOptIn,
+        reasoningMode: llmSettings.reasoningMode,
+        timeoutMs: llmSettings.agentTimeoutMs,
+        contextTier: llmSettings.contextTier,
+        reasoningOptIn: activeProfile(llmSettings).reasoningOptIn,
+        compactionAuto: llmSettings.compactionAuto !== false,
+        previousSummary: latestAgentCompactionSummary(workspace, agentState.sessionId),
+        domainSnapshot: agentState.bag.documentId
+          ? buildDomainSnapshot(workspace, agentState.bag.documentId) || undefined
+          : undefined,
+        onCompaction: (event) => {
+          compactionEvents.push(event);
+        },
         message,
         workspaceWriteApprovalMessage: requestedMessage,
+        proposalHint: proposalHint || undefined,
         messages: agentState.agentMessages,
         bag: agentState.bag,
         bridge: createWorkspaceBridge(workspace),
@@ -475,6 +687,9 @@ export async function runChatAgentTurn(opts: {
   }
 
   agentState.agentMessages = turn.messages;
+  for (const event of compactionEvents) {
+    settleCompactionEvent(workspace, agentState, chat, event);
+  }
   if (turn.opened) {
     const switched = syncBagFromDocument(
       agentState,
@@ -563,7 +778,7 @@ export async function runChatAgentTurn(opts: {
   saveAgentSession(workspace, {
     sessionId: agentState.sessionId,
     documentId: agentState.bag.documentId,
-    messages: turn.messages,
+    messages: agentState.agentMessages,
     clarificationRounds: agentState.clarificationRounds,
     chatTurns: chat.list(),
     sourcePaths: agentState.sourcePaths,

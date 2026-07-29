@@ -3,41 +3,56 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mockAgent = vi.hoisted(() => ({
   abortCalls: 0,
   promptCalls: 0,
+  continueCalls: 0,
+  continueHook: undefined as ((instance: { state: { messages: unknown[]; errorMessage?: string } }) => void) | undefined,
+  instance: undefined as { state: { messages: unknown[]; errorMessage?: string } } | undefined,
   resolvePrompt: undefined as (() => void) | undefined,
   rejectPrompt: undefined as ((error: Error) => void) | undefined,
   options: undefined as Record<string, unknown> | undefined,
   subscriber: undefined as ((event: Record<string, unknown>) => void) | undefined,
 }));
 
-vi.mock("@earendil-works/pi-agent-core", () => ({
-  Agent: class {
-    state = { messages: [], errorMessage: undefined };
+vi.mock("@earendil-works/pi-agent-core", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    Agent: class {
+      state = { messages: [] as unknown[], errorMessage: undefined as string | undefined };
 
-    constructor(options: Record<string, unknown>) {
-      mockAgent.options = options;
-      const initial = options.initialState as { messages?: unknown[] } | undefined;
-      this.state.messages = (initial?.messages ?? []) as never[];
-    }
+      constructor(options: Record<string, unknown>) {
+        mockAgent.options = options;
+        mockAgent.instance = this;
+        const initial = options.initialState as { messages?: unknown[] } | undefined;
+        this.state.messages = (initial?.messages ?? []) as never[];
+      }
 
-    subscribe(listener: (event: Record<string, unknown>) => void) {
-      mockAgent.subscriber = listener;
-      return () => undefined;
-    }
+      subscribe(listener: (event: Record<string, unknown>) => void) {
+        mockAgent.subscriber = listener;
+        return () => undefined;
+      }
 
-    prompt() {
-      mockAgent.promptCalls += 1;
-      return new Promise<void>((resolve, reject) => {
-        mockAgent.resolvePrompt = resolve;
-        mockAgent.rejectPrompt = reject;
-      });
-    }
+      prompt() {
+        mockAgent.promptCalls += 1;
+        return new Promise<void>((resolve, reject) => {
+          mockAgent.resolvePrompt = resolve;
+          mockAgent.rejectPrompt = reject;
+        });
+      }
 
-    abort() {
-      mockAgent.abortCalls += 1;
-      mockAgent.rejectPrompt?.(new Error("agent aborted"));
-    }
-  },
-}));
+      continue() {
+        mockAgent.continueCalls += 1;
+        this.state.errorMessage = undefined;
+        mockAgent.continueHook?.(this);
+        return Promise.resolve();
+      }
+
+      abort() {
+        mockAgent.abortCalls += 1;
+        mockAgent.rejectPrompt?.(new Error("agent aborted"));
+      }
+    },
+  };
+});
 
 const mockCompat = vi.hoisted(() => ({
   streamSimpleCalls: [] as Array<{ options?: Record<string, unknown> }>,
@@ -48,6 +63,9 @@ vi.mock("@earendil-works/pi-ai/compat", () => ({
     mockCompat.streamSimpleCalls.push({ options });
     return {};
   },
+  completeSimple: async () => {
+    throw new Error("completeSimple is not mocked in pi-loop tests");
+  },
 }));
 
 const { runPiAgentLoop, summarizeToolArguments, trimAgentMessages } = await import("./pi-loop.js");
@@ -56,6 +74,9 @@ const { configureRequestPolicy } = await import("@margin/llm");
 beforeEach(() => {
   mockAgent.abortCalls = 0;
   mockAgent.promptCalls = 0;
+  mockAgent.continueCalls = 0;
+  mockAgent.continueHook = undefined;
+  mockAgent.instance = undefined;
   mockAgent.resolvePrompt = undefined;
   mockAgent.rejectPrompt = undefined;
   mockAgent.options = undefined;
@@ -230,6 +251,46 @@ describe("Pi runtime boundaries", () => {
     expect((trimmed[0] as { role: string }).role).toBe("user");
     expect(JSON.stringify(trimmed)).toContain("tool output truncated");
     expect(JSON.stringify(trimmed).length).toBeLessThan(4_000);
+  });
+
+  it("defaults the final compaction rung to 32 chars", () => {
+    const messages = [{ role: "user", content: "x".repeat(2_000) }] as never[];
+
+    const trimmed = trimAgentMessages(messages, 10, 100);
+
+    const content = (trimmed[0] as { content: string }).content;
+    expect(content.startsWith("x".repeat(32))).toBe(true);
+    expect(content.length).toBe(32 + "...[message text truncated]".length);
+  });
+
+  it("keeps the final compaction rung at or above toolCompactionFloor", () => {
+    const messages = [{ role: "user", content: "x".repeat(2_000) }] as never[];
+
+    const floored = trimAgentMessages(messages, 10, 100, 1_000);
+
+    const content = (floored[0] as { content: string }).content;
+    expect(content.length).toBeGreaterThan(100);
+    expect(content.startsWith("x".repeat(128))).toBe(true);
+  });
+
+  it("threads toolCompactionFloor into Pi context trimming", async () => {
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      maxContextChars: 100,
+      toolCompactionFloor: 1_000,
+      timeoutMs: 10_000,
+    });
+    const options = mockAgent.options as {
+      transformContext: (messages: never[]) => Promise<never[]>;
+    };
+    const big = [{ role: "user", content: "x".repeat(2_000) }] as never[];
+    const trimmed = await options.transformContext(big);
+    expect((trimmed[0] as { content: string }).content.length).toBeGreaterThan(100);
+    mockAgent.resolvePrompt?.();
+    await running;
   });
 
   it("bounds one oversized current turn without dropping its user request", () => {
@@ -448,5 +509,309 @@ describe("Pi request policy", () => {
     await runToCompletion();
     expect(recorded).toEqual([]);
     configureRequestPolicy({ onUsage: undefined });
+  });
+});
+
+describe("Pi context compaction", () => {
+  const usageAssistant = (totalTokens: number, timestamp: number) => ({
+    role: "assistant",
+    content: [{ type: "text", text: "a" }],
+    usage: { totalTokens, input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+    stopReason: "stop",
+    timestamp,
+  });
+
+  const transformContextOf = () =>
+    (mockAgent.options as {
+      transformContext: (messages: never[]) => Promise<never[]>;
+    }).transformContext;
+
+  const overThresholdTranscript = () => [
+    { role: "user", content: "u1".padEnd(400, "1"), timestamp: 1 },
+    usageAssistant(90_000, 2),
+    { role: "user", content: "y".repeat(88_000), timestamp: 3 },
+  ];
+
+  it("summarizes over-threshold context inside transformContext", async () => {
+    const events: unknown[] = [];
+    let summarizeCalls = 0;
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      contextWindow: 100_000,
+      contextTier: "standard",
+      summarizer: async () => {
+        summarizeCalls += 1;
+        return "摘要文本";
+      },
+      onCompaction: (event: unknown) => events.push(event),
+      timeoutMs: 10_000,
+    } as never);
+
+    const transformed = await transformContextOf()(overThresholdTranscript() as never[]);
+
+    expect(summarizeCalls).toBe(1);
+    const first = transformed[0] as { role: string; content: string };
+    expect(first.role).toBe("user");
+    expect(first.content).toContain("此前对话已压缩为以下摘要：");
+    expect(first.content).toContain("摘要文本");
+    expect(events).toEqual([
+      expect.objectContaining({ reason: "threshold", summary: "摘要文本" }),
+    ]);
+    const event = events[0] as {
+      eventId: string;
+      tokensBefore: number;
+      tokensAfter: number;
+      messagesBefore: unknown[];
+      messagesAfter: unknown[];
+    };
+    expect(event.tokensBefore).toBeGreaterThan(event.tokensAfter);
+    // C1/C2: the event carries an idempotency key and both transcript snapshots.
+    expect(typeof event.eventId).toBe("string");
+    expect(event.eventId.length).toBeGreaterThan(0);
+    expect(event.messagesBefore).toEqual(overThresholdTranscript());
+    const afterHead = event.messagesAfter[0] as { role: string; content: string };
+    expect(afterHead.role).toBe("user");
+    expect(afterHead.content).toContain("摘要文本");
+    expect(event.messagesAfter.length).toBeLessThan(event.messagesBefore.length);
+
+    // Self-trigger guard: the stale usage no longer re-triggers compaction.
+    await transformContextOf()(overThresholdTranscript() as never[]);
+    expect(summarizeCalls).toBe(1);
+
+    mockAgent.resolvePrompt?.();
+    await running;
+  });
+
+  it("does not summarize when compactionAuto is false", async () => {
+    let summarizeCalls = 0;
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      contextWindow: 100_000,
+      contextTier: "standard",
+      compactionAuto: false,
+      summarizer: async () => {
+        summarizeCalls += 1;
+        return "x";
+      },
+      timeoutMs: 10_000,
+    } as never);
+
+    const transformed = await transformContextOf()(overThresholdTranscript() as never[]);
+
+    expect(summarizeCalls).toBe(0);
+    expect((transformed[0] as { role: string }).role).toBe("user");
+    expect((transformed[0] as { content: string }).content).toContain("u1");
+    mockAgent.resolvePrompt?.();
+    await running;
+  });
+
+  it("never summarizes on the eco tier (prune + ladder only)", async () => {
+    let summarizeCalls = 0;
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      contextWindow: 100_000,
+      contextTier: "eco",
+      summarizer: async () => {
+        summarizeCalls += 1;
+        return "x";
+      },
+      timeoutMs: 10_000,
+    } as never);
+
+    await transformContextOf()(overThresholdTranscript() as never[]);
+
+    expect(summarizeCalls).toBe(0);
+    mockAgent.resolvePrompt?.();
+    await running;
+  });
+
+  it("falls back to the trim ladder when the summarizer fails", async () => {
+    const events: unknown[] = [];
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      contextWindow: 100_000,
+      contextTier: "standard",
+      summarizer: async () => {
+        throw new Error("provider down");
+      },
+      onCompaction: (event: unknown) => events.push(event),
+      timeoutMs: 10_000,
+    } as never);
+
+    const transformed = await transformContextOf()(overThresholdTranscript() as never[]);
+
+    expect(events).toEqual([]);
+    expect((transformed[0] as { content: string }).content).toContain("u1");
+    mockAgent.resolvePrompt?.();
+    const result = await running;
+    expect(result.outcome).toBe("completed");
+    expect(result.notes.some((note) => note.includes("compaction failed"))).toBe(true);
+  });
+
+  const overflowAssistant = (timestamp: number) => ({
+    role: "assistant",
+    content: [{ type: "text", text: "" }],
+    stopReason: "error",
+    errorMessage: "prompt is too long: 213462 tokens > 200000 maximum",
+    usage: { totalTokens: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    timestamp,
+  });
+
+  it("drops the overflow error message, compacts, and retries once", async () => {
+    const events: unknown[] = [];
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      contextWindow: 200_000,
+      contextTier: "standard",
+      summarizer: async () => "溢出后摘要",
+      onCompaction: (event: unknown) => events.push(event),
+      timeoutMs: 10_000,
+    } as never);
+
+    const instance = mockAgent.instance!;
+    instance.state.messages = [
+      { role: "user", content: "u1".padEnd(400, "1"), timestamp: 1 },
+      { role: "assistant", content: [{ type: "text", text: "a1" }], stopReason: "stop", timestamp: 2 },
+      { role: "user", content: "latest", timestamp: 3 },
+      overflowAssistant(4),
+    ];
+    instance.state.errorMessage = "prompt is too long: 213462 tokens > 200000 maximum";
+    mockAgent.resolvePrompt?.();
+    const result = await running;
+
+    expect(mockAgent.continueCalls).toBe(1);
+    expect(result.outcome).toBe("completed");
+    expect(events).toEqual([
+      expect.objectContaining({ reason: "overflow", summary: "溢出后摘要" }),
+    ]);
+    const messages = instance.state.messages as Array<{ role: string; content: unknown; errorMessage?: string }>;
+    expect(messages.some((m) => m.errorMessage?.includes("too long"))).toBe(false);
+    expect(messages[0]!.role).toBe("user");
+    expect(String(messages[0]!.content)).toContain("溢出后摘要");
+    expect(result.notes.some((note) => note.includes("context overflow"))).toBe(true);
+  });
+
+  it("reports the error when the retry overflows again", async () => {
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      contextWindow: 200_000,
+      contextTier: "standard",
+      summarizer: async () => "溢出后摘要",
+      timeoutMs: 10_000,
+    } as never);
+
+    const instance = mockAgent.instance!;
+    instance.state.messages = [
+      { role: "user", content: "u1".padEnd(400, "1"), timestamp: 1 },
+      { role: "user", content: "latest", timestamp: 2 },
+      overflowAssistant(3),
+    ];
+    instance.state.errorMessage = "prompt is too long: 213462 tokens > 200000 maximum";
+    mockAgent.continueHook = (agent) => {
+      agent.state.messages = [...agent.state.messages, overflowAssistant(5)];
+      agent.state.errorMessage = "prompt is too long: 213462 tokens > 200000 maximum";
+    };
+    mockAgent.resolvePrompt?.();
+    const result = await running;
+
+    expect(mockAgent.continueCalls).toBe(1);
+    expect(result.outcome).toBe("error");
+    expect(result.errorMessage).toContain("prompt is too long");
+  });
+
+  it("keeps the full transcript in state and the result when auto compaction is active (C3)", async () => {
+    const history = Array.from({ length: 30 }, (_, index) => ({
+      role: index % 2 ? "assistant" : "user",
+      content: `m${index}`,
+      timestamp: index,
+    }));
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      messages: history,
+      maxContextMessages: 10,
+      timeoutMs: 10_000,
+    } as never);
+
+    const initial = (mockAgent.options as { initialState: { messages: unknown[] } })
+      .initialState.messages;
+    // No pre-trim: trimming is a per-request view, not a state mutation.
+    expect(initial).toHaveLength(30);
+    mockAgent.resolvePrompt?.();
+    const result = await running;
+    // No trim on the way out either; growth is bounded by compaction itself.
+    expect(result.messages).toHaveLength(30);
+  });
+
+  it("still trims state and result when compactionAuto is false (documented degraded path)", async () => {
+    const history = Array.from({ length: 30 }, (_, index) => ({
+      role: index % 2 ? "assistant" : "user",
+      content: `m${index}`,
+      timestamp: index,
+    }));
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      messages: history,
+      maxContextMessages: 10,
+      compactionAuto: false,
+      timeoutMs: 10_000,
+    } as never);
+
+    const initial = (mockAgent.options as { initialState: { messages: unknown[] } })
+      .initialState.messages;
+    expect(initial.length).toBeLessThanOrEqual(10);
+    mockAgent.resolvePrompt?.();
+    const result = await running;
+    expect(result.messages.length).toBeLessThanOrEqual(10);
+  });
+
+  it("forwards domainSnapshot to the summarizer as a trailing user message", async () => {
+    const seen: Array<Array<{ role: string; content: unknown }>> = [];
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      contextWindow: 100_000,
+      contextTier: "standard",
+      domainSnapshot: "[Margin 裁决状态快照]\n待裁决提案 2 条",
+      summarizer: async (messages: Array<{ role: string; content: unknown }>) => {
+        seen.push(messages);
+        return "摘要文本";
+      },
+      timeoutMs: 10_000,
+    } as never);
+
+    await transformContextOf()(overThresholdTranscript() as never[]);
+
+    expect(seen).toHaveLength(1);
+    const last = seen[0]!.at(-1)!;
+    expect(last.role).toBe("user");
+    expect(String(last.content)).toContain("[Margin 裁决状态快照]");
+    mockAgent.resolvePrompt?.();
+    await running;
   });
 });

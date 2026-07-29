@@ -4,22 +4,36 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   archiveAgentSession,
+  latestAgentCompactionSummary,
+  listAgentCompactions,
+  listBlocks,
+  loadAgentSession,
   loadAgentSessionEnvelope,
   openDocument,
   openWorkspace,
   saveAgentSession,
+  saveDecision,
+  saveLlmSettings,
+  saveProposal,
   type Workspace,
 } from "@margin/storage-local";
+import type { CompactionEvent } from "@margin/agent";
+import { ChatMemory } from "./chat-memory.js";
 import {
+  appendConversationNote,
   buildTranscriptPayload,
   chatAgentStateFromSession,
   clearChatAgentConversation,
   closeChatAgentDocument,
+  compactChatAgentConversation,
   createChatAgentState,
   createWorkspaceBridge,
   isCloseDocumentRequest,
   restoreChatAgentState,
+  rotateChatSessionWithSummary,
+  settleCompactionEvent,
   syncBagFromDocument,
+  type AgentMessage,
 } from "./chat-agent.js";
 
 const dirs: string[] = [];
@@ -289,6 +303,408 @@ describe("chatAgentStateFromSession (session switch)", () => {
       } catch {
         /* ignore */
       }
+      await workspace.releaseLock();
+    }
+  });
+});
+
+describe("appendConversationNote", () => {
+  it("appends a [Margin 记录] user message in the pi user-message shape", () => {
+    const state = createChatAgentState({
+      agentMessages: [{ role: "user", content: "hi" }],
+    });
+
+    appendConversationNote(state, "[Margin 记录] 用户裁决：提案 p1 = 接受");
+
+    expect(state.agentMessages).toHaveLength(2);
+    const note = state.agentMessages.at(-1) as {
+      role?: string;
+      content?: unknown;
+      timestamp?: unknown;
+    };
+    expect(note.role).toBe("user");
+    expect(note.content).toBe("[Margin 记录] 用户裁决：提案 p1 = 接受");
+    expect(typeof note.timestamp).toBe("number");
+  });
+
+  it("ignores blank notes", () => {
+    const state = createChatAgentState();
+    appendConversationNote(state, "   ");
+    expect(state.agentMessages).toEqual([]);
+  });
+
+  it("persists and restores notes through the existing session storage", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-note-"));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, "paper.md"), "# Title\n\nBody text.\n", "utf8");
+    const workspace = await openWorkspace(root);
+    try {
+      const document = openDocument(workspace, "paper.md");
+      const state = createChatAgentState({ sessionId: "s-note" });
+      state.bag = {
+        documentId: document.id,
+        revision: document.revision,
+        relativePath: document.relativePath,
+        blocks: [],
+      };
+      appendConversationNote(state, "[Margin 记录] 用户裁决：提案 p1 = 接受");
+      saveAgentSession(workspace, {
+        sessionId: state.sessionId,
+        documentId: state.bag.documentId,
+        messages: state.agentMessages,
+        chatTurns: [],
+        sourcePaths: [],
+      });
+
+      const restored = restoreChatAgentState(workspace);
+
+      const note = restored.agentMessages.at(-1) as { role?: string; content?: unknown };
+      expect(note.role).toBe("user");
+      expect(note.content).toBe("[Margin 记录] 用户裁决：提案 p1 = 接受");
+    } finally {
+      try {
+        workspace.db.close();
+      } catch {
+        /* ignore */
+      }
+      await workspace.releaseLock();
+    }
+  });
+});
+
+describe("rotateChatSessionWithSummary", () => {
+  it("archives the old session and seeds the new one with a rule-based summary", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-rotate-"));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, "paper.md"), "first paragraph\n\nsecond paragraph\n", "utf8");
+    const workspace = await openWorkspace(root);
+    try {
+      const document = openDocument(workspace, "paper.md");
+      const blocks = listBlocks(workspace, document.id);
+      saveProposal(workspace, {
+        schemaVersion: 1,
+        id: "proposal-rotate",
+        documentId: document.id,
+        blockId: blocks[0]!.id,
+        baseRevision: document.revision,
+        baseHash: blocks[0]!.contentHash,
+        before: blocks[0]!.text,
+        after: `${blocks[0]!.text} revised`,
+        rationale: "test revision",
+        risk: "language",
+        evidence: [],
+        status: "proposed",
+        createdAt: "2026-07-28T00:00:00.000Z",
+      });
+      saveDecision(workspace, "proposal-rotate", "Y");
+      saveAgentSession(workspace, {
+        sessionId: "s-old",
+        documentId: document.id,
+        messages: [{ role: "user", content: "润色引言" }],
+        chatTurns: [{ role: "user", text: "润色引言" }],
+        sourcePaths: [],
+      });
+      const state = restoreChatAgentState(workspace);
+      expect(state.sessionId).toBe("s-old");
+
+      rotateChatSessionWithSummary(workspace, state, true);
+
+      expect(state.sessionId).not.toBe("s-old");
+      expect(state.agentMessages).toHaveLength(1);
+      const note = state.agentMessages[0] as { role?: string; content?: unknown };
+      expect(note.role).toBe("user");
+      expect(String(note.content)).toContain("[Margin 记录] 上一会话摘要");
+      expect(String(note.content)).toContain("主题「润色引言」");
+      expect(String(note.content)).toContain("已接受 1、已拒绝 0、已编辑 0");
+      expect(loadAgentSessionEnvelope(workspace, "s-old")).not.toBeNull();
+    } finally {
+      try {
+        workspace.db.close();
+      } catch {
+        /* ignore */
+      }
+      await workspace.releaseLock();
+    }
+  });
+
+  it("injects nothing when there is no prior session content", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-rotate-empty-"));
+    dirs.push(root);
+    const workspace = await openWorkspace(root);
+    try {
+      const state = createChatAgentState({ sessionId: "s-fresh" });
+
+      rotateChatSessionWithSummary(workspace, state, false);
+
+      expect(state.sessionId).not.toBe("s-fresh");
+      expect(state.agentMessages).toEqual([]);
+    } finally {
+      try {
+        workspace.db.close();
+      } catch {
+        /* ignore */
+      }
+      await workspace.releaseLock();
+    }
+  });
+});
+
+describe("settleCompactionEvent", () => {
+  const u = (content: string, timestamp: number) =>
+    ({ role: "user", content, timestamp }) as AgentMessage;
+  const a = (text: string, timestamp: number) =>
+    ({ role: "assistant", content: [{ type: "text", text }], timestamp }) as AgentMessage;
+
+  const beforeTranscript = () => [u("u1", 1), a("a1", 2), u("u2", 3), a("a2", 4)];
+  const summaryHead = (summary: string) =>
+    u(`此前对话已压缩为以下摘要：\n\n${summary}`, 100);
+
+  const compactionEvent = (overrides: Partial<CompactionEvent> = {}): CompactionEvent => {
+    const before = beforeTranscript();
+    return {
+      eventId: "evt-1",
+      reason: "threshold",
+      tokensBefore: 90_000,
+      tokensAfter: 20_000,
+      summary: "压缩摘要",
+      messagesBefore: before,
+      messagesAfter: [summaryHead("压缩摘要"), ...before.slice(2)],
+      ...overrides,
+    };
+  };
+
+  it("archives messagesBefore and swaps the grown transcript's prefix for messagesAfter", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-compact-"));
+    dirs.push(root);
+    const workspace = await openWorkspace(root);
+    try {
+      // The turn appended more messages after the compaction snapshot.
+      const state = createChatAgentState({
+        sessionId: "s-compact",
+        agentMessages: [...beforeTranscript(), u("u3", 5), a("a3", 6)],
+      });
+      const chat = new ChatMemory();
+      const event = compactionEvent();
+
+      const settled = settleCompactionEvent(workspace, state, chat, event);
+
+      expect(settled).toBe(true);
+      const contents = state.agentMessages.map((message) =>
+        JSON.stringify((message as { content?: unknown }).content),
+      );
+      // [summary head, kept tail (u2, a2), post-compaction turn (u3, a3), note]
+      expect(String((state.agentMessages[0] as { content?: unknown }).content))
+        .toBe("此前对话已压缩为以下摘要：\n\n压缩摘要");
+      expect((state.agentMessages[1] as { content?: unknown }).content).toBe("u2");
+      expect((state.agentMessages[2] as { content?: unknown }).content)
+        .toEqual([{ type: "text", text: "a2" }]);
+      expect((state.agentMessages[3] as { content?: unknown }).content).toBe("u3");
+      expect((state.agentMessages[4] as { content?: unknown }).content)
+        .toEqual([{ type: "text", text: "a3" }]);
+      const note = state.agentMessages.at(-1) as { role?: string; content?: unknown };
+      expect(note.role).toBe("user");
+      expect(String(note.content)).toContain("[Margin 记录] 上下文已压缩：约 90000 → 20000 tokens");
+      expect(String(note.content)).toContain("压缩前记录已存档");
+      expect(contents.filter((c) => c.includes("u1"))).toHaveLength(0);
+
+      // C2: the archive holds the compaction-time snapshot, not the grown transcript.
+      const archived = listAgentCompactions(workspace, "s-compact");
+      expect(archived).toHaveLength(1);
+      expect(archived[0]).toMatchObject({
+        reason: "threshold",
+        tokensBefore: 90_000,
+        tokensAfter: 20_000,
+        summary: "压缩摘要",
+        messageCount: 4,
+      });
+      expect(latestAgentCompactionSummary(workspace, "s-compact")).toBe("压缩摘要");
+      expect(chat.list().map((turn) => turn.role)).toEqual(["system"]);
+      expect(chat.list()[0]?.text).toContain("90000 → 20000");
+    } finally {
+      try { workspace.db.close(); } catch { /* ignore */ }
+      await workspace.releaseLock();
+    }
+  });
+
+  it("is idempotent per eventId: a repeated settle is a no-op", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-compact-dup-"));
+    dirs.push(root);
+    const workspace = await openWorkspace(root);
+    try {
+      const state = createChatAgentState({
+        sessionId: "s-dup",
+        agentMessages: beforeTranscript(),
+      });
+      const chat = new ChatMemory();
+      const event = compactionEvent();
+
+      expect(settleCompactionEvent(workspace, state, chat, event)).toBe(true);
+      const afterFirst = state.agentMessages.map((message) =>
+        JSON.stringify(message),
+      );
+      expect(settleCompactionEvent(workspace, state, chat, event)).toBe(false);
+
+      expect(state.agentMessages.map((message) => JSON.stringify(message))).toEqual(afterFirst);
+      expect(listAgentCompactions(workspace, "s-dup")).toHaveLength(1);
+      expect(chat.list()).toHaveLength(1);
+    } finally {
+      try { workspace.db.close(); } catch { /* ignore */ }
+      await workspace.releaseLock();
+    }
+  });
+
+  it("detects the overflow path (pi-loop already wrote messagesAfter back)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-compact-overflow-"));
+    dirs.push(root);
+    const workspace = await openWorkspace(root);
+    try {
+      const event = compactionEvent({ reason: "overflow" });
+      const state = createChatAgentState({
+        sessionId: "s-overflow",
+        // pi-loop wrote the compacted transcript back; the turn then appended u3.
+        agentMessages: [...event.messagesAfter, u("u3", 5)],
+      });
+      const chat = new ChatMemory();
+
+      const settled = settleCompactionEvent(workspace, state, chat, event);
+
+      expect(settled).toBe(true);
+      // No double splice: exactly one summary head, tail intact.
+      expect(state.agentMessages.filter((message) =>
+        String((message as { content?: unknown }).content).includes("此前对话已压缩为以下摘要"),
+      )).toHaveLength(1);
+      expect((state.agentMessages[1] as { content?: unknown }).content).toBe("u2");
+      expect((state.agentMessages[3] as { content?: unknown }).content).toBe("u3");
+      expect(listAgentCompactions(workspace, "s-overflow")).toHaveLength(1);
+    } finally {
+      try { workspace.db.close(); } catch { /* ignore */ }
+      await workspace.releaseLock();
+    }
+  });
+
+  it("archives but refuses the swap when the prefix check fails (宁缺毋错)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-compact-mismatch-"));
+    dirs.push(root);
+    const workspace = await openWorkspace(root);
+    try {
+      const event = compactionEvent();
+      const diverged = [u("u1", 1), a("a1", 2), u("u2", 3), a("篡改的a2", 4), u("u3", 5)];
+      const state = createChatAgentState({
+        sessionId: "s-mismatch",
+        agentMessages: diverged,
+      });
+      const chat = new ChatMemory();
+
+      const settled = settleCompactionEvent(workspace, state, chat, event);
+
+      expect(settled).toBe(true);
+      // Transcript untouched: no summary head, no dropped prefix.
+      expect(state.agentMessages.filter((message) =>
+        String((message as { content?: unknown }).content).includes("此前对话已压缩为以下摘要"),
+      )).toHaveLength(0);
+      expect((state.agentMessages[3] as { content?: unknown }).content)
+        .toEqual([{ type: "text", text: "篡改的a2" }]);
+      // Warning note instead of the standard compaction note.
+      const note = state.agentMessages.at(-1) as { role?: string; content?: unknown };
+      expect(note.role).toBe("user");
+      expect(String(note.content)).toContain("警告");
+      expect(String(note.content)).toContain("evt-1");
+      // Archive still written.
+      const archived = listAgentCompactions(workspace, "s-mismatch");
+      expect(archived).toHaveLength(1);
+      expect(archived[0]?.messageCount).toBe(4);
+    } finally {
+      try { workspace.db.close(); } catch { /* ignore */ }
+      await workspace.releaseLock();
+    }
+  });
+});
+
+describe("compactChatAgentConversation", () => {
+  const ENV_KEYS = ["MARGIN_API_KEY", "MARGIN_MODEL", "MARGIN_BASE_URL", "MARGIN_PROVIDER", "MARGIN_API_FORMAT"];
+  let savedEnv: Record<string, string | undefined> = {};
+
+  afterEach(() => {
+    for (const key of ENV_KEYS) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+    savedEnv = {};
+  });
+
+  const seedTranscript = (): AgentMessage[] => [
+    { role: "user", content: "第一轮问题", timestamp: 1 } as AgentMessage,
+    { role: "assistant", content: [{ type: "text", text: "很长的回答".repeat(200) }], timestamp: 2 } as AgentMessage,
+    { role: "user", content: "最新一轮", timestamp: 3 } as AgentMessage,
+  ];
+
+  it("rejects when the conversation has no content", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-manual-empty-"));
+    dirs.push(root);
+    const workspace = await openWorkspace(root);
+    try {
+      const state = createChatAgentState({ sessionId: "s-empty" });
+      await expect(
+        compactChatAgentConversation({ workspace, agentState: state, chat: new ChatMemory() }),
+      ).rejects.toThrow(/没有可压缩/);
+    } finally {
+      try { workspace.db.close(); } catch { /* ignore */ }
+      await workspace.releaseLock();
+    }
+  });
+
+  it("rejects on the eco tier (no LLM summarization)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-manual-eco-"));
+    dirs.push(root);
+    const workspace = await openWorkspace(root);
+    try {
+      await saveLlmSettings(root, { contextTier: "eco" });
+      const state = createChatAgentState({ sessionId: "s-eco", agentMessages: seedTranscript() });
+      await expect(
+        compactChatAgentConversation({ workspace, agentState: state, chat: new ChatMemory() }),
+      ).rejects.toThrow(/eco|节省/);
+    } finally {
+      try { workspace.db.close(); } catch { /* ignore */ }
+      await workspace.releaseLock();
+    }
+  });
+
+  it("compacts manually: archive + splice + persist + visible note", async () => {
+    savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+    process.env.MARGIN_API_KEY = "test-key";
+    delete process.env.MARGIN_BASE_URL;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-manual-"));
+    dirs.push(root);
+    const workspace = await openWorkspace(root);
+    try {
+      const state = createChatAgentState({ sessionId: "s-manual", agentMessages: seedTranscript() });
+      const chat = new ChatMemory();
+
+      const result = await compactChatAgentConversation({
+        workspace,
+        agentState: state,
+        chat,
+        summarizer: async () => "手动压缩摘要",
+      });
+
+      expect(result.summary).toBe("手动压缩摘要");
+      expect(result.tokensBefore).toBeGreaterThan(result.tokensAfter);
+      const head = state.agentMessages[0] as { role?: string; content?: unknown };
+      expect(String(head.content)).toBe("此前对话已压缩为以下摘要：\n\n手动压缩摘要");
+      expect((state.agentMessages[1] as { content?: unknown }).content).toBe("最新一轮");
+
+      const archived = listAgentCompactions(workspace, "s-manual");
+      expect(archived).toHaveLength(1);
+      expect(archived[0]?.reason).toBe("manual");
+      expect(latestAgentCompactionSummary(workspace, "s-manual")).toBe("手动压缩摘要");
+      expect(chat.list().map((turn) => turn.role)).toEqual(["system"]);
+
+      const persisted = loadAgentSession(workspace);
+      expect(String((persisted?.messages[0] as { content?: unknown })?.content))
+        .toContain("手动压缩摘要");
+      expect(persisted?.chatTurns.map((turn) => turn.role)).toContain("system");
+    } finally {
+      try { workspace.db.close(); } catch { /* ignore */ }
       await workspace.releaseLock();
     }
   });

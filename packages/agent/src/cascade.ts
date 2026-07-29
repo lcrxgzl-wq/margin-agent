@@ -110,12 +110,12 @@ export function normalizeCascadeOffer(
   return out;
 }
 
-/** Compact outline for prompt injection (titles only). */
+/** Compact outline for prompt injection (titles only). maxHeadings 0 = unlimited. */
 export function formatOutlineHint(blocks: BlockSnapshot[], maxHeadings = 24): string {
-  const headings = [...blocks]
+  const sorted = [...blocks]
     .filter((b) => b.kind === "heading")
-    .sort((a, c) => a.order - c.order)
-    .slice(0, maxHeadings);
+    .sort((a, c) => a.order - c.order);
+  const headings = maxHeadings > 0 ? sorted.slice(0, maxHeadings) : sorted;
   if (!headings.length) return "";
   const lines = headings.map((b) => {
     const m = /^(#{1,6})\s+(.*)$/s.exec(b.text);

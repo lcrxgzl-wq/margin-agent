@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Workspace } from "./workspace-fs.js";
 
 const SESSION_ROW_ID = "current";
@@ -16,7 +17,7 @@ const MAX_TASK_SOURCE_REFS = 100;
 const MAX_JSON_BYTES = 800_000;
 
 export type PersistedChatTurn = {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   text: string;
   threadId?: string;
 };
@@ -84,7 +85,7 @@ function isChatTurn(value: unknown): value is PersistedChatTurn {
   if (!value || typeof value !== "object") return false;
   const t = value as { role?: unknown; text?: unknown; threadId?: unknown };
   return (
-    (t.role === "user" || t.role === "assistant") &&
+    (t.role === "user" || t.role === "assistant" || t.role === "system") &&
     typeof t.text === "string" &&
     t.text.trim().length > 0 &&
     (t.threadId === undefined || (
@@ -349,7 +350,36 @@ export function ensureAgentSessionSchema(ws: Workspace): void {
       messages_json TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS agent_compactions (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      tokens_before INTEGER NOT NULL,
+      tokens_after INTEGER NOT NULL,
+      summary TEXT NOT NULL,
+      previous_summary TEXT,
+      message_count INTEGER NOT NULL,
+      truncated INTEGER NOT NULL DEFAULT 0,
+      messages_json TEXT NOT NULL
+    );
   `);
+  // Idempotent column migrations for DBs created before event_id /
+  // truncated_count existed (I3/I4).
+  const compactionColumns = new Set(
+    (ws.db.prepare(`PRAGMA table_info(agent_compactions)`).all() as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!compactionColumns.has("event_id")) {
+    ws.db.exec(`ALTER TABLE agent_compactions ADD COLUMN event_id TEXT`);
+  }
+  if (!compactionColumns.has("truncated_count")) {
+    ws.db.exec(`ALTER TABLE agent_compactions ADD COLUMN truncated_count INTEGER NOT NULL DEFAULT 0`);
+  }
+  ws.db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS agent_compactions_event_id_idx
+     ON agent_compactions (event_id)`,
+  );
 }
 
 export function saveAgentSession(
@@ -557,4 +587,205 @@ export function listAgentSessions(ws: Workspace): AgentSessionSummary[] {
       turnCount: parsed.chatTurns.length,
     };
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* agent_compactions: non-destructive archive of pre-compaction        */
+/* transcripts (context-compaction Round B).                           */
+/* ------------------------------------------------------------------ */
+
+const MAX_COMPACTION_ROWS = 50;
+const MAX_COMPACTION_JSON_BYTES = 800_000;
+
+export type AgentCompactionRecord = {
+  id: string;
+  sessionId: string;
+  createdAt: string;
+  reason: string;
+  tokensBefore: number;
+  tokensAfter: number;
+  summary: string;
+  previousSummary?: string;
+  /** Original transcript size (before any byte-cap truncation). */
+  messageCount: number;
+  truncated: boolean;
+  /** How many oldest messages were dropped by the byte-cap truncation. */
+  truncatedCount: number;
+};
+
+export type SaveAgentCompactionInput = {
+  sessionId: string;
+  /** Idempotency key minted by orchestrateCompaction; dedupes the archive. */
+  eventId: string;
+  reason: string;
+  tokensBefore: number;
+  tokensAfter: number;
+  summary: string;
+  previousSummary?: string;
+  /** Full pre-compaction transcript; oldest messages drop past the byte cap. */
+  messages: unknown[];
+};
+
+export type SaveAgentCompactionResult = {
+  id: string;
+  createdAt: string;
+  /** True when the same summary + tokensBefore was already archived (idempotent). */
+  duplicate: boolean;
+  archivedBytes: number;
+};
+
+type CompactionRow = {
+  id: string;
+  event_id: string | null;
+  session_id: string;
+  created_at: string;
+  reason: string;
+  tokens_before: number;
+  tokens_after: number;
+  summary: string;
+  previous_summary: string | null;
+  message_count: number;
+  truncated: number;
+  truncated_count: number | null;
+};
+
+function compactionRecord(row: CompactionRow): AgentCompactionRecord {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    createdAt: row.created_at,
+    reason: row.reason,
+    tokensBefore: row.tokens_before,
+    tokensAfter: row.tokens_after,
+    summary: row.summary,
+    previousSummary: row.previous_summary ?? undefined,
+    messageCount: row.message_count,
+    truncated: row.truncated === 1,
+    truncatedCount: row.truncated_count ?? 0,
+  };
+}
+
+/** Role lookup for archived raw messages (local: storage must not import agent). */
+function archivedRoleOf(message: unknown): string | undefined {
+  return message && typeof message === "object" && "role" in message
+    ? String((message as { role?: unknown }).role ?? "")
+    : undefined;
+}
+
+/**
+ * Drop the oldest archived messages only at a user-message boundary, so the
+ * byte-cap truncation can never split an assistant toolCall from its
+ * toolResult (mirrors the findSafeCutIndex boundary rule). Falls back to a
+ * single-message drop when no user boundary exists, to guarantee progress.
+ */
+function dropOldestArchiveUnit(messages: unknown[]): unknown[] {
+  for (let index = 1; index < messages.length; index += 1) {
+    if (archivedRoleOf(messages[index]) === "user") return messages.slice(index);
+  }
+  return messages.slice(1);
+}
+
+/**
+ * Archive a pre-compaction transcript. Idempotent per event_id so a duplicate
+ * settle of the same compaction event never writes twice — and a fresh event
+ * with an identical summary is never mistaken for a duplicate. Pruned to the
+ * newest 50 rows.
+ */
+export function saveAgentCompaction(
+  ws: Workspace,
+  input: SaveAgentCompactionInput,
+): SaveAgentCompactionResult {
+  ensureAgentSessionSchema(ws);
+  const existing = ws.db
+    .prepare(
+      `SELECT id, created_at FROM agent_compactions
+       WHERE event_id = ? LIMIT 1`,
+    )
+    .get(input.eventId) as
+    | { id: string; created_at: string }
+    | undefined;
+  if (existing) {
+    return { id: existing.id, createdAt: existing.created_at, duplicate: true, archivedBytes: 0 };
+  }
+
+  let kept = [...input.messages];
+  let truncated = false;
+  let messagesJson = JSON.stringify(kept);
+  while (Buffer.byteLength(messagesJson, "utf8") > MAX_COMPACTION_JSON_BYTES && kept.length) {
+    kept = dropOldestArchiveUnit(kept);
+    truncated = true;
+    messagesJson = JSON.stringify(kept);
+  }
+
+  const id = randomUUID();
+  const createdAt = new Date().toISOString();
+  ws.db.prepare(
+    `INSERT INTO agent_compactions (
+       id, event_id, session_id, created_at, reason, tokens_before, tokens_after,
+       summary, previous_summary, message_count, truncated, truncated_count, messages_json
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    input.eventId,
+    input.sessionId,
+    createdAt,
+    input.reason,
+    Math.max(0, Math.floor(input.tokensBefore)),
+    Math.max(0, Math.floor(input.tokensAfter)),
+    input.summary,
+    input.previousSummary ?? null,
+    input.messages.length,
+    truncated ? 1 : 0,
+    input.messages.length - kept.length,
+    messagesJson,
+  );
+  ws.db.prepare(
+    `DELETE FROM agent_compactions WHERE id NOT IN (
+       SELECT id FROM agent_compactions ORDER BY created_at DESC, rowid DESC LIMIT ?
+     )`,
+  ).run(MAX_COMPACTION_ROWS);
+  return {
+    id,
+    createdAt,
+    duplicate: false,
+    archivedBytes: Buffer.byteLength(messagesJson, "utf8"),
+  };
+}
+
+/** Archive metadata, newest first (messages_json intentionally excluded). */
+export function listAgentCompactions(
+  ws: Workspace,
+  sessionId?: string,
+): AgentCompactionRecord[] {
+  ensureAgentSessionSchema(ws);
+  const rows = (
+    sessionId === undefined
+      ? ws.db.prepare(
+          `SELECT id, session_id, created_at, reason, tokens_before, tokens_after,
+                  summary, previous_summary, message_count, truncated, truncated_count
+           FROM agent_compactions ORDER BY created_at DESC, rowid DESC`,
+        ).all()
+      : ws.db.prepare(
+          `SELECT id, session_id, created_at, reason, tokens_before, tokens_after,
+                  summary, previous_summary, message_count, truncated, truncated_count
+           FROM agent_compactions WHERE session_id = ?
+           ORDER BY created_at DESC, rowid DESC`,
+        ).all(sessionId)
+  ) as CompactionRow[];
+  return rows.map(compactionRecord);
+}
+
+/** Latest compaction summary for a session — the next previousSummary input. */
+export function latestAgentCompactionSummary(
+  ws: Workspace,
+  sessionId: string,
+): string | undefined {
+  ensureAgentSessionSchema(ws);
+  const row = ws.db
+    .prepare(
+      `SELECT summary FROM agent_compactions WHERE session_id = ?
+       ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+    )
+    .get(sessionId) as { summary: string } | undefined;
+  return row?.summary;
 }

@@ -9,6 +9,7 @@ import {
 } from "@margin/llm";
 import { getHeuristicComments } from "./packs/registry.js";
 import { runPiAgentLoop, type ToolAuditEvent } from "./pi-loop.js";
+import type { CompactionEvent } from "./compaction.js";
 import { assertPiLoopCompleted } from "./pi-outcome.js";
 import { decideRoute } from "./policy/router.js";
 import { isUserFacingPhase, toolPhaseLabel } from "./progress.js";
@@ -29,6 +30,72 @@ import { formatOutlineHint, type CascadeCandidate } from "./cascade.js";
 import type { AgentComment, AgentWorkReport, ReasoningMode, ScanProgressHandler } from "./types.js";
 import type { RemoteMcpApprovalFn, RemoteMcpBridge } from "./mcp-tools.js";
 
+export type ContextTier = "eco" | "standard" | "max";
+
+export type ContextTierPreset = {
+  /** Inline selection excerpt cap (chars). */
+  selectionChars: number;
+  /** Outline heading cap; 0 = unlimited. */
+  outlineHeadings: number;
+  contextMessages: number;
+  contextChars: number;
+  /** Final tool/text compaction rung floor in pi-loop. */
+  compactionFloor: number;
+  /** Inject the blocks adjacent to the selection (±1, ≤800 chars each). */
+  adjacentBlocks: boolean;
+};
+
+export const CONTEXT_TIER_PRESETS: Record<ContextTier, ContextTierPreset> = {
+  eco: {
+    selectionChars: 400,
+    outlineHeadings: 12,
+    contextMessages: 40,
+    contextChars: 60_000,
+    compactionFloor: 32,
+    adjacentBlocks: false,
+  },
+  standard: {
+    selectionChars: 2_000,
+    outlineHeadings: 24,
+    contextMessages: 80,
+    contextChars: 200_000,
+    compactionFloor: 128,
+    adjacentBlocks: false,
+  },
+  max: {
+    selectionChars: 12_000,
+    outlineHeadings: 0,
+    contextMessages: 120,
+    contextChars: 600_000,
+    compactionFloor: 1_000,
+    adjacentBlocks: true,
+  },
+};
+
+function resolveContextTier(value: unknown): ContextTier | undefined {
+  return value === "eco" || value === "standard" || value === "max" ? value : undefined;
+}
+
+/** max tier: inline the blocks surrounding the selection (±1, ≤800 chars each); omit silently. */
+function buildSelectionAdjacentContext(
+  blocks: SessionDocBag["blocks"],
+  selectionIds: string[],
+): string {
+  if (!selectionIds.length || !blocks.length) return "";
+  const indices = selectionIds
+    .map((id) => blocks.findIndex((block) => block.id === id))
+    .filter((index) => index >= 0);
+  if (!indices.length) return "";
+  const first = Math.min(...indices);
+  const last = Math.max(...indices);
+  const parts: string[] = [];
+  const prev = blocks[first - 1];
+  const next = blocks[last + 1];
+  if (prev) parts.push(`前一段（${prev.id}）：\n${prev.text.slice(0, 800)}`);
+  if (next) parts.push(`后一段（${next.id}）：\n${next.text.slice(0, 800)}`);
+  return parts.length ? `\n\n[选区上下文]\n${parts.join("\n")}` : "";
+}
+
 export type SessionTurnInput = {
   message: string;
   /** Unexpanded user text used for this turn's workspace-write approval only. */
@@ -40,6 +107,8 @@ export type SessionTurnInput = {
   harnessId?: string;
   selectionHint?: string;
   selectionBlockIds?: string[];
+  /** Rule-based proposal/decision status for the open document; injected next to docHint. */
+  proposalHint?: string;
   /** User-confirmed cascade block ids from offer card. */
   cascadeBlockIds?: string[];
   /** Short chat history for offline/discuss turns. */
@@ -53,6 +122,18 @@ export type SessionTurnInput = {
   sessionId?: string;
   /** Product reasoning mode; explicit levels apply only to compatible/opted-in models. */
   reasoningMode?: ReasoningMode;
+  /** User-configured pi session timeout (ms); wins over env/profile fallback. */
+  timeoutMs?: number;
+  /** Context budget tier; unset/invalid keeps the current standard behavior. */
+  contextTier?: ContextTier;
+  /** Automatic context compaction (default true); plumbed like agentTimeoutMs. */
+  compactionAuto?: boolean;
+  /** Last compaction summary, for incremental summary updates. */
+  previousSummary?: string;
+  /** Compaction events; archiving + UI notes are the host's job (Round B). */
+  onCompaction?: (event: CompactionEvent) => void;
+  /** Decision snapshot appended to the summarizer input (built from proposals/decisions). */
+  domainSnapshot?: string;
   /** Custom provider opt-in to reasoning controls (set after a passing connection test). */
   reasoningOptIn?: boolean;
   /** direct = revise promptly; socratic = ask first, propose only when user greenlights. */
@@ -158,6 +239,8 @@ export async function runPiSessionTurn(
   input: SessionTurnInput,
 ): Promise<SessionTurnResult> {
   const profile = getAgentProfile(input.harnessId);
+  const contextTier = resolveContextTier(input.contextTier);
+  const tierPreset = CONTEXT_TIER_PRESETS[contextTier ?? "standard"];
   const runtime = resolveRuntimeModel(profile.model);
   const { model, apiKey } = runtime;
   const thinkingLevel = effectiveThinkingLevel(input.reasoningMode, runtime, input.reasoningOptIn);
@@ -196,7 +279,7 @@ export async function runPiSessionTurn(
   emit("正在思考…");
 
   const selection = input.selectionHint?.trim()
-    ? `\n\n用户当前选区${selectionIds.length ? `（blockIds: ${selectionIds.join(", ")}）` : ""}：\n"""\n${input.selectionHint.trim().slice(0, 800)}\n"""`
+    ? `\n\n用户当前选区${selectionIds.length ? `（blockIds: ${selectionIds.join(", ")}）` : ""}：\n"""\n${input.selectionHint.trim().slice(0, tierPreset.selectionChars)}\n"""`
     : selectionIds.length
       ? `\n\n用户选中段落 blockIds: ${selectionIds.join(", ")}`
       : "";
@@ -204,7 +287,13 @@ export async function runPiSessionTurn(
     ? `\n当前已打开：${input.bag.relativePath}（${input.bag.blocks.length} 段）`
     : "\n当前未打开文稿。";
   const outlineHint =
-    input.bag.blocks.length > 0 ? formatOutlineHint(input.bag.blocks) : "";
+    input.bag.blocks.length > 0 ? formatOutlineHint(input.bag.blocks, tierPreset.outlineHeadings) : "";
+  const adjacentContext = tierPreset.adjacentBlocks
+    ? buildSelectionAdjacentContext(input.bag.blocks, selectionIds)
+    : "";
+  const proposalHint = input.proposalHint?.trim()
+    ? `\n\n${input.proposalHint.trim()}`
+    : "";
   const modeHint = buildClarificationHint({
     clarificationRound: input.clarificationRound ?? 0,
     chatMode: input.chatMode,
@@ -249,7 +338,7 @@ export async function runPiSessionTurn(
   }
 
   const result = await runPiAgentLoop({
-    prompt: `${input.message}${docHint}${outlineHint}${selection}${modeHint}${cascadeHint}${sourceHint}`,
+    prompt: `${input.message}${docHint}${outlineHint}${proposalHint}${selection}${adjacentContext}${modeHint}${cascadeHint}${sourceHint}`,
     systemPrompt: systemSkills.prompt,
     tools,
     messages: input.messages,
@@ -259,9 +348,16 @@ export async function runPiSessionTurn(
     thinkingLevel,
     usagePath: "pi-chat",
     maxTurns: maxTurns(profile.limits.maxTurns),
-    timeoutMs: timeoutMs(profile.limits.timeoutMs),
-    maxContextMessages: profile.limits.maxContextMessages,
-    maxContextChars: profile.limits.maxContextChars,
+    timeoutMs: input.timeoutMs ?? timeoutMs(profile.limits.timeoutMs),
+    maxContextMessages: contextTier ? tierPreset.contextMessages : profile.limits.maxContextMessages,
+    maxContextChars: contextTier ? tierPreset.contextChars : profile.limits.maxContextChars,
+    toolCompactionFloor: contextTier ? tierPreset.compactionFloor : undefined,
+    contextWindow: model.contextWindow,
+    contextTier: contextTier ?? "standard",
+    compactionAuto: input.compactionAuto,
+    previousSummary: input.previousSummary,
+    domainSnapshot: input.domainSnapshot,
+    onCompaction: input.onCompaction,
     allowedToolNames: tools.map((tool) => tool.name),
     onProgress: emit,
     onDelta: input.onDelta,

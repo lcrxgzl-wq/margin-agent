@@ -6,10 +6,10 @@ export type ChatHistoryTurn = {
 const DEFAULT_MAX = 12;
 
 /** Keep the last N turns (user+assistant pairs count toward the cap). */
-export function trimHistory(
-  turns: ChatHistoryTurn[],
+export function trimHistory<T extends { text: string }>(
+  turns: T[],
   maxTurns = DEFAULT_MAX,
-): ChatHistoryTurn[] {
+): T[] {
   if (turns.length <= maxTurns) return turns;
   return turns.slice(-maxTurns);
 }

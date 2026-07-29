@@ -26,4 +26,27 @@ describe("ChatMemory thread metadata", () => {
 
     expect(memory.list().map((turn) => turn.threadId)).toEqual(["thread-1", "thread-1"]);
   });
+
+  it("keeps system turns for the UI but excludes them from LLM history", () => {
+    const memory = new ChatMemory();
+    memory.remember("user", "Question");
+    memory.remember("system", "上下文已压缩：约 90000 → 20000 tokens（压缩前记录已存档）");
+    memory.remember("assistant", "Answer");
+
+    expect(memory.list().map((turn) => turn.role)).toEqual(["user", "system", "assistant"]);
+    expect(memory.prior()).toEqual([
+      { role: "user", text: "Question" },
+      { role: "assistant", text: "Answer" },
+    ]);
+  });
+
+  it("hydrates persisted system turns", () => {
+    const memory = new ChatMemory();
+    memory.hydrate([
+      { role: "user", text: "Question" },
+      { role: "system", text: "上下文已压缩" },
+    ]);
+
+    expect(memory.list().map((turn) => turn.role)).toEqual(["user", "system"]);
+  });
 });

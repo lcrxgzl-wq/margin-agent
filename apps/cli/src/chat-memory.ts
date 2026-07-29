@@ -2,7 +2,12 @@ import { trimHistory, type ChatHistoryTurn } from "@margin/llm";
 
 const MAX_TURNS = 12;
 
-export type ChatMemoryTurn = ChatHistoryTurn & { threadId?: string };
+export type ChatMemoryTurn = {
+  /** "system" turns are UI-visible host notes; never sent to the LLM. */
+  role: "user" | "assistant" | "system";
+  text: string;
+  threadId?: string;
+};
 
 /** In-process short memory for one localhost session. */
 export class ChatMemory {
@@ -14,10 +19,13 @@ export class ChatMemory {
 
   /** Snapshot before appending the current user message. */
   prior(): ChatHistoryTurn[] {
-    return trimHistory(this.turns, MAX_TURNS).map(({ role, text }) => ({ role, text }));
+    const llmTurns = this.turns.flatMap((turn) =>
+      turn.role === "system" ? [] : [{ role: turn.role, text: turn.text }],
+    );
+    return trimHistory(llmTurns, MAX_TURNS).map(({ role, text }) => ({ role, text }));
   }
 
-  remember(role: "user" | "assistant", text: string, threadId?: string) {
+  remember(role: "user" | "assistant" | "system", text: string, threadId?: string) {
     const t = text.trim();
     if (!t) return;
     this.turns = trimHistory([
@@ -30,7 +38,7 @@ export class ChatMemory {
   hydrate(turns: ChatMemoryTurn[]) {
     this.turns = trimHistory(
       turns
-        .filter((t) => (t.role === "user" || t.role === "assistant") && t.text?.trim())
+        .filter((t) => (t.role === "user" || t.role === "assistant" || t.role === "system") && t.text?.trim())
         .map((t) => ({
           role: t.role,
           text: t.text.trim(),

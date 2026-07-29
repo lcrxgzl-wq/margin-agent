@@ -132,6 +132,35 @@ describe("cascade gate", () => {
     expect(hint).not.toContain("执行张力");
   });
 
+  it("formatOutlineHint caps at 24 headings by default and honors maxHeadings", () => {
+    const many: BlockSnapshot[] = Array.from({ length: 30 }, (_, i) => ({
+      id: `h${i + 1}`,
+      kind: "heading",
+      order: i,
+      text: `# 标题 ${i + 1}`,
+      contentHash: `hash-${i + 1}`,
+    }));
+    const capped = formatOutlineHint(many);
+    expect(capped).toContain("标题 24");
+    expect(capped).not.toContain("标题 25");
+    const twelve = formatOutlineHint(many, 12);
+    expect(twelve).toContain("标题 12");
+    expect(twelve).not.toContain("标题 13");
+  });
+
+  it("formatOutlineHint treats maxHeadings 0 as unlimited", () => {
+    const many: BlockSnapshot[] = Array.from({ length: 30 }, (_, i) => ({
+      id: `h${i + 1}`,
+      kind: "heading",
+      order: i,
+      text: `# 标题 ${i + 1}`,
+      contentHash: `hash-${i + 1}`,
+    }));
+    const hint = formatOutlineHint(many, 0);
+    expect(hint).toContain("标题 1");
+    expect(hint).toContain("标题 30");
+  });
+
   it("isPrimaryProposeTarget respects allowlist", () => {
     expect(isPrimaryProposeTarget("b-lit", { primaryAllowlist: ["b-lit"] })).toBe(true);
     expect(isPrimaryProposeTarget("b-abs", { primaryAllowlist: ["b-lit"] })).toBe(false);

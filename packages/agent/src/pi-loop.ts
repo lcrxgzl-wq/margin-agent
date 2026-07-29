@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isContextOverflow } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import {
   Agent,
@@ -6,6 +7,15 @@ import {
   type AgentTool,
   type StreamFn,
 } from "@earendil-works/pi-agent-core";
+import {
+  createPiSummarizer,
+  orchestrateCompaction,
+  pruneToolOutputs,
+  type CompactionEvent,
+  type CompactionOutcome,
+  type ContextTierName,
+  type SummarizerFn,
+} from "./compaction.js";
 import {
   marginRequestHeaders,
   reportModelUsage,
@@ -32,10 +42,26 @@ export type PiLoopOptions = {
   timeoutMs?: number;
   maxContextMessages?: number;
   maxContextChars?: number;
+  /** Floor for the final tool/text compaction rung; defaults to 32 (status quo). */
+  toolCompactionFloor?: number;
   /** Optional stricter allowlist; defaults to the tools actually mounted. */
   allowedToolNames?: readonly string[];
   onProgress?: (phase: string, tool?: string) => void;
   onDelta?: (chunk: string) => void;
+  /** Model context window; enables usage-triggered compaction when set. */
+  contextWindow?: number;
+  /** Context tier; eco never summarizes (prune + trim ladder only). */
+  contextTier?: ContextTierName;
+  /** Automatic compaction (threshold trigger + overflow retry); default true. */
+  compactionAuto?: boolean;
+  /** Test seam: injected summarizer; defaults to pi generateSummary. */
+  summarizer?: SummarizerFn;
+  /** Compaction events (archiving / UI visibility handled by the host). */
+  onCompaction?: (event: CompactionEvent) => void;
+  /** Last compaction summary, for incremental summary updates. */
+  previousSummary?: string;
+  /** Synthetic decision snapshot appended to the summarizer input (Round B host wiring). */
+  domainSnapshot?: string;
   signal?: AbortSignal;
 };
 
@@ -185,6 +211,7 @@ export function trimAgentMessages(
   messages: AgentMessage[],
   maxMessages = DEFAULT_MAX_CONTEXT_MESSAGES,
   maxChars = DEFAULT_MAX_CONTEXT_CHARS,
+  toolCompactionFloor = 32,
 ): AgentMessage[] {
   let trimmed = [...messages];
   if (trimmed.length > maxMessages) {
@@ -219,7 +246,7 @@ export function trimAgentMessages(
   while (serializedChars(trimmed) > maxChars && dropOldestContextUnit(trimmed)) {
     // Last resort for one oversized turn: preserve its user request and newest complete units.
   }
-  if (serializedChars(trimmed) > maxChars) trimmed = compactAllMessageText(trimmed, 32);
+  if (serializedChars(trimmed) > maxChars) trimmed = compactAllMessageText(trimmed, Math.max(32, toolCompactionFloor));
   return trimmed;
 }
 
@@ -268,20 +295,109 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
   let streamedText = "";
   let thrownError: string | undefined;
 
+  // Context compaction state (Round A): prune always; summarize when the
+  // tier allows it, the user has not disabled it, and this session has not
+  // given up after a non-shrinking compaction.
+  let previousSummary = opts.previousSummary;
+  let lastCompactionAt: number | undefined;
+  let autoCompactionDisabled = false;
+  const contextTier: ContextTierName = opts.contextTier ?? "standard";
+  const compactionAuto = opts.compactionAuto !== false;
+  // C3: with auto compaction on a non-eco tier the state holds the full
+  // transcript; trimming is a per-request view only (transformContext), and
+  // growth is bounded by compaction itself. Eco / compactionAuto=false keep
+  // the documented degraded path of trimming state directly.
+  const fullTranscriptState = compactionAuto && contextTier !== "eco";
+  const summarizer =
+    opts.summarizer ??
+    createPiSummarizer({
+      model: opts.model as never,
+      apiKey: opts.apiKey,
+      headers: marginRequestHeaders(),
+    });
+  const reportCompaction = (
+    reason: CompactionEvent["reason"],
+    outcome: Extract<CompactionOutcome, { kind: "compacted" }>,
+    messagesBefore: AgentMessage[],
+  ) => {
+    previousSummary = outcome.summary;
+    lastCompactionAt = Date.now();
+    notes.push(
+      `context compacted (${reason}): ~${outcome.tokensBefore} -> ${outcome.tokensAfter} tokens`,
+    );
+    opts.onCompaction?.({
+      eventId: outcome.eventId,
+      reason,
+      tokensBefore: outcome.tokensBefore,
+      tokensAfter: outcome.tokensAfter,
+      summary: outcome.summary,
+      messagesBefore,
+      messagesAfter: outcome.messages,
+    });
+  };
+  // Returns the per-request context view. Compaction (when it fires) replaces
+  // the view with [summary head] + kept tail; otherwise the view is pruned and
+  // trimmed — but the pi state is never mutated here.
+  const maybeCompactContext = async (messages: AgentMessage[]): Promise<AgentMessage[]> => {
+    const working = pruneToolOutputs(messages).messages;
+    if (
+      !compactionAuto ||
+      contextTier === "eco" ||
+      autoCompactionDisabled ||
+      !(opts.contextWindow && opts.contextWindow > 0)
+    ) {
+      return trimAgentMessages(
+        working,
+        contextMessageLimit,
+        contextCharLimit,
+        opts.toolCompactionFloor,
+      );
+    }
+    const outcome = await orchestrateCompaction({
+      messages: working,
+      model: opts.model as never,
+      contextWindow: opts.contextWindow,
+      tier: contextTier,
+      summarizer,
+      previousSummary,
+      domainSnapshot: opts.domainSnapshot,
+      lastCompactionAt,
+      signal: combined.signal,
+    });
+    if (outcome.kind === "compacted") {
+      reportCompaction("threshold", outcome, messages);
+      return outcome.messages;
+    }
+    if (outcome.kind === "skipped" && outcome.reason === "not_beneficial") {
+      autoCompactionDisabled = true;
+      notes.push("auto compaction disabled: summary would not shrink context");
+    } else if (outcome.kind === "failed") {
+      notes.push(`compaction failed, falling back to trim: ${outcome.error}`);
+    }
+    return trimAgentMessages(
+      outcome.messages,
+      contextMessageLimit,
+      contextCharLimit,
+      opts.toolCompactionFloor,
+    );
+  };
+
   const agent = new Agent({
     initialState: {
       systemPrompt: opts.systemPrompt,
       model: opts.model as never,
       thinkingLevel: opts.thinkingLevel ?? "off",
       tools: tools as AgentTool[],
-      messages: trimAgentMessages(
-        opts.messages ?? [],
-        contextMessageLimit,
-        contextCharLimit,
-      ),
+      messages: fullTranscriptState
+        ? (opts.messages ?? [])
+        : trimAgentMessages(
+            opts.messages ?? [],
+            contextMessageLimit,
+            contextCharLimit,
+            opts.toolCompactionFloor,
+          ),
     },
-    transformContext: async (messages) =>
-      trimAgentMessages(messages, contextMessageLimit, contextCharLimit),
+    transformContext: async (messages) => maybeCompactContext(messages),
     beforeToolCall: async ({ toolCall, args }) => {
       const summary = summarizeToolArguments(args);
       if (!allowedToolNames.has(toolCall.name)) {
@@ -388,8 +504,62 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
 
   const timer = setTimeout(() => abort("timed_out", `aborted after ${limit}ms`), limit);
 
+  let overflowRetried = false;
+  const maybeRetryOverflowOnce = async () => {
+    if (overflowRetried || !compactionAuto || combined.signal.aborted) return;
+    const messages = agent.state.messages as AgentMessage[];
+    const last = messages[messages.length - 1] as
+      | { role?: string; stopReason?: string; errorMessage?: string }
+      | undefined;
+    if (!last || last.role !== "assistant" || last.stopReason !== "error" || !last.errorMessage) {
+      return;
+    }
+    if (!isContextOverflow(last as never, opts.contextWindow)) return;
+    overflowRetried = true;
+    notes.push("context overflow: compacted transcript and retried once");
+    // Delete the failed assistant message, compact the transcript, retry once.
+    const cleaned = pruneToolOutputs(messages.slice(0, -1)).messages;
+    let compacted: AgentMessage[];
+    if (contextTier !== "eco" && opts.contextWindow && opts.contextWindow > 0) {
+      const outcome = await orchestrateCompaction({
+        messages: cleaned,
+        model: opts.model as never,
+        contextWindow: opts.contextWindow,
+        tier: contextTier,
+        summarizer,
+        previousSummary,
+        domainSnapshot: opts.domainSnapshot,
+        force: true,
+        signal: combined.signal,
+      });
+      if (outcome.kind === "compacted") {
+        reportCompaction("overflow", outcome, cleaned);
+        compacted = outcome.messages;
+      } else {
+        compacted = trimAgentMessages(
+          outcome.messages,
+          contextMessageLimit,
+          contextCharLimit,
+          opts.toolCompactionFloor,
+        );
+      }
+    } else {
+      compacted = trimAgentMessages(
+        cleaned,
+        contextMessageLimit,
+        contextCharLimit,
+        opts.toolCompactionFloor,
+      );
+    }
+    agent.state.messages = compacted as never;
+    await agent.continue();
+  };
+
   try {
-    if (!combined.signal.aborted) await agent.prompt(opts.prompt);
+    if (!combined.signal.aborted) {
+      await agent.prompt(opts.prompt);
+      await maybeRetryOverflowOnce();
+    }
   } catch (error) {
     if (combined.signal.aborted && outcome === "completed") {
       outcome = "aborted";
@@ -438,7 +608,9 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
   }
 
   return {
-    messages: trimAgentMessages(agent.state.messages, contextMessageLimit, contextCharLimit),
+    messages: fullTranscriptState
+      ? agent.state.messages
+      : trimAgentMessages(agent.state.messages, contextMessageLimit, contextCharLimit, opts.toolCompactionFloor),
     outcome,
     notes,
     streamedText,

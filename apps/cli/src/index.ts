@@ -84,18 +84,23 @@ import {
   type LlmProviderProbeInput,
 } from "@margin/llm";
 import {
+  appendConversationNote,
   chatAgentStateFromSession,
   clearChatAgentConversation,
   closeChatAgentDocument,
+  compactChatAgentConversation,
+  ManualCompactionError,
   isCloseDocumentRequest,
   loadPersistedChatTurns,
   loadPersistedReviewThreads,
   restoreChatAgentState,
   replaceAttachedSources,
+  rotateChatSessionWithSummary,
   runChatAgentTurn,
   syncBagFromDocument,
   type ChatAgentState,
 } from "./chat-agent.js";
+import { applyConversationNote, decisionConversationNote } from "./conversation-notes.js";
 import { buildLlmSettingsUpdate } from "./llm-settings-patch.js";
 import { ChatMemory } from "./chat-memory.js";
 import {
@@ -202,6 +207,13 @@ type AppState = {
   agent: ChatAgentState;
   reviewThreads: PersistedReviewThread[];
 };
+
+/** Test seam: populated once the server is listening (index-race.test.ts). */
+export const runtime: {
+  app?: ReturnType<typeof Fastify>;
+  state?: AppState;
+  enqueueChat?: <T>(fn: () => Promise<T>) => Promise<T>;
+} = {};
 
 function requireAuth(state: AppState, header?: string) {
   if (!header || header !== `Bearer ${state.token}`) {
@@ -676,6 +688,9 @@ async function main() {
       reasoningOptIn?: boolean;
       reasoningMode?: "auto" | "fast" | "standard" | "deep" | null;
       harnessId?: string | null;
+      agentTimeoutMs?: number | null;
+      /** Automatic context compaction toggle; null clears back to default. */
+      compactionAuto?: boolean | null;
     };
   }>("/api/v1/settings/llm", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
@@ -1093,19 +1108,24 @@ async function main() {
     Body: { kind: "Y" | "N" | "E"; editedText?: string; reason?: string };
   }>("/api/v1/proposals/:id/decision", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
-    try {
-      getProposal(workspace, req.params.id);
-      const decision = saveDecision(
-        workspace,
-        req.params.id,
-        req.body.kind,
-        req.body.editedText,
-        req.body.reason,
-      );
-      return { decision };
-    } catch (e) {
-      return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) });
-    }
+    // I1: decision notes + persistSession mutate the chat agent state; serialize with chat turns.
+    return enqueueChat(async () => {
+      try {
+        const proposal = getProposal(workspace, req.params.id);
+        const decision = saveDecision(
+          workspace,
+          req.params.id,
+          req.body.kind,
+          req.body.editedText,
+          req.body.reason,
+        );
+        appendConversationNote(state.agent, decisionConversationNote(proposal, decision));
+        persistSession();
+        return { decision };
+      } catch (e) {
+        return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) });
+      }
+    });
   });
 
   app.post<{
@@ -1113,22 +1133,34 @@ async function main() {
     Body: { expectedRevision: number; expectedHash: string; proposalIds?: string[] };
   }>("/api/v1/documents/:id/apply", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
-    if (!Array.isArray(req.body.proposalIds) || req.body.proposalIds.length === 0) {
-      return reply.code(400).send({ error: "proposalIds must be a non-empty explicit list" });
-    }
-    const result = await applyApproved(
-      workspace,
-      req.params.id,
-      req.body.expectedRevision,
-      req.body.expectedHash,
-      Array.isArray(req.body.proposalIds)
-        ? req.body.proposalIds.filter((id): id is string => typeof id === "string").slice(0, 100)
-        : undefined,
-    );
-    if (!result.ok) return reply.code(409).send(result);
-    syncBagFromDocument(state.agent, result.document, result.blocks);
-    persistSession();
-    return result;
+    // I1: apply mutates the bag and appends agent notes; serialize with chat turns.
+    return enqueueChat(async () => {
+      if (!Array.isArray(req.body.proposalIds) || req.body.proposalIds.length === 0) {
+        return reply.code(400).send({ error: "proposalIds must be a non-empty explicit list" });
+      }
+      const result = await applyApproved(
+        workspace,
+        req.params.id,
+        req.body.expectedRevision,
+        req.body.expectedHash,
+        Array.isArray(req.body.proposalIds)
+          ? req.body.proposalIds.filter((id): id is string => typeof id === "string").slice(0, 100)
+          : undefined,
+      );
+      if (!result.ok) return reply.code(409).send(result);
+      syncBagFromDocument(state.agent, result.document, result.blocks);
+      const requestedApplyIds = new Set(req.body.proposalIds);
+      const appliedProposals = listProposals(workspace, req.params.id).filter(
+        (proposal) =>
+          requestedApplyIds.has(proposal.id) &&
+          ["Y", "E"].includes(getLatestDecision(workspace, proposal.id)?.kind ?? ""),
+      );
+      if (appliedProposals.length) {
+        appendConversationNote(state.agent, applyConversationNote(appliedProposals));
+      }
+      persistSession();
+      return result;
+    });
   });
 
   app.get<{ Params: { id: string } }>("/api/v1/documents/:id/exports", async (req) => {
@@ -1179,12 +1211,32 @@ async function main() {
     requireAuth(state, req.headers.authorization);
     await enqueueChat(async () => {
       mcpApprovalRegistry.denyAllForSession(state.agent.sessionId, "session-switch");
-      archiveCurrentSession();
+      rotateChatSessionWithSummary(workspace, state.agent, state.chat.list().length > 0);
       state.chat.clear();
-      clearChatAgentConversation(state.agent);
       persistSession();
     });
     return sessionPayload();
+  });
+
+  /** Manual context compaction: force-summarize the current transcript. */
+  app.post("/api/v1/sessions/compact", async (req, reply) => {
+    requireAuth(state, req.headers.authorization);
+    try {
+      return await enqueueChat(async () => {
+        const result = await compactChatAgentConversation({
+          workspace,
+          agentState: state.agent,
+          chat: state.chat,
+          harnessId: resolveHarnessId(),
+        });
+        persistSession();
+        return result;
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status = error instanceof ManualCompactionError ? 409 : 500;
+      return reply.code(status).send({ error: message });
+    }
   });
 
   app.post<{ Body: { sessionId?: string } }>("/api/v1/sessions/switch", async (req, reply) => {
@@ -1388,71 +1440,78 @@ async function main() {
     };
   }>("/api/v1/proposals/:id/resolve", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
-    let claimed = false;
-    let applied = false;
-    try {
-      const proposal = getProposal(workspace, req.params.id);
-      if (req.body.documentId !== proposal.documentId) {
-        return reply.code(409).send({ ok: false, reason: "document_mismatch" });
-      }
-      if (proposal.status !== "proposed") {
-        const previousDecision = getLatestDecision(workspace, proposal.id);
-        const previousApply = getLatestProposalApplyEvent(workspace, proposal.id);
-        const sameDecision = previousDecision?.kind === req.body.kind &&
-          (req.body.kind !== "E" || previousDecision.editedText === req.body.editedText);
-        if (sameDecision && req.body.kind === "N" && proposal.status === "superseded") {
-          return { ok: true, rejected: true, decision: previousDecision, replayed: true };
+    // I1: resolve mutates the bag, appends agent notes and persists; serialize with chat turns.
+    return enqueueChat(async () => {
+      let claimed = false;
+      let applied = false;
+      try {
+        const proposal = getProposal(workspace, req.params.id);
+        if (req.body.documentId !== proposal.documentId) {
+          return reply.code(409).send({ ok: false, reason: "document_mismatch" });
         }
-        if (
-          sameDecision &&
-          previousApply?.ok &&
-          previousApply.decisionId === previousDecision?.id
-        ) {
-          return {
-            ok: true,
-            document: getDocument(workspace, proposal.documentId),
-            blocks: listBlocks(workspace, proposal.documentId),
-            decision: previousDecision,
-            replayed: true,
-          };
+        if (proposal.status !== "proposed") {
+          const previousDecision = getLatestDecision(workspace, proposal.id);
+          const previousApply = getLatestProposalApplyEvent(workspace, proposal.id);
+          const sameDecision = previousDecision?.kind === req.body.kind &&
+            (req.body.kind !== "E" || previousDecision.editedText === req.body.editedText);
+          if (sameDecision && req.body.kind === "N" && proposal.status === "superseded") {
+            return { ok: true, rejected: true, decision: previousDecision, replayed: true };
+          }
+          if (
+            sameDecision &&
+            previousApply?.ok &&
+            previousApply.decisionId === previousDecision?.id
+          ) {
+            return {
+              ok: true,
+              document: getDocument(workspace, proposal.documentId),
+              blocks: listBlocks(workspace, proposal.documentId),
+              decision: previousDecision,
+              replayed: true,
+            };
+          }
+          return reply.code(409).send({
+            ok: false,
+            reason: proposal.status === "decided" ? "proposal_resolving" : "proposal_already_resolved",
+          });
         }
-        return reply.code(409).send({
-          ok: false,
-          reason: proposal.status === "decided" ? "proposal_resolving" : "proposal_already_resolved",
-        });
+        const decision = saveDecision(
+          workspace,
+          proposal.id,
+          req.body.kind,
+          req.body.editedText,
+          req.body.reason,
+        );
+        claimed = true;
+        if (decision.kind === "N") {
+          rejectProposal(workspace, proposal, decision);
+          appendConversationNote(state.agent, decisionConversationNote(proposal, decision));
+          persistSession();
+          return { ok: true, rejected: true, decision };
+        }
+        const result = await applyApproved(
+          workspace,
+          proposal.documentId,
+          req.body.expectedRevision,
+          req.body.expectedHash,
+          [proposal.id],
+        );
+        if (!result.ok) {
+          reopenProposal(workspace, proposal.id);
+          claimed = false;
+          return reply.code(409).send(result);
+        }
+        applied = true;
+        syncBagFromDocument(state.agent, result.document, result.blocks);
+        appendConversationNote(state.agent, decisionConversationNote(proposal, decision));
+        appendConversationNote(state.agent, applyConversationNote([proposal]));
+        persistSession();
+        return { ...result, decision };
+      } catch (error) {
+        if (claimed && !applied) reopenProposal(workspace, req.params.id);
+        return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
       }
-      const decision = saveDecision(
-        workspace,
-        proposal.id,
-        req.body.kind,
-        req.body.editedText,
-        req.body.reason,
-      );
-      claimed = true;
-      if (decision.kind === "N") {
-        rejectProposal(workspace, proposal, decision);
-        return { ok: true, rejected: true, decision };
-      }
-      const result = await applyApproved(
-        workspace,
-        proposal.documentId,
-        req.body.expectedRevision,
-        req.body.expectedHash,
-        [proposal.id],
-      );
-      if (!result.ok) {
-        reopenProposal(workspace, proposal.id);
-        claimed = false;
-        return reply.code(409).send(result);
-      }
-      applied = true;
-      syncBagFromDocument(state.agent, result.document, result.blocks);
-      persistSession();
-      return { ...result, decision };
-    } catch (error) {
-      if (claimed && !applied) reopenProposal(workspace, req.params.id);
-      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
-    }
+    });
   });
 
   app.delete("/api/v1/session/document", async (req) => {
@@ -1891,6 +1950,9 @@ async function main() {
   process.on("SIGTERM", () => void shutdown());
 
   await app.listen({ port, host: "127.0.0.1" });
+  runtime.app = app;
+  runtime.state = state;
+  runtime.enqueueChat = enqueueChat;
   const url = `http://127.0.0.1:${port}/#token=${token}`;
   console.log(`Margin Agent (local)`);
   console.log(`  workspace: ${workspacePath}`);

@@ -182,4 +182,79 @@ describe("reasoning fields", () => {
     await saveLlmSettings(root, buildLlmSettingsUpdate({ reasoningMode: null }, before.id));
     expect(readLlmSettingsStore(root).reasoningMode).toBeUndefined();
   });
+
+  it("threads an agent timeout without touching the provider patch", () => {
+    const update = buildLlmSettingsUpdate({ agentTimeoutMs: 180_000 }, "custom");
+    expect(update.agentTimeoutMs).toBe(180_000);
+    expect(update.provider).toBeUndefined();
+  });
+
+  it("persists and clears an agent timeout through the update flow", async () => {
+    const before = activeProfile(readLlmSettingsStore(root));
+    await saveLlmSettings(
+      root,
+      buildLlmSettingsUpdate({ agentTimeoutMs: 240_000 }, before.id),
+    );
+    expect(readLlmSettingsStore(root).agentTimeoutMs).toBe(240_000);
+
+    await saveLlmSettings(root, buildLlmSettingsUpdate({ agentTimeoutMs: null }, before.id));
+    expect(readLlmSettingsStore(root).agentTimeoutMs).toBeUndefined();
+  });
+
+  it("surfaces validation errors for invalid agent timeouts", async () => {
+    const before = activeProfile(readLlmSettingsStore(root));
+    await expect(
+      saveLlmSettings(root, buildLlmSettingsUpdate({ agentTimeoutMs: 500 }, before.id)),
+    ).rejects.toThrow(/agentTimeoutMs|超时/);
+  });
+
+  it("threads a context tier without touching the provider patch", () => {
+    const update = buildLlmSettingsUpdate({ contextTier: "max" }, "custom");
+    expect(update.contextTier).toBe("max");
+    expect(update.provider).toBeUndefined();
+  });
+
+  it("persists and clears a context tier through the update flow", async () => {
+    const before = activeProfile(readLlmSettingsStore(root));
+    await saveLlmSettings(
+      root,
+      buildLlmSettingsUpdate({ contextTier: "eco" }, before.id),
+    );
+    expect(readLlmSettingsStore(root).contextTier).toBe("eco");
+
+    await saveLlmSettings(root, buildLlmSettingsUpdate({ contextTier: null }, before.id));
+    expect(readLlmSettingsStore(root).contextTier).toBeUndefined();
+  });
+
+  it("surfaces validation errors for invalid context tiers", async () => {
+    const before = activeProfile(readLlmSettingsStore(root));
+    await expect(
+      saveLlmSettings(root, buildLlmSettingsUpdate({ contextTier: "ludicrous" as never }, before.id)),
+    ).rejects.toThrow(/contextTier/);
+  });
+
+  it("threads compactionAuto without touching the provider patch", () => {
+    const update = buildLlmSettingsUpdate({ compactionAuto: false }, "custom");
+    expect(update.compactionAuto).toBe(false);
+    expect(update.provider).toBeUndefined();
+  });
+
+  it("persists and clears compactionAuto through the update flow", async () => {
+    const before = activeProfile(readLlmSettingsStore(root));
+    await saveLlmSettings(
+      root,
+      buildLlmSettingsUpdate({ compactionAuto: false }, before.id),
+    );
+    expect(readLlmSettingsStore(root).compactionAuto).toBe(false);
+
+    await saveLlmSettings(root, buildLlmSettingsUpdate({ compactionAuto: null }, before.id));
+    expect(readLlmSettingsStore(root).compactionAuto).toBeUndefined();
+  });
+
+  it("surfaces validation errors for invalid compactionAuto values", async () => {
+    const before = activeProfile(readLlmSettingsStore(root));
+    await expect(
+      saveLlmSettings(root, buildLlmSettingsUpdate({ compactionAuto: "yes" as never }, before.id)),
+    ).rejects.toThrow(/compactionAuto/);
+  });
 });

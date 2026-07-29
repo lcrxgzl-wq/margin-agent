@@ -23,6 +23,12 @@ export type LlmSettingsPutBody = {
   reasoningOptIn?: boolean;
   reasoningMode?: "auto" | "fast" | "standard" | "deep" | null;
   harnessId?: string | null;
+  /** Pi session timeout in ms; null clears back to the default. */
+  agentTimeoutMs?: number | null;
+  /** Context budget tier; null clears back to the default (standard). */
+  contextTier?: "eco" | "standard" | "max" | null;
+  /** Automatic context compaction; null clears back to the default (on). */
+  compactionAuto?: boolean | null;
 };
 
 /**
@@ -58,6 +64,9 @@ export function buildLlmSettingsUpdate(
     clearApiKey: !!body.clearApiKey,
     harnessId,
     reasoningMode: body.reasoningMode,
+    agentTimeoutMs: body.agentTimeoutMs,
+    contextTier: body.contextTier,
+    compactionAuto: body.compactionAuto,
     provider: Object.keys(defined).length
       ? { ...defined, id: activeProviderId }
       : undefined,
