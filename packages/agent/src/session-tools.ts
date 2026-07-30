@@ -40,7 +40,10 @@ export type WorkspaceBridge = {
     relativePath: string,
     content: string,
   ) => Promise<{ relativePath: string; bytes: number; created: boolean }>;
-  openDocument: (relativePath: string) => {
+  openDocument: (relativePath: string) => Promise<{
+    document: DocumentMeta;
+    blocks: BlockSnapshot[];
+  }> | {
     document: DocumentMeta;
     blocks: BlockSnapshot[];
   };
@@ -281,14 +284,14 @@ export function createSessionTools(
     name: "open_document",
     label: "Open Document",
     description:
-      "Open a Markdown document into the editor session so paper tools can run. Does not apply edits.",
+      "Open a Markdown or DOCX document into the editor session so paper tools can run. Does not apply edits.",
     parameters: Type.Object({
       relativePath: Type.String(),
     }),
     executionMode: "sequential",
     execute: async (_id, raw) => {
       const params = raw as { relativePath: string };
-      const opened = bridge.openDocument(String(params.relativePath));
+      const opened = await bridge.openDocument(String(params.relativePath));
       bag.documentId = opened.document.id;
       bag.revision = opened.document.revision;
       bag.relativePath = opened.document.relativePath;

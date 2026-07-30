@@ -3,6 +3,8 @@ import {
   canApplyDocumentImportResponse,
   canApplyDocumentResponse,
   confirmDocumentReplacement,
+  isDocumentReplacementChatIntent,
+  isWorkspaceListChatIntent,
   sameDocumentIdentity,
   shouldPreserveDirtyDocumentOnImport,
   UNSAVED_DOCUMENT_REPLACEMENT_MESSAGE,
@@ -124,5 +126,18 @@ describe("document replacement safety", () => {
       requestGeneration: 1,
       currentGeneration: 1,
     })).toBe(false);
+  });
+
+  it("allows list intents while dirty without treating them as replacements", () => {
+    expect(isWorkspaceListChatIntent("有哪些文件")).toBe(true);
+    expect(isWorkspaceListChatIntent("打开文稿")).toBe(true);
+    expect(isDocumentReplacementChatIntent("有哪些文件")).toBe(false);
+    expect(isDocumentReplacementChatIntent("打开文稿")).toBe(false);
+  });
+
+  it("treats open/import document turns as replacement intents", () => {
+    expect(isDocumentReplacementChatIntent("打开 imports/sport value.docx")).toBe(true);
+    expect(isDocumentReplacementChatIntent("打开样章")).toBe(true);
+    expect(isDocumentReplacementChatIntent("open notes.md")).toBe(true);
   });
 });

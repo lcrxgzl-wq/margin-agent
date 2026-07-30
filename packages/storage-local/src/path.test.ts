@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   openWorkspace,
   openDocument,
+  openDocumentFile,
   readWorkspaceText,
   resolveWorkspacePath,
   saveAgentTranscript,
@@ -73,6 +74,20 @@ describe("workspace metadata boundary", () => {
 });
 
 describe("workspace text io", () => {
+  it("rejects non-document sources with a clear open_document error", async () => {
+    const root = tmpWorkspace();
+    fs.writeFileSync(path.join(root, "notes.txt"), "访谈", "utf8");
+    fs.writeFileSync(path.join(root, "paper.pdf"), "%PDF-1.4", "utf8");
+    const ws = await openWorkspace(root);
+    try {
+      await expect(openDocumentFile(ws, "notes.txt")).rejects.toThrow(/read_workspace_file/);
+      await expect(openDocumentFile(ws, "paper.pdf")).rejects.toThrow(/Markdown|Word|docx/i);
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
   it("rejects oversized Markdown before reading it into memory", async () => {
     const root = tmpWorkspace();
     const large = path.join(root, "large.md");

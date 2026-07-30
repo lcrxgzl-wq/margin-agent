@@ -29,6 +29,28 @@ export function confirmDocumentReplacement(
   return !documentDirty || confirm(UNSAVED_DOCUMENT_REPLACEMENT_MESSAGE);
 }
 
+/** Chat turns that only list workspace materials and do not replace the open document. */
+export function isWorkspaceListChatIntent(message: string): boolean {
+  const text = message.trim();
+  if (!text) return false;
+  if (/^(?:打开|open)\s*(文稿|文章|文件|文档|论文)?\s*$/i.test(text)) return true;
+  return (
+    /^(?:请)?(?:列出|查看|显示)(?:一下)?(?:工作区)?(?:有哪些)?(?:文件|文稿|文章)(?:列表)?[。！？!?]?$/i.test(text) ||
+    /^(?:有哪些)(?:文件|文稿|文章)[。！？!?]?$/i.test(text) ||
+    /^(?:list(?:\s+files)?|ls)[.!?]?$/i.test(text)
+  );
+}
+
+/** Chat turns that open/import a document and may discard the current canvas. */
+export function isDocumentReplacementChatIntent(message: string): boolean {
+  const text = message.trim();
+  if (!text || isWorkspaceListChatIntent(text)) return false;
+  if (/^(?:样章|示范|示例)$/.test(text)) return true;
+  if (/^(?:请)?(?:打开|open)\b/i.test(text) || /^(?:请)?打开/.test(text)) return true;
+  if (/(?:导入|import)\b/i.test(text) && /\.docx(?:\b|["'`”》])/i.test(text)) return true;
+  return false;
+}
+
 export function canApplyDocumentImportResponse(
   requestDocumentGeneration: number,
   currentDocumentGeneration: number,

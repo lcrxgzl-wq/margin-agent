@@ -21,10 +21,17 @@ describe("parseOpenIntent", () => {
       relativePath: "fixtures/sample.md",
     });
   });
+
+  it("keeps spaces in DOCX open paths", () => {
+    expect(parseOpenIntent("打开 imports/sport value.docx")).toEqual({
+      kind: "path",
+      relativePath: "imports/sport value.docx",
+    });
+  });
 });
 
 describe("resolveOpenPath", () => {
-  const files = ["fixtures/sample.md", "fixtures/agent-chapter.md", "notes/a.md"];
+  const files = ["fixtures/sample.md", "fixtures/agent-chapter.md", "notes/a.md", "imports/sport value.docx"];
 
   it("resolves basename", () => {
     expect(resolveOpenPath("sample.md", files)).toBe("fixtures/sample.md");
@@ -32,5 +39,9 @@ describe("resolveOpenPath", () => {
 
   it("resolves 样章", () => {
     expect(resolveOpenPath("样章", files)).toBe("fixtures/agent-chapter.md");
+  });
+
+  it("resolves spaced DOCX basename", () => {
+    expect(resolveOpenPath("sport value.docx", files)).toBe("imports/sport value.docx");
   });
 });

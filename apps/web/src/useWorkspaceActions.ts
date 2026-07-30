@@ -34,6 +34,9 @@ import { useRef, useState } from "react";
 import {
   ASYNC_DOCUMENT_CONFLICT_MESSAGE,
   canApplyDocumentResponse,
+  confirmDocumentReplacement,
+  isDocumentReplacementChatIntent,
+  isWorkspaceListChatIntent,
 } from "./documentSafety";
 import { useMarginStore } from "./store";
 import { filterEditableBlockIds, selectionEditUnavailableReason } from "./selectionSafety";
@@ -663,13 +666,29 @@ export function useWorkspaceActions(options?: {
         }
         return;
       }
+      let allowOpenWhileDirty = false;
       if (storeRef.current.documentDirty) {
-        store.appendMessage({
-          id: mid(),
-          role: "assistant",
-          text: "当前文稿有未保存修改，请先保存或撤销；我不会基于后端旧版本继续操作。",
-        });
-        return;
+        if (isWorkspaceListChatIntent(text)) {
+          // Listing materials does not replace the open document.
+        } else if (isDocumentReplacementChatIntent(text)) {
+          if (!confirmDocumentReplacement(true)) {
+            store.appendMessage({
+              id: mid(),
+              role: "assistant",
+              text: "已取消打开；未保存修改仍保留在当前画布。",
+            });
+            return;
+          }
+          // Keep dirty until a successful open replaces the canvas.
+          allowOpenWhileDirty = true;
+        } else {
+          store.appendMessage({
+            id: mid(),
+            role: "assistant",
+            text: "当前文稿有未保存修改，请先保存或撤销；我不会基于后端旧版本继续操作。",
+          });
+          return;
+        }
       }
       if (/接受全部|全部接受|accept\s*all/i.test(text)) return await acceptAll();
       if (/撤回全部|全部撤回|undo\s*all|拒绝全部/i.test(text)) return await undoAll();
@@ -774,7 +793,7 @@ export function useWorkspaceActions(options?: {
           setPendingMcpApproval(null);
         }
         if (done.opened || done.closed) {
-          assertDocumentResponseCurrent(requestDocument, generation);
+          assertDocumentResponseCurrent(requestDocument, generation, allowOpenWhileDirty);
         }
         const switchedDocument =
           !!requestDocument && !!done.opened && requestDocument.id !== done.opened.document.id;

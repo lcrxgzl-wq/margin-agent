@@ -17,7 +17,7 @@ describe("PolicyRouter (full Pi)", () => {
     });
   });
 
-  it.each(["有哪些文件", "列出工作区文件", "list files", "ls", "打开样章", "打开 notes/a.md"])(
+  it.each(["有哪些文件", "列出工作区文件", "list files", "ls", "打开样章", "打开 notes/a.md", '打开 "sport value.docx"', "读取 notes/a.md", "open paper.md"])(
     "routes deterministic host command %s without invoking Pi",
     (message) => {
       expect(decideRoute({ message, ...credentials })).toEqual({

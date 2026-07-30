@@ -12,6 +12,7 @@ import { runPiAgentLoop, type ToolAuditEvent } from "./pi-loop.js";
 import type { CompactionEvent } from "./compaction.js";
 import { assertPiLoopCompleted } from "./pi-outcome.js";
 import { decideRoute } from "./policy/router.js";
+import { parseOpenIntent, parseReadIntent, resolveOpenPath } from "./policy/open-intent-rule.js";
 import { isUserFacingPhase, toolPhaseLabel } from "./progress.js";
 import type { Draft } from "./pi-tools.js";
 import {
@@ -533,7 +534,11 @@ export async function runOfflineSessionTurn(
     });
   }
 
-  if (/有哪些|列出|list|ls|文件列表|文章列表|打开文稿|打开文章|打开文件/i.test(msg) && !/打开\s+\S+\.md/i.test(msg) && !/样章/.test(msg)) {
+  const openIntent = parseOpenIntent(msg);
+  const listIntent =
+    openIntent.kind === "list" ||
+    (/有哪些|列出|list|ls|文件列表|文章列表/i.test(msg) && openIntent.kind !== "path");
+  if (listIntent) {
     const result = await call("list_workspace_files");
     const text = result.content[0] && "text" in result.content[0] ? result.content[0].text : "";
     const files = (JSON.parse(text) as { files: string[] }).files;
@@ -543,20 +548,26 @@ export async function runOfflineSessionTurn(
             .slice(0, 40)
             .map((f) => `· ${f}`)
             .join("\n")}\n\n可以说「打开样章」或「打开 …」。`
-        : "工作区里还没有 Markdown、TXT 或 CSV 资料。",
+        : "工作区里还没有 Markdown、TXT、CSV、PDF 或 DOCX 资料。",
       proposals: [],
       comments: [],
     });
   }
 
-  if (/样章|agent-chapter/i.test(msg) || /打开\s+/i.test(msg)) {
-    let path = "fixtures/agent-chapter.md";
-    const named = /打开\s+[《"'「]?([^\s》"'」]+)[》"'」]?/i.exec(msg);
-    if (named && !/文稿|文章|文件|文档|论文|样章/.test(named[1])) {
-      path = named[1];
+  if (openIntent.kind === "path") {
+    const listed = await call("list_workspace_files");
+    const listedText = listed.content[0] && "text" in listed.content[0] ? listed.content[0].text : "{}";
+    const files = (JSON.parse(listedText) as { files: string[] }).files;
+    const path = resolveOpenPath(openIntent.relativePath, files) ?? openIntent.relativePath;
+    try {
+      await call("open_document", { relativePath: path });
+    } catch (error) {
+      return finish({
+        reply: `打开失败：${error instanceof Error ? error.message : String(error)}`,
+        proposals: [],
+        comments: [],
+      });
     }
-    if (/样章/.test(msg)) path = "fixtures/agent-chapter.md";
-    await call("open_document", { relativePath: path });
     return finish({
       reply: effects.opened
         ? `已打开《${effects.opened.document.relativePath.replace(/^.*\//, "")}》（${effects.opened.blocks.length} 段）。选中一段可以说「重写」。`
@@ -567,30 +578,40 @@ export async function runOfflineSessionTurn(
     });
   }
 
-  const readMatch = /(?:读取|读一下|read)\s+(\S+)/i.exec(msg);
-  if (readMatch) {
-    const result = await call("read_workspace_file", {
-      relativePath: readMatch[1],
-    });
-    const text = result.content[0] && "text" in result.content[0]
-      ? result.content[0].text
-      : "{}";
-    const file = JSON.parse(text) as {
-      relativePath: string;
-      text: string;
-      hasMore: boolean;
-      nextOffset: number;
-    };
-    const preview = file.text.length > 1200
-      ? `${file.text.slice(0, 1200)}\n…`
-      : file.text;
-    return finish({
-      reply: `已读取 ${file.relativePath}：\n\n${preview}${
-        file.hasMore ? `\n\n还有后续内容（nextOffset: ${file.nextOffset}）。` : ""
-      }`,
-      proposals: [],
-      comments: [],
-    });
+  const readPath = parseReadIntent(msg);
+  if (readPath) {
+    const listed = await call("list_workspace_files");
+    const listedText = listed.content[0] && "text" in listed.content[0] ? listed.content[0].text : "{}";
+    const files = (JSON.parse(listedText) as { files: string[] }).files;
+    const relativePath = resolveOpenPath(readPath, files) ?? readPath;
+    try {
+      const result = await call("read_workspace_file", { relativePath });
+      const text = result.content[0] && "text" in result.content[0]
+        ? result.content[0].text
+        : "{}";
+      const file = JSON.parse(text) as {
+        relativePath: string;
+        text: string;
+        hasMore: boolean;
+        nextOffset: number;
+      };
+      const preview = file.text.length > 1200
+        ? `${file.text.slice(0, 1200)}\n…`
+        : file.text;
+      return finish({
+        reply: `已读取 ${file.relativePath}：\n\n${preview}${
+          file.hasMore ? `\n\n还有后续内容（nextOffset: ${file.nextOffset}）。` : ""
+        }`,
+        proposals: [],
+        comments: [],
+      });
+    } catch (error) {
+      return finish({
+        reply: `读取失败：${error instanceof Error ? error.message : String(error)}`,
+        proposals: [],
+        comments: [],
+      });
+    }
   }
 
   const writeMatch = /^(?:新建|写入|创建)\s+([^\s：:]+)(?:\s*[：:]\s*|\n+)([\s\S]+)$/i.exec(msg);

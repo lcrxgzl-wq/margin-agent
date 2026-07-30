@@ -79,7 +79,9 @@ export {
 } from "./policy/router.js";
 export {
   parseOpenIntent,
+  parseReadIntent,
   resolveOpenPath,
+  unwrapPathToken,
   type OpenIntent,
 } from "./policy/open-intent-rule.js";
 export {

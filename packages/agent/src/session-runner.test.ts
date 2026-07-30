@@ -110,6 +110,97 @@ describe("session assistant text boundaries", () => {
   });
 });
 
+describe("runOfflineSessionTurn open intents", () => {
+  it("opens spaced DOCX paths and returns a soft error for PDF", async () => {
+    const opened: string[] = [];
+    const localBridge: WorkspaceBridge = {
+      listSourceFiles: () => ["imports/sport value.docx", "notes/report.pdf"],
+      readText: () => {
+        throw new Error("unused");
+      },
+      writeText: async () => {
+        throw new Error("unused");
+      },
+      openDocument: async (relativePath) => {
+        opened.push(relativePath);
+        if (relativePath.endsWith(".pdf")) {
+          throw new Error(
+            "open_document only supports Markdown (.md/.markdown) and Word (.docx); use read_workspace_file for pdf/txt/csv",
+          );
+        }
+        return {
+          document: {
+            id: "doc-1",
+            relativePath,
+            revision: 0,
+            contentHash: "hash",
+            updatedAt: "2026-07-30T00:00:00.000Z",
+          },
+          blocks: [
+            {
+              id: "b1",
+              kind: "paragraph",
+              text: "body",
+              order: 0,
+              contentHash: "b1",
+            },
+          ],
+        };
+      },
+    };
+
+    const openedTurn = await runOfflineSessionTurn({
+      message: '打开 "imports/sport value.docx"',
+      bridge: localBridge,
+      bag: { revision: 0, blocks: [] },
+    });
+    expect(opened).toEqual(["imports/sport value.docx"]);
+    expect(openedTurn.opened?.document.relativePath).toBe("imports/sport value.docx");
+    expect(openedTurn.reply).toContain("已打开");
+
+    const pdfTurn = await runOfflineSessionTurn({
+      message: "打开 notes/report.pdf",
+      bridge: localBridge,
+      bag: { revision: 0, blocks: [] },
+    });
+    expect(pdfTurn.opened).toBeUndefined();
+    expect(pdfTurn.reply).toMatch(/打开失败：.*read_workspace_file/);
+  });
+
+  it("opens after 打开文件 phrasing instead of listing", async () => {
+    const opened: string[] = [];
+    const localBridge: WorkspaceBridge = {
+      listSourceFiles: () => ["paper.md"],
+      readText: () => {
+        throw new Error("unused");
+      },
+      writeText: async () => {
+        throw new Error("unused");
+      },
+      openDocument: async (relativePath) => {
+        opened.push(relativePath);
+        return {
+          document: {
+            id: "doc-md",
+            relativePath,
+            revision: 0,
+            contentHash: "hash",
+            updatedAt: "2026-07-30T00:00:00.000Z",
+          },
+          blocks: [],
+        };
+      },
+    };
+    const turn = await runOfflineSessionTurn({
+      message: "打开文件 paper.md",
+      bridge: localBridge,
+      bag: { revision: 0, blocks: [] },
+    });
+    expect(opened).toEqual(["paper.md"]);
+    expect(turn.opened?.document.relativePath).toBe("paper.md");
+  });
+});
+
 describe("runPiSessionTurn proposal status hint", () => {
   it("injects the proposal hint next to docHint when provided", async () => {
     await runPiSessionTurn({

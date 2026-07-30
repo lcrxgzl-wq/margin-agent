@@ -1,6 +1,55 @@
 import { describe, expect, it } from "vitest";
 import { createSessionTools, type SessionDocBag } from "./session-tools.js";
 
+describe("open_document", () => {
+  it("awaits async bridge opens for DOCX paths", async () => {
+    const bag: SessionDocBag = { revision: 0, blocks: [] };
+    const tools = createSessionTools(
+      {
+        listSourceFiles: () => ["paper.docx"],
+        readText: () => ({ relativePath: "", text: "", bytes: 0 }),
+        writeText: async () => ({ relativePath: "", bytes: 0, created: false }),
+        openDocument: async (relativePath) => {
+          expect(relativePath).toBe("paper.docx");
+          return {
+            document: {
+              id: "doc-docx",
+              relativePath: "paper.docx",
+              revision: 0,
+              contentHash: "hash",
+              updatedAt: "2026-07-30T00:00:00.000Z",
+            },
+            blocks: [
+              {
+                id: "b1",
+                kind: "paragraph",
+                text: "From DOCX",
+                order: 0,
+                contentHash: "b1",
+              },
+            ],
+          };
+        },
+      },
+      bag,
+      [],
+      [],
+      {},
+    );
+    const open = tools.find((t) => t.name === "open_document")!;
+    const result = await open.execute("1", { relativePath: "paper.docx" });
+    expect(JSON.parse((result.content[0] as { text: string }).text)).toMatchObject({
+      ok: true,
+      relativePath: "paper.docx",
+      documentId: "doc-docx",
+      blockCount: 1,
+    });
+    expect(bag.documentId).toBe("doc-docx");
+    expect(bag.relativePath).toBe("paper.docx");
+    expect(bag.blocks).toHaveLength(1);
+  });
+});
+
 describe("write_workspace_file canonical guard", () => {
   it("refuses overwrite of the open document path", async () => {
     const bag: SessionDocBag = {

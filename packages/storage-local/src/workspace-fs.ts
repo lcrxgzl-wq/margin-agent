@@ -417,9 +417,11 @@ export async function openDocxDocument(ws: Workspace, relativePath: string): Pro
 }
 
 export async function openDocumentFile(ws: Workspace, relativePath: string): Promise<DocumentMeta> {
-  return /\.docx$/i.test(relativePath)
-    ? openDocxDocument(ws, relativePath)
-    : openDocument(ws, relativePath);
+  if (/\.docx$/i.test(relativePath)) return openDocxDocument(ws, relativePath);
+  if (/\.(md|markdown)$/i.test(relativePath)) return openDocument(ws, relativePath);
+  throw new Error(
+    "open_document only supports Markdown (.md/.markdown) and Word (.docx); use read_workspace_file for pdf/txt/csv",
+  );
 }
 
 export function readNativeDocx(ws: Workspace, documentId: string): Buffer {

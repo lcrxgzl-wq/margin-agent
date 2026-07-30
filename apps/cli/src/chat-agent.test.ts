@@ -120,6 +120,37 @@ describe("buildTranscriptPayload", () => {
 });
 
 describe("workspace bridge extensions", () => {
+  it("opens Markdown and DOCX through the agent open_document bridge", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-agent-"));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, "paper.md"), "# Title\n\nBody text.\n", "utf8");
+    const { Document, Packer, Paragraph } = await import("docx");
+    const buffer = Buffer.from(
+      await Packer.toBuffer(
+        new Document({
+          sections: [{ children: [new Paragraph("Native DOCX paragraph")] }],
+        }),
+      ),
+    );
+    fs.writeFileSync(path.join(root, "paper.docx"), buffer);
+    const workspace = await openWorkspace(root);
+    try {
+      const bridge = createWorkspaceBridge(workspace);
+      await expect(bridge.openDocument("paper.md")).resolves.toMatchObject({
+        document: { relativePath: "paper.md" },
+      });
+      await expect(bridge.openDocument("paper.docx")).resolves.toMatchObject({
+        document: { relativePath: "paper.docx" },
+        blocks: expect.arrayContaining([
+          expect.objectContaining({ text: "Native DOCX paragraph" }),
+        ]),
+      });
+    } finally {
+      workspace.db.close();
+      await workspace.releaseLock();
+    }
+  });
+
   it("never exposes configured MCP tools to the agent bridge", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-agent-"));
     dirs.push(root);

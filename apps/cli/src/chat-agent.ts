@@ -32,7 +32,7 @@ import {
   listRegisteredDocumentPaths,
   loadAgentSession,
   loadAgentSessionEnvelope,
-  openDocument,
+  openDocumentFile,
   readWorkspaceSource,
   readLlmSettingsStore,
   readSkillSettings,
@@ -218,8 +218,8 @@ export function createWorkspaceBridge(workspace: Workspace): WorkspaceBridge {
       assertNotRegisteredDocumentWrite(workspace, relativePath);
       return writeWorkspaceText(workspace, relativePath, content);
     },
-    openDocument: (relativePath) => {
-      const document = openDocument(workspace, relativePath.replace(/\\/g, "/"));
+    openDocument: async (relativePath) => {
+      const document = await openDocumentFile(workspace, relativePath.replace(/\\/g, "/"));
       const blocks = listBlocks(workspace, document.id);
       return { document, blocks };
     },
