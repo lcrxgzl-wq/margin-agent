@@ -88,6 +88,7 @@ export {
   runSessionTurn,
   runPiSessionTurn,
   runOfflineSessionTurn,
+  composeVisibleReply,
 } from "./session-runner.js";
 export { createSessionTools } from "./session-tools.js";
 export {

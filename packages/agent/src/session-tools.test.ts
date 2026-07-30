@@ -292,3 +292,41 @@ describe("profile capability boundary", () => {
     expect(written).toEqual(["notes/approved.md"]);
   });
 });
+
+describe("finish_turn summary host wiring", () => {
+  it("stores finish_turn.summary on session effects for the visible reply", async () => {
+    const effects: import("./session-tools.js").SessionSideEffects = {};
+    const tools = createSessionTools(
+      {
+        listSourceFiles: () => [],
+        readText: () => ({ relativePath: "", text: "", bytes: 0 }),
+        writeText: async () => ({ relativePath: "", bytes: 0, created: false }),
+        openDocument: () => {
+          throw new Error("unused");
+        },
+      },
+      {
+        documentId: "doc-1",
+        revision: 1,
+        relativePath: "paper.md",
+        blocks: [
+          {
+            id: "b1",
+            kind: "paragraph",
+            text: "一段正文",
+            order: 0,
+            contentHash: "h1",
+          },
+        ],
+      },
+      [],
+      [],
+      effects,
+    );
+    const finish = tools.find((tool) => tool.name === "finish_turn")!;
+    await finish.execute("fin", {
+      summary: "拒稿点一：摘要承诺未被方法章兑现。",
+    });
+    expect(effects.finishSummary).toBe("拒稿点一：摘要承诺未被方法章兑现。");
+  });
+});

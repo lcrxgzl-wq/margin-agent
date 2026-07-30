@@ -238,6 +238,18 @@ function explicitlyRequestedWorkspaceWritePaths(message: string): string[] {
   return [...new Set(paths)];
 }
 
+/** Merge assistant speech with finish_turn.summary into the user-visible reply. */
+export function composeVisibleReply(assistantText: string, finishSummary?: string): string {
+  const spoken = assistantText.trim();
+  const summary = (finishSummary ?? "").trim();
+  if (!summary) return spoken;
+  if (!spoken) return summary;
+  if (spoken.includes(summary) || summary.includes(spoken)) {
+    return spoken.length >= summary.length ? spoken : summary;
+  }
+  return `${spoken}\n\n${summary}`;
+}
+
 function extractAssistantText(messages: AgentMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i] as { role?: string; content?: unknown };
@@ -405,9 +417,10 @@ export async function runPiSessionTurn(
   });
   assertPiLoopCompleted(result, "pi session");
 
-  let reply = stripLiteralThinkingBlocks(
+  const spoken = stripLiteralThinkingBlocks(
     extractAssistantText(result.messages) || result.streamedText,
   );
+  let reply = composeVisibleReply(spoken, effects.finishSummary);
   if (!reply) {
     if (effects.opened) {
       reply = `已打开《${effects.opened.document.relativePath.replace(/^.*\//, "")}》（${effects.opened.blocks.length} 段）。`;
@@ -421,8 +434,15 @@ export async function runPiSessionTurn(
       reply = "本轮已结束。若要继续，直接说下一步。";
     }
     await emitTextChunks(reply, input.onDelta, { chunkSize: 64, delayMs: 8 });
-  } else if (!result.streamedText && reply) {
+  } else if (!result.streamedText?.trim()) {
     await emitTextChunks(reply, input.onDelta, { chunkSize: 64, delayMs: 8 });
+  } else if (reply !== spoken) {
+    const suffix = reply.startsWith(spoken)
+      ? reply.slice(spoken.length)
+      : `\n\n${(effects.finishSummary ?? "").trim()}`;
+    if (suffix.trim()) {
+      await emitTextChunks(suffix, input.onDelta, { chunkSize: 64, delayMs: 8 });
+    }
   }
 
   const heuristicComments = getHeuristicComments(undefined, input.harnessId);

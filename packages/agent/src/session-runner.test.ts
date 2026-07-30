@@ -28,6 +28,7 @@ vi.mock("./resolve-model.js", () => ({
 const {
   runOfflineSessionTurn,
   runPiSessionTurn,
+  composeVisibleReply,
   CONTEXT_TIER_PRESETS,
 } = await import("./session-runner.js");
 
@@ -62,6 +63,27 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+describe("composeVisibleReply", () => {
+  it("uses finish_turn.summary when assistant text is empty", () => {
+    expect(composeVisibleReply("", "完整结构分析")).toBe("完整结构分析");
+  });
+
+  it("keeps assistant text when summary is empty", () => {
+    expect(composeVisibleReply("短状态", "")).toBe("短状态");
+  });
+
+  it("appends a distinct summary after spoken status text", () => {
+    expect(composeVisibleReply("我继续推进结构判断。", "一、拒稿点\n二、重排方案")).toBe(
+      "我继续推进结构判断。\n\n一、拒稿点\n二、重排方案",
+    );
+  });
+
+  it("does not duplicate when summary is already inside spoken text", () => {
+    const body = "完整结构分析已经在正文里。";
+    expect(composeVisibleReply(body, "完整结构分析已经在正文里。")).toBe(body);
+  });
 });
 
 describe("session assistant text boundaries", () => {

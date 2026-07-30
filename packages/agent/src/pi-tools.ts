@@ -49,6 +49,8 @@ export type PaperToolContext = {
   ) => { address: string; text: string } | undefined | Promise<{ address: string; text: string } | undefined>;
   /** Host collector for review-only cell patches. These drafts are never added to block proposals. */
   onTableCellProposal?: (proposal: TableCellProposalDraft) => void;
+  /** Host collector for finish_turn.summary so it can become user-visible reply text. */
+  onFinishSummary?: (summary: string) => void;
 };
 
 function normalizeSourcePath(value: string): string {
@@ -634,26 +636,33 @@ export function createCorePaperTools(
     name: "finish_turn",
     label: "Finish Turn",
     description:
-      "End this agent turn after tools. Optional summary becomes part of the user-visible reply. Host persists proposals.",
+      "End this agent turn after tools. Put the full user-facing analysis in normal assistant text first. Optional summary is a short closing note (1-3 sentences) that the host appends if needed — never put the long analysis only in summary. Host persists proposals.",
     parameters: Type.Object({
-      summary: Type.Optional(Type.String()),
+      summary: Type.Optional(
+        Type.String({
+          description:
+            "Brief closing note only. Long structure/argument analysis must already be in assistant text.",
+        }),
+      ),
     }),
     executionMode: "sequential",
     execute: async (_id, raw) => {
       const params = raw as { summary?: string };
+      const summary = String(params.summary ?? "").trim();
+      if (summary) ctx.onFinishSummary?.(summary);
       return {
         content: [
           {
             type: "text",
             text: JSON.stringify({
               ok: true,
-              summary: params.summary ?? "",
+              summary,
               proposalCount: drafts.length + proposedTableCells.size,
               commentCount: comments.length,
             }),
           },
         ],
-        details: { summary: params.summary ?? "" },
+        details: { summary },
         terminate: true,
       };
     },

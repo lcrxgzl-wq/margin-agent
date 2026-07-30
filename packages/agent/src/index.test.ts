@@ -299,11 +299,13 @@ describe("paper tools", () => {
   it("list/get/propose/comment/cite/style/finish without LLM", async () => {
     const drafts: import("./pi-tools.js").Draft[] = [];
     const comments: import("./types.js").AgentComment[] = [];
+    const summaries: string[] = [];
     const tools = createPaperTools(
       {
         getBlocks: () => sampleBlocks,
         getDocumentId: () => "doc1",
         getRevision: () => 3,
+        onFinishSummary: (summary) => summaries.push(summary),
       },
       drafts,
       comments,
@@ -351,8 +353,11 @@ describe("paper tools", () => {
     expect(comments[0]?.ephemeral).toBe(true);
     expect(comments[0]?.severity).toBe("warn");
 
-    const fin = await byName.finish_turn!.execute("6", { summary: "done" });
+    const fin = await byName.finish_turn!.execute("6", {
+      summary: "结构分析长文只应作为收束，不应单独消失。",
+    });
     expect(fin.terminate).toBe(true);
+    expect(summaries).toEqual(["结构分析长文只应作为收束，不应单独消失。"]);
   });
 
   it("omits pack tools for the minimal harness or none pack", () => {

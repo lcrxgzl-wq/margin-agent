@@ -80,6 +80,8 @@ export type SessionSideEffects = {
   loadedSkills?: Array<{ name: string; contentHash: string }>;
   cascadeOffer?: CascadeCandidate[];
   tableCellProposals?: TableCellProposalDraft[];
+  /** Visible closing text from finish_turn.summary. */
+  finishSummary?: string;
 };
 
 export type SessionToolOptions = {
@@ -384,6 +386,9 @@ export function createSessionTools(
         : {}),
       sourcePaths,
       getReadSourceRefs: () => effects.readSourceRefs ?? [],
+      onFinishSummary: (summary) => {
+        effects.finishSummary = summary;
+      },
     },
     drafts,
     comments,
