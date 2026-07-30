@@ -1,6 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { citeCheck, heuristicComments, styleLint } from "../academic.js";
+import { resolveBlockSnapshot } from "../pi-tools.js";
 import type { MarginPack } from "./types.js";
 
 export { citeCheck, heuristicComments, styleLint } from "../academic.js";
@@ -29,10 +30,9 @@ export const academicPack: MarginPack = {
       execute: async (_id, raw) => {
         const blocks = requireBlocks();
         const params = raw as { blockId?: string };
-        const subset = params.blockId ? blocks.filter((b) => b.id === params.blockId) : blocks;
-        if (params.blockId && !subset.length) {
-          throw new Error(`Unknown blockId: ${params.blockId}`);
-        }
+        const subset = params.blockId
+          ? [resolveBlockSnapshot(blocks, String(params.blockId)).block]
+          : blocks;
         const result = citeCheck(subset);
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],
@@ -52,10 +52,9 @@ export const academicPack: MarginPack = {
       execute: async (_id, raw) => {
         const blocks = requireBlocks();
         const params = raw as { blockId?: string };
-        const subset = params.blockId ? blocks.filter((b) => b.id === params.blockId) : blocks;
-        if (params.blockId && !subset.length) {
-          throw new Error(`Unknown blockId: ${params.blockId}`);
-        }
+        const subset = params.blockId
+          ? [resolveBlockSnapshot(blocks, String(params.blockId)).block]
+          : blocks;
         const result = styleLint(subset);
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],

@@ -116,6 +116,84 @@ function normalizedSeverity(value: unknown): "info" | "warn" | undefined {
   return undefined;
 }
 
+function parseOoxmlBodyAddress(blockId: string): { kind: "p" | "t"; bodyIndex: number } | null {
+  const match = /^ooxml-([pt])-(\d+)-/.exec(blockId);
+  if (!match) return null;
+  return { kind: match[1] as "p" | "t", bodyIndex: Number(match[2]) };
+}
+
+function blocksAtOoxmlBodyIndex(
+  blocks: BlockSnapshot[],
+  kind: "p" | "t",
+  bodyIndex: number,
+): BlockSnapshot[] {
+  const prefix = `ooxml-${kind}-${bodyIndex}-`;
+  return blocks.filter((block) => block.id.startsWith(prefix));
+}
+
+function nearestOoxmlBlockIds(
+  blocks: BlockSnapshot[],
+  kind: "p" | "t",
+  bodyIndex: number,
+  limit = 5,
+): string[] {
+  const scored = blocks
+    .map((block) => {
+      const address = parseOoxmlBodyAddress(block.id);
+      if (!address || address.kind !== kind) return null;
+      return { id: block.id, dist: Math.abs(address.bodyIndex - bodyIndex) };
+    })
+    .filter((row): row is { id: string; dist: number } => row != null)
+    .sort((a, b) => a.dist - b.dist || a.id.localeCompare(b.id));
+  const ids: string[] = [];
+  for (const row of scored) {
+    if (!ids.includes(row.id)) ids.push(row.id);
+    if (ids.length >= limit) break;
+  }
+  return ids;
+}
+
+/** Exact id, else unique ooxml-{p|t}-{bodyIndex}-* remap when hash suffix went stale. */
+export function resolveBlockSnapshot(
+  blocks: BlockSnapshot[],
+  blockId: string,
+  opts?: { remapByBodyIndex?: boolean; byId?: Map<string, BlockSnapshot> },
+): { block: BlockSnapshot; remappedFrom?: string } {
+  const exact = opts?.byId?.get(blockId) ?? blocks.find((block) => block.id === blockId);
+  if (exact) return { block: exact };
+  const remap = opts?.remapByBodyIndex !== false;
+  const address = parseOoxmlBodyAddress(blockId);
+  if (remap && address) {
+    const matches = blocksAtOoxmlBodyIndex(blocks, address.kind, address.bodyIndex);
+    if (matches.length === 1) {
+      return { block: matches[0]!, remappedFrom: blockId };
+    }
+  }
+  throw unknownBlockIdError(blocks, blockId);
+}
+
+export function unknownBlockIdError(blocks: BlockSnapshot[], blockId: string): Error {
+  const address = parseOoxmlBodyAddress(blockId);
+  let hint = "Call list_blocks or search_blocks for current ids; do not invent ooxml-* ids.";
+  if (address) {
+    const matches = blocksAtOoxmlBodyIndex(blocks, address.kind, address.bodyIndex);
+    if (matches.length === 1) {
+      hint = `Current id at body index ${address.bodyIndex} is ${matches[0]!.id}. ${hint}`;
+    } else if (matches.length > 1) {
+      hint = `Ambiguous body index ${address.bodyIndex}: ${matches.map((block) => block.id).join(", ")}. ${hint}`;
+    } else {
+      const near = nearestOoxmlBlockIds(blocks, address.kind, address.bodyIndex);
+      hint = near.length
+        ? `No current block at ooxml-${address.kind}-${address.bodyIndex}-*. Nearest: ${near.join(", ")}. ${hint}`
+        : `No ooxml-${address.kind}-* blocks in the open document. ${hint}`;
+    }
+  } else if (blocks.length) {
+    const sample = blocks.slice(0, 5).map((block) => block.id).join(", ");
+    hint = `Sample current ids: ${sample}. ${hint}`;
+  }
+  return new Error(`Unknown blockId: ${blockId}. ${hint}`);
+}
+
 /**
  * Paper tools only — no bash / arbitrary FS / apply / persist.
  * Drafts/comments stay in-memory until host persists.
@@ -126,10 +204,16 @@ export function createCorePaperTools(
   comments: AgentComment[],
 ): AgentTool[] {
   let indexedBlocks: BlockSnapshot[] | null = null;
+  let indexedFingerprint = "";
   let blockById = new Map<string, BlockSnapshot>();
+  const blocksFingerprint = (blocks: BlockSnapshot[]): string =>
+    `${blocks.length}:${blocks[0]?.id ?? ""}:${blocks[blocks.length - 1]?.id ?? ""}:${blocks[0]?.contentHash ?? ""}`;
   const getBlockIndex = (blocks: BlockSnapshot[]): Map<string, BlockSnapshot> => {
-    if (indexedBlocks !== blocks) {
+    const fingerprint = blocksFingerprint(blocks);
+    // bag.blocks is source of truth; rebuild when the array is replaced OR reindexed in place.
+    if (indexedBlocks !== blocks || indexedFingerprint !== fingerprint) {
       indexedBlocks = blocks;
+      indexedFingerprint = fingerprint;
       blockById = new Map(blocks.map((block) => [block.id, block]));
     }
     return blockById;
@@ -189,20 +273,28 @@ export function createCorePaperTools(
   const getBlockTool: AgentTool = {
     name: "get_block",
     label: "Get Block",
-    description: "Full text of one block. Read-only.",
+    description:
+      "Full text of one block. Read-only. Stale ooxml-*-{bodyIndex}-* ids remap to the unique current block at that body index.",
     parameters: Type.Object({
-      blockId: Type.String({ description: "Block id" }),
+      blockId: Type.String({ description: "Block id from list_blocks / outline (current open document)" }),
     }),
     executionMode: "sequential",
     execute: async (_id, raw) => {
       const { blocks } = requireDoc();
       const byId = getBlockIndex(blocks);
       const params = raw as { blockId: string };
-      const block = byId.get(String(params.blockId));
-      if (!block) throw new Error(`Unknown blockId: ${params.blockId}`);
+      const requested = String(params.blockId);
+      const { block, remappedFrom } = resolveBlockSnapshot(blocks, requested, { byId });
+      const payload = remappedFrom
+        ? {
+            ...block,
+            resolvedFrom: remappedFrom,
+            note: "Stale blockId remapped by body index; use id for subsequent tools.",
+          }
+        : block;
       return {
-        content: [{ type: "text", text: JSON.stringify(block) }],
-        details: { blockId: block.id },
+        content: [{ type: "text", text: JSON.stringify(payload) }],
+        details: { blockId: block.id, remappedFrom: remappedFrom ?? null },
       };
     },
   };
@@ -314,9 +406,10 @@ export function createCorePaperTools(
       if (drafts.length >= MAX_PROPOSALS) {
         throw new Error(`proposal cap ${MAX_PROPOSALS} reached`);
       }
-      const blockId = String(params.blockId);
-      const block = byId.get(blockId);
-      if (!block) throw new Error(`Unknown blockId: ${blockId}`);
+      const requestedBlockId = String(params.blockId);
+      const resolved = resolveBlockSnapshot(blocks, requestedBlockId, { byId });
+      const block = resolved.block;
+      const blockId = block.id;
       if (block.kind === "table") {
         throw new Error("Full-table text replacement is forbidden; use propose_table_cell_edit with a Host cell resolver");
       }
@@ -425,9 +518,11 @@ export function createCorePaperTools(
           if (drafts.length + proposedTableCells.size >= MAX_PROPOSALS) {
             throw new Error(`proposal cap ${MAX_PROPOSALS} reached`);
           }
-          const blockId = String(params.blockId);
-          const block = getBlockIndex(blocks).get(blockId);
-          if (!block) throw new Error(`Unknown blockId: ${blockId}`);
+          const byId = getBlockIndex(blocks);
+          const requestedBlockId = String(params.blockId);
+          const resolved = resolveBlockSnapshot(blocks, requestedBlockId, { byId });
+          const block = resolved.block;
+          const blockId = block.id;
           if (block.kind !== "table") throw new Error("propose_table_cell_edit requires a table block");
           assertCanProposeBlock(blockId, scopeOf(ctx));
           const row = Number(params.row);
@@ -513,8 +608,10 @@ export function createCorePaperTools(
       if (comments.length >= MAX_COMMENTS) {
         throw new Error(`comment cap ${MAX_COMMENTS} reached`);
       }
-      const blockId = String(params.blockId);
-      if (!byId.has(blockId)) throw new Error(`Unknown blockId: ${blockId}`);
+      const requestedBlockId = String(params.blockId);
+      const resolved = resolveBlockSnapshot(blocks, requestedBlockId, { byId });
+      const block = resolved.block;
+      const blockId = block.id;
       const text = String(params.text ?? "").trim();
       if (!text) throw new Error("text is empty");
       const comment: AgentComment = {

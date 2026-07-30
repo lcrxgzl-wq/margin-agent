@@ -273,7 +273,7 @@ describe("Pi runtime boundaries", () => {
     expect(mockAgent.abortCalls).toBe(1);
   });
 
-  it("fails the run immediately when a tool returns an error", async () => {
+  it("keeps the run alive when a tool returns an error", async () => {
     const running = runPiAgentLoop({
       prompt: "test",
       systemPrompt: "test",
@@ -283,16 +283,17 @@ describe("Pi runtime boundaries", () => {
     });
     mockAgent.subscriber?.({
       type: "tool_execution_end",
-      toolName: "read_workspace_file",
+      toolName: "get_block",
       isError: true,
-      result: { content: [{ type: "text", text: "file missing" }] },
+      result: { content: [{ type: "text", text: "Unknown blockId: ooxml-p-19-deadbeef" }] },
     });
+    mockAgent.resolvePrompt?.();
 
     await expect(running).resolves.toMatchObject({
-      outcome: "error",
-      notes: ["tool read_workspace_file failed: file missing"],
+      outcome: "completed",
+      notes: ["tool get_block failed: Unknown blockId: ooxml-p-19-deadbeef"],
     });
-    expect(mockAgent.abortCalls).toBe(1);
+    expect(mockAgent.abortCalls).toBe(0);
   });
 
   it("keeps complete recent turns within message and character limits", () => {

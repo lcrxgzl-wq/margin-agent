@@ -4,11 +4,13 @@ import {
   createPaperAgentAdapter,
   createPaperTools,
   preferredEngine,
+  resolveBlockSnapshot,
   resolveEngine,
   runBlockScan,
   searchBlocks,
   styleLint,
   buildOutline,
+  unknownBlockIdError,
 } from "./index.js";
 
 const sampleBlocks = [
@@ -541,4 +543,80 @@ describe("paper tools", () => {
       rationale: "测试。",
     })).rejects.toThrow(/stale/);
   });
+  it("resolveBlockSnapshot remaps stale ooxml body-index ids", () => {
+    const blocks = [
+      {
+        id: "ooxml-p-19-aabbccddeeff",
+        kind: "paragraph" as const,
+        text: "当前段落",
+        order: 0,
+        contentHash: "cur",
+      },
+      {
+        id: "ooxml-p-21-112233445566",
+        kind: "paragraph" as const,
+        text: "邻段",
+        order: 1,
+        contentHash: "n",
+      },
+    ];
+    const resolved = resolveBlockSnapshot(blocks, "ooxml-p-19-56e637661df7");
+    expect(resolved.block.id).toBe("ooxml-p-19-aabbccddeeff");
+    expect(resolved.remappedFrom).toBe("ooxml-p-19-56e637661df7");
+    expect(() => resolveBlockSnapshot(blocks, "ooxml-p-99-deadbeef")).toThrow(/Nearest:.*ooxml-p-21/);
+    expect(() => resolveBlockSnapshot(blocks, "not-a-block")).toThrow(/Sample current ids/);
+    expect(unknownBlockIdError(blocks, "ooxml-p-19-x").message).toMatch(/Call list_blocks/);
+  });
+
+  it("get_block remaps stale hash suffix and refreshes index after in-place reindex", async () => {
+    const bag = {
+      blocks: [
+        {
+          id: "ooxml-p-19-oldhash00001",
+          kind: "paragraph" as const,
+          text: "旧文",
+          order: 0,
+          contentHash: "old",
+        },
+      ],
+    };
+    const tools = createPaperTools(
+      {
+        getBlocks: () => bag.blocks,
+        getDocumentId: () => "doc1",
+        getRevision: () => 1,
+      },
+      [],
+      [],
+      { packId: "none" },
+    );
+    const getBlock = tools.find((tool) => tool.name === "get_block")!;
+
+    const remapped = await getBlock.execute("stale", { blockId: "ooxml-p-19-56e637661df7" });
+    expect(remapped.details).toMatchObject({
+      blockId: "ooxml-p-19-oldhash00001",
+      remappedFrom: "ooxml-p-19-56e637661df7",
+    });
+    expect(JSON.parse(remapped.content[0]!.text)).toMatchObject({
+      id: "ooxml-p-19-oldhash00001",
+      resolvedFrom: "ooxml-p-19-56e637661df7",
+    });
+
+    // Same array reference, new ids (reindex after apply) must not serve stale map entries.
+    bag.blocks.splice(0, bag.blocks.length, {
+      id: "ooxml-p-19-newhash00002",
+      kind: "paragraph" as const,
+      text: "新文",
+      order: 0,
+      contentHash: "new",
+    });
+    const afterReindex = await getBlock.execute("fresh", { blockId: "ooxml-p-19-newhash00002" });
+    expect(afterReindex.details).toMatchObject({ blockId: "ooxml-p-19-newhash00002", remappedFrom: null });
+    const viaStale = await getBlock.execute("via-stale", { blockId: "ooxml-p-19-oldhash00001" });
+    expect(viaStale.details).toMatchObject({
+      blockId: "ooxml-p-19-newhash00002",
+      remappedFrom: "ooxml-p-19-oldhash00001",
+    });
+  });
+
 });

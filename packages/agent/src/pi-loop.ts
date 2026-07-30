@@ -498,7 +498,11 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
         .join(" ")
         .replace(/\s+/g, " ")
         .slice(0, 300);
-      abort("error", `tool ${event.toolName} failed${detail ? `: ${detail}` : ""}`);
+      // Recoverable tool failures (unknown blockId, missing source, etc.) must
+      // stay in the transcript so the model can list/search and continue.
+      if (notes.length < 12) {
+        notes.push(`tool ${event.toolName} failed${detail ? `: ${detail}` : ""}`);
+      }
       return;
     }
     if (event.type === "turn_end") {

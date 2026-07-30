@@ -122,6 +122,7 @@ export {
   normalizeCascadeOffer,
 } from "./cascade.js";
 export type { CascadeCandidate, CascadeGate, ProposeScope } from "./cascade.js";
+export { resolveBlockSnapshot, unknownBlockIdError } from "./pi-tools.js";
 export type { AgentMessage } from "@earendil-works/pi-agent-core";
 export {
   resolveRuntimeModel,

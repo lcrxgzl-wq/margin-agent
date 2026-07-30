@@ -11,7 +11,7 @@ import {
   type FilterExpr,
 } from "../data/tabular.js";
 import type { AnalysisRunStore } from "../data/store.js";
-import type { Draft } from "../pi-tools.js";
+import { resolveBlockSnapshot, type Draft } from "../pi-tools.js";
 import type { MarginPack, PackExtras } from "./types.js";
 
 function requireRead(extras?: PackExtras) {
@@ -303,8 +303,8 @@ export const dataAnalysisPack: MarginPack = {
           rationale: string;
           risk?: RiskLevel;
         };
-        const block = blocks.find((b) => b.id === params.blockId);
-        if (!block) throw new Error(`Unknown blockId: ${params.blockId}`);
+        const { block } = resolveBlockSnapshot(blocks, String(params.blockId));
+        const blockId = block.id;
         if (block.kind === "table") {
           throw new Error("Full-table text replacement is forbidden; table results require a Host-backed cell proposal");
         }
@@ -312,9 +312,9 @@ export const dataAnalysisPack: MarginPack = {
           ...ctx.proposeScope,
           gate: ctx.cascadeGate ?? ctx.proposeScope?.gate,
         };
-        assertCanProposeBlock(params.blockId, scope);
-        if (drafts.some((d) => d.blockId === params.blockId)) {
-          throw new Error(`Already proposed for ${params.blockId}`);
+        assertCanProposeBlock(blockId, scope);
+        if (drafts.some((d) => d.blockId === blockId)) {
+          throw new Error(`Already proposed for ${blockId}`);
         }
         let after = String(params.template ?? "");
         const rendered: Array<{ token: string; resultRef: string; renderedValue: string }> =
@@ -342,7 +342,7 @@ export const dataAnalysisPack: MarginPack = {
         drafts.push({
           schemaVersion: 1,
           documentId,
-          blockId: params.blockId,
+          blockId,
           baseRevision: ctx.getRevision(),
           baseHash: block.contentHash,
           before: block.text,
@@ -351,21 +351,21 @@ export const dataAnalysisPack: MarginPack = {
           risk: params.risk ?? "fact",
           evidence,
         } satisfies Draft);
-        noteCascadePropose(scope, params.blockId);
+        noteCascadePropose(scope, blockId);
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify({
                 ok: true,
-                blockId: params.blockId,
+                blockId,
                 renderedBindings: rendered,
                 evidenceRefs: evidence,
                 proposalCount: drafts.length,
               }),
             },
           ],
-          details: { blockId: params.blockId, effect: "draft" },
+          details: { blockId, effect: "draft" },
         };
       },
     };
