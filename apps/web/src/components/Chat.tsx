@@ -28,6 +28,7 @@ import { ReviewPanel } from "./ReviewPanel";
 import { SourcePicker } from "./SourcePicker";
 import { mentionableSkills } from "../extensionsModel";
 import { submitEnterFrom } from "../ime";
+import { formatElapsedTime } from "../sessionTime";
 
 export type ChatMessage = {
   id: string;
@@ -136,6 +137,7 @@ export function Chat({
   const [skillOptions, setSkillOptions] = useState<SkillSummary[]>([]);
   const [pickedSkills, setPickedSkills] = useState<SkillSummary[]>([]);
   const [skillQuery, setSkillQuery] = useState<string | null>(null);
+  const [busyElapsedSeconds, setBusyElapsedSeconds] = useState(0);
   const bottom = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const followTail = useRef(true);
@@ -154,6 +156,18 @@ export function Chat({
       bottom.current?.scrollIntoView({ behavior: "auto", block: "end" });
     }
   }, [messages, busy, activeActivity]);
+
+  useEffect(() => {
+    if (!busy) {
+      setBusyElapsedSeconds(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const update = () => setBusyElapsedSeconds(Math.floor((Date.now() - startedAt) / 1_000));
+    update();
+    const timer = window.setInterval(update, 1_000);
+    return () => window.clearInterval(timer);
+  }, [busy]);
 
   useEffect(() => {
     if (landing) inputRef.current?.focus();
@@ -500,7 +514,11 @@ export function Chat({
                     />
                   ) : null}
                   <span className="composer-hint" role={busy ? "status" : undefined}>
-                    {busy ? <><i className="busy-dot" aria-hidden />{statusHint || "正在处理"}</> : null}
+                    {busy ? <>
+                      <i className="busy-dot" aria-hidden />
+                      {statusHint || "正在处理"}
+                      {busyElapsedSeconds >= 10 ? ` · ${formatElapsedTime(busyElapsedSeconds)}` : ""}
+                    </> : null}
                   </span>
                 </div>
                 <button

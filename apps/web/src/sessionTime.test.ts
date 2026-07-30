@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatSessionTime } from "./sessionTime";
+import { formatElapsedTime, formatSessionTime } from "./sessionTime";
 
 const NOW = Date.parse("2026-07-28T12:00:00.000Z");
 
@@ -18,5 +18,18 @@ describe("formatSessionTime", () => {
   it("tolerates invalid input and future timestamps", () => {
     expect(formatSessionTime("not-a-date", NOW)).toBe("");
     expect(formatSessionTime("2026-07-28T13:00:00.000Z", NOW)).toBe("刚刚");
+  });
+});
+
+describe("formatElapsedTime", () => {
+  it("formats minute and hour durations without changing width unexpectedly", () => {
+    expect(formatElapsedTime(9)).toBe("0:09");
+    expect(formatElapsedTime(75)).toBe("1:15");
+    expect(formatElapsedTime(3_661)).toBe("1:01:01");
+  });
+
+  it("clamps invalid or negative durations", () => {
+    expect(formatElapsedTime(-10)).toBe("0:00");
+    expect(formatElapsedTime(Number.NaN)).toBe("0:00");
   });
 });

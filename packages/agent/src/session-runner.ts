@@ -29,6 +29,10 @@ import { buildClarificationHint, isEditOrRewriteIntent } from "./clarification.j
 import { formatOutlineHint, type CascadeCandidate } from "./cascade.js";
 import type { AgentComment, AgentWorkReport, ReasoningMode, ScanProgressHandler } from "./types.js";
 import type { RemoteMcpApprovalFn, RemoteMcpBridge } from "./mcp-tools.js";
+import {
+  LiteralThinkingBlockFilter,
+  stripLiteralThinkingBlocks,
+} from "./assistant-text.js";
 
 export type ContextTier = "eco" | "standard" | "max";
 
@@ -41,34 +45,39 @@ export type ContextTierPreset = {
   contextChars: number;
   /** Final tool/text compaction rung floor in pi-loop. */
   compactionFloor: number;
-  /** Inject the blocks adjacent to the selection (±1, ≤800 chars each). */
-  adjacentBlocks: boolean;
+  /** Number of neighboring blocks to inject on each side of the selection. */
+  adjacentBlocksPerSide: number;
+  /** Character cap for each injected neighboring block. */
+  adjacentBlockChars: number;
 };
 
 export const CONTEXT_TIER_PRESETS: Record<ContextTier, ContextTierPreset> = {
   eco: {
-    selectionChars: 400,
-    outlineHeadings: 12,
-    contextMessages: 40,
-    contextChars: 60_000,
-    compactionFloor: 32,
-    adjacentBlocks: false,
-  },
-  standard: {
     selectionChars: 2_000,
     outlineHeadings: 24,
-    contextMessages: 80,
-    contextChars: 200_000,
-    compactionFloor: 128,
-    adjacentBlocks: false,
+    contextMessages: 48,
+    contextChars: 80_000,
+    compactionFloor: 64,
+    adjacentBlocksPerSide: 0,
+    adjacentBlockChars: 0,
+  },
+  standard: {
+    selectionChars: 12_000,
+    outlineHeadings: 48,
+    contextMessages: 120,
+    contextChars: 300_000,
+    compactionFloor: 512,
+    adjacentBlocksPerSide: 1,
+    adjacentBlockChars: 1_200,
   },
   max: {
-    selectionChars: 12_000,
+    selectionChars: 48_000,
     outlineHeadings: 0,
-    contextMessages: 120,
-    contextChars: 600_000,
-    compactionFloor: 1_000,
-    adjacentBlocks: true,
+    contextMessages: 180,
+    contextChars: 800_000,
+    compactionFloor: 2_000,
+    adjacentBlocksPerSide: 2,
+    adjacentBlockChars: 2_000,
   },
 };
 
@@ -76,12 +85,14 @@ function resolveContextTier(value: unknown): ContextTier | undefined {
   return value === "eco" || value === "standard" || value === "max" ? value : undefined;
 }
 
-/** max tier: inline the blocks surrounding the selection (±1, ≤800 chars each); omit silently. */
+/** Inline bounded blocks surrounding the selection; omit silently when unavailable. */
 function buildSelectionAdjacentContext(
   blocks: SessionDocBag["blocks"],
   selectionIds: string[],
+  blocksPerSide: number,
+  blockChars: number,
 ): string {
-  if (!selectionIds.length || !blocks.length) return "";
+  if (!selectionIds.length || !blocks.length || blocksPerSide < 1 || blockChars < 1) return "";
   const indices = selectionIds
     .map((id) => blocks.findIndex((block) => block.id === id))
     .filter((index) => index >= 0);
@@ -89,11 +100,24 @@ function buildSelectionAdjacentContext(
   const first = Math.min(...indices);
   const last = Math.max(...indices);
   const parts: string[] = [];
-  const prev = blocks[first - 1];
-  const next = blocks[last + 1];
-  if (prev) parts.push(`前一段（${prev.id}）：\n${prev.text.slice(0, 800)}`);
-  if (next) parts.push(`后一段（${next.id}）：\n${next.text.slice(0, 800)}`);
+  for (let offset = blocksPerSide; offset >= 1; offset -= 1) {
+    const block = blocks[first - offset];
+    if (block) parts.push(`前${offset}段（${block.id}）：\n${block.text.slice(0, blockChars)}`);
+  }
+  for (let offset = 1; offset <= blocksPerSide; offset += 1) {
+    const block = blocks[last + offset];
+    if (block) parts.push(`后${offset}段（${block.id}）：\n${block.text.slice(0, blockChars)}`);
+  }
   return parts.length ? `\n\n[选区上下文]\n${parts.join("\n")}` : "";
+}
+
+function resolveSelectionContextChars(value: unknown, fallback: number): number {
+  return typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 1_000 &&
+    value <= 100_000
+    ? value
+    : fallback;
 }
 
 export type SessionTurnInput = {
@@ -107,6 +131,8 @@ export type SessionTurnInput = {
   harnessId?: string;
   selectionHint?: string;
   selectionBlockIds?: string[];
+  /** Custom inline selection cap (1000-100000 chars); overrides the context tier. */
+  selectionContextChars?: number;
   /** Rule-based proposal/decision status for the open document; injected next to docHint. */
   proposalHint?: string;
   /** User-confirmed cascade block ids from offer card. */
@@ -241,6 +267,10 @@ export async function runPiSessionTurn(
   const profile = getAgentProfile(input.harnessId);
   const contextTier = resolveContextTier(input.contextTier);
   const tierPreset = CONTEXT_TIER_PRESETS[contextTier ?? "standard"];
+  const selectionContextChars = resolveSelectionContextChars(
+    input.selectionContextChars,
+    tierPreset.selectionChars,
+  );
   const runtime = resolveRuntimeModel(profile.model);
   const { model, apiKey } = runtime;
   const thinkingLevel = effectiveThinkingLevel(input.reasoningMode, runtime, input.reasoningOptIn);
@@ -279,7 +309,7 @@ export async function runPiSessionTurn(
   emit("正在思考…");
 
   const selection = input.selectionHint?.trim()
-    ? `\n\n用户当前选区${selectionIds.length ? `（blockIds: ${selectionIds.join(", ")}）` : ""}：\n"""\n${input.selectionHint.trim().slice(0, tierPreset.selectionChars)}\n"""`
+    ? `\n\n用户当前选区${selectionIds.length ? `（blockIds: ${selectionIds.join(", ")}）` : ""}：\n"""\n${input.selectionHint.trim().slice(0, selectionContextChars)}\n"""`
     : selectionIds.length
       ? `\n\n用户选中段落 blockIds: ${selectionIds.join(", ")}`
       : "";
@@ -288,9 +318,12 @@ export async function runPiSessionTurn(
     : "\n当前未打开文稿。";
   const outlineHint =
     input.bag.blocks.length > 0 ? formatOutlineHint(input.bag.blocks, tierPreset.outlineHeadings) : "";
-  const adjacentContext = tierPreset.adjacentBlocks
-    ? buildSelectionAdjacentContext(input.bag.blocks, selectionIds)
-    : "";
+  const adjacentContext = buildSelectionAdjacentContext(
+    input.bag.blocks,
+    selectionIds,
+    tierPreset.adjacentBlocksPerSide,
+    tierPreset.adjacentBlockChars,
+  );
   const proposalHint = input.proposalHint?.trim()
     ? `\n\n${input.proposalHint.trim()}`
     : "";
@@ -322,6 +355,12 @@ export async function runPiSessionTurn(
   const sourceHint = sourcePaths.length
     ? `\n\n[已挂资料，只读] ${sourcePaths.join("、")}。涉及资料的事实/引语须先 read_workspace_file 实际读取再起草；提案 evidence 用 read_workspace_file 返回的 sourceRef 填写。${sourceSkillHint}`
     : "";
+  const prompt = `${input.message}${docHint}${outlineHint}${proposalHint}${selection}${adjacentContext}${modeHint}${cascadeHint}${sourceHint}`;
+  // Pi budgets the serialized message, where quotes and control characters
+  // are escaped. Size that representation so an accepted current request is
+  // never compacted merely because its raw string length looked smaller.
+  const serializedPromptChars = JSON.stringify({ role: "user", content: prompt }).length;
+  const requestContextChars = Math.max(tierPreset.contextChars, serializedPromptChars + 32_000);
 
   // Explicit one-turn selections are inlined here; invalid ones throw visibly
   // before any model call. Reported alongside load_skill results.
@@ -338,7 +377,7 @@ export async function runPiSessionTurn(
   }
 
   const result = await runPiAgentLoop({
-    prompt: `${input.message}${docHint}${outlineHint}${proposalHint}${selection}${adjacentContext}${modeHint}${cascadeHint}${sourceHint}`,
+    prompt,
     systemPrompt: systemSkills.prompt,
     tools,
     messages: input.messages,
@@ -349,9 +388,9 @@ export async function runPiSessionTurn(
     usagePath: "pi-chat",
     maxTurns: maxTurns(profile.limits.maxTurns),
     timeoutMs: input.timeoutMs ?? timeoutMs(profile.limits.timeoutMs),
-    maxContextMessages: contextTier ? tierPreset.contextMessages : profile.limits.maxContextMessages,
-    maxContextChars: contextTier ? tierPreset.contextChars : profile.limits.maxContextChars,
-    toolCompactionFloor: contextTier ? tierPreset.compactionFloor : undefined,
+    maxContextMessages: tierPreset.contextMessages,
+    maxContextChars: requestContextChars,
+    toolCompactionFloor: tierPreset.compactionFloor,
     contextWindow: model.contextWindow,
     contextTier: contextTier ?? "standard",
     compactionAuto: input.compactionAuto,
@@ -365,7 +404,9 @@ export async function runPiSessionTurn(
   });
   assertPiLoopCompleted(result, "pi session");
 
-  let reply = extractAssistantText(result.messages) || result.streamedText;
+  let reply = stripLiteralThinkingBlocks(
+    extractAssistantText(result.messages) || result.streamedText,
+  );
   if (!reply) {
     if (effects.opened) {
       reply = `已打开《${effects.opened.document.relativePath.replace(/^.*\//, "")}》（${effects.opened.blocks.length} 段）。`;
@@ -457,8 +498,9 @@ export async function runOfflineSessionTurn(
       reply: string;
     },
   ): Promise<SessionTurnResult> => {
-    await emitTextChunks(partial.reply, input.onDelta, {
-      chunkSize: Math.min(96, Math.max(24, Math.ceil(partial.reply.length / 8))),
+    const reply = stripLiteralThinkingBlocks(partial.reply);
+    await emitTextChunks(reply, input.onDelta, {
+      chunkSize: Math.min(96, Math.max(24, Math.ceil(reply.length / 8))),
       delayMs: 4,
     });
     return {
@@ -468,6 +510,7 @@ export async function runOfflineSessionTurn(
       notes,
       workReport: buildWorkReport(effects, steps, partial.proposals.length + (partial.tableCellProposals?.length ?? 0)),
       ...partial,
+      reply,
     };
   };
 
@@ -586,6 +629,7 @@ export async function runOfflineSessionTurn(
         neighbors,
         harnessId: input.harnessId,
         instruction,
+        timeoutMs: input.timeoutMs,
       });
       await call("propose_block_edit", {
         blockId: id,
@@ -615,6 +659,7 @@ export async function runOfflineSessionTurn(
     .slice(0, 8)
     .map((b) => b.text.replace(/^#+\s*/, ""))
     .join(" · ");
+  const visibleTextFilter = new LiteralThinkingBlockFilter();
   const reply = await streamDiscuss(
     {
       message: msg,
@@ -623,13 +668,21 @@ export async function runOfflineSessionTurn(
       harnessId: input.harnessId,
       history: input.history,
       hasDocument: !!input.bag.documentId,
+      timeoutMs: input.timeoutMs,
       signal: input.signal,
     },
-    input.onDelta,
+    input.onDelta
+      ? (chunk) => {
+          const visible = visibleTextFilter.push(chunk);
+          if (visible) input.onDelta?.(visible);
+        }
+      : undefined,
   );
+  const finalVisible = visibleTextFilter.finish();
+  if (finalVisible) input.onDelta?.(finalVisible);
   return {
     engine: "offline",
-    reply,
+    reply: stripLiteralThinkingBlocks(reply),
     messages: input.messages ?? [],
     proposals: [],
     comments: [],

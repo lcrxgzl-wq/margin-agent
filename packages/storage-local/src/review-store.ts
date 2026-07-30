@@ -169,6 +169,136 @@ export function saveDecision(
   return decision;
 }
 
+export type ProposalResolutionBatch = {
+  id: string;
+  documentId: string;
+  proposalIds: string[];
+  expectedRevision: number;
+  expectedHash: string;
+  createdAt: string;
+};
+
+function resolutionBatchFromRow(row: Record<string, unknown>): ProposalResolutionBatch {
+  const proposalIds = JSON.parse(String(row.proposal_ids_json)) as unknown;
+  if (
+    !Array.isArray(proposalIds) ||
+    proposalIds.length === 0 ||
+    proposalIds.some((id) => typeof id !== "string" || !id)
+  ) {
+    throw new Error("invalid proposal resolution batch");
+  }
+  return {
+    id: String(row.id),
+    documentId: String(row.document_id),
+    proposalIds,
+    expectedRevision: Number(row.expected_revision),
+    expectedHash: String(row.expected_hash),
+    createdAt: String(row.created_at),
+  };
+}
+
+function listProposalResolutionBatches(ws: Workspace): ProposalResolutionBatch[] {
+  const rows = ws.db.prepare(
+    `SELECT * FROM proposal_resolution_batches ORDER BY created_at ASC, rowid ASC`,
+  ).all() as Array<Record<string, unknown>>;
+  return rows.map(resolutionBatchFromRow);
+}
+
+/** Claim a whole accept-all request in one durable SQLite transaction. */
+export function saveProposalResolutionBatch(
+  ws: Workspace,
+  documentId: string,
+  proposalIds: string[],
+  expectedRevision: number,
+  expectedHash: string,
+): { batch: ProposalResolutionBatch; decisions: Decision[] } {
+  if (!proposalIds.length || new Set(proposalIds).size !== proposalIds.length) {
+    throw new Error("proposal resolution batch ids must be non-empty and unique");
+  }
+  const proposals = proposalIds.map((proposalId) => getProposal(ws, proposalId));
+  if (proposals.some((proposal) => proposal.documentId !== documentId)) {
+    throw new Error("proposal resolution batch document mismatch");
+  }
+  if (proposals.some((proposal) => proposal.status !== "proposed")) {
+    throw new Error("proposal not decidable");
+  }
+
+  const createdAt = new Date().toISOString();
+  const batch: ProposalResolutionBatch = {
+    id: randomUUID(),
+    documentId,
+    proposalIds: [...proposalIds],
+    expectedRevision,
+    expectedHash,
+    createdAt,
+  };
+  const decisions = proposalIds.map((proposalId): Decision => ({
+    schemaVersion: 1,
+    id: randomUUID(),
+    proposalId,
+    kind: "Y",
+    createdAt,
+  }));
+
+  ws.db.prepare("BEGIN IMMEDIATE").run();
+  try {
+    ws.db.prepare(
+      `INSERT INTO proposal_resolution_batches (
+        id, document_id, proposal_ids_json, expected_revision, expected_hash, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      batch.id,
+      batch.documentId,
+      JSON.stringify(batch.proposalIds),
+      batch.expectedRevision,
+      batch.expectedHash,
+      batch.createdAt,
+    );
+    const insertDecision = ws.db.prepare(
+      `INSERT INTO decisions (id, proposal_id, kind, edited_text, reason, created_at)
+       VALUES (?, ?, 'Y', NULL, NULL, ?)`,
+    );
+    const claimProposal = ws.db.prepare(
+      `UPDATE proposals SET status = 'decided' WHERE id = ? AND status = 'proposed'`,
+    );
+    for (const decision of decisions) {
+      insertDecision.run(decision.id, decision.proposalId, decision.createdAt);
+      const claimed = claimProposal.run(decision.proposalId);
+      if (Number(claimed.changes ?? 0) !== 1) throw new Error("proposal not decidable");
+    }
+    ws.db.prepare("COMMIT").run();
+  } catch (error) {
+    try { ws.db.prepare("ROLLBACK").run(); } catch { /* ignore */ }
+    throw error;
+  }
+  return { batch, decisions };
+}
+
+export function completeProposalResolutionBatch(ws: Workspace, batchId: string): void {
+  ws.db.prepare(`DELETE FROM proposal_resolution_batches WHERE id = ?`).run(batchId);
+}
+
+/** Make every still-pending member retryable and retire the durable batch marker. */
+export function reopenProposalResolutionBatch(ws: Workspace, batchId: string): void {
+  const row = ws.db.prepare(
+    `SELECT * FROM proposal_resolution_batches WHERE id = ?`,
+  ).get(batchId) as Record<string, unknown> | undefined;
+  if (!row) return;
+  const batch = resolutionBatchFromRow(row);
+  ws.db.prepare("BEGIN IMMEDIATE").run();
+  try {
+    const reopen = ws.db.prepare(
+      `UPDATE proposals SET status = 'proposed' WHERE id = ? AND status = 'decided'`,
+    );
+    for (const proposalId of batch.proposalIds) reopen.run(proposalId);
+    ws.db.prepare(`DELETE FROM proposal_resolution_batches WHERE id = ?`).run(batch.id);
+    ws.db.prepare("COMMIT").run();
+  } catch (error) {
+    try { ws.db.prepare("ROLLBACK").run(); } catch { /* ignore */ }
+    throw error;
+  }
+}
+
 export function getLatestDecision(ws: Workspace, proposalId: string): Decision | undefined {
   const row = ws.db.prepare(
     `SELECT * FROM decisions WHERE proposal_id = ? ORDER BY created_at DESC LIMIT 1`,
@@ -242,6 +372,45 @@ export function getLatestProposalApplyEvent(
 export async function recoverDecidedProposals(ws: Workspace): Promise<void> {
   await recoverNativeSaveJournals(ws);
   await recoverApplyJournals(ws);
+  for (const batch of listProposalResolutionBatches(ws)) {
+    try {
+      const proposals = batch.proposalIds.map((proposalId) => getProposal(ws, proposalId));
+      const alreadyApplied = proposals.every((proposal) => {
+        const decision = getLatestDecision(ws, proposal.id);
+        const event = getLatestProposalApplyEvent(ws, proposal.id);
+        return proposal.status === "superseded" &&
+          decision?.kind === "Y" &&
+          event?.ok === true &&
+          event.decisionId === decision.id;
+      });
+      if (alreadyApplied) {
+        completeProposalResolutionBatch(ws, batch.id);
+        continue;
+      }
+      if (
+        proposals.some((proposal) =>
+          proposal.documentId !== batch.documentId || proposal.status !== "decided",
+        ) ||
+        proposals.some((proposal) => getLatestDecision(ws, proposal.id)?.kind !== "Y")
+      ) {
+        reopenProposalResolutionBatch(ws, batch.id);
+        continue;
+      }
+      const result = await applyApproved(
+        ws,
+        batch.documentId,
+        batch.expectedRevision,
+        batch.expectedHash,
+        batch.proposalIds,
+        { requireAll: true },
+      );
+      if (result.ok) completeProposalResolutionBatch(ws, batch.id);
+      else reopenProposalResolutionBatch(ws, batch.id);
+    } catch {
+      // A recoverable batch is all-or-none: never fall through to per-proposal replay.
+      reopenProposalResolutionBatch(ws, batch.id);
+    }
+  }
   const rows = ws.db.prepare(
     `SELECT * FROM proposals WHERE status = 'decided' ORDER BY created_at ASC, rowid ASC`,
   ).all() as Array<Record<string, unknown>>;
@@ -464,15 +633,21 @@ type ApplyResult =
   | { ok: true; document: ReturnType<typeof getDocument>; blocks: ReturnType<typeof listBlocks> }
   | { ok: false; reason: string };
 
+export type ApplyApprovedOptions = {
+  /** Refuse the whole batch when any requested proposal cannot be applied. */
+  requireAll?: boolean;
+};
+
 export function applyApproved(
   ws: Workspace,
   documentId: string,
   expectedRevision: number,
   expectedHash: string,
   proposalIds?: string[],
+  options: ApplyApprovedOptions = {},
 ): Promise<ApplyResult> {
   return enqueueDocumentMutation(ws, documentId, () =>
-    applyApprovedOnce(ws, documentId, expectedRevision, expectedHash, proposalIds),
+    applyApprovedOnce(ws, documentId, expectedRevision, expectedHash, proposalIds, options),
   );
 }
 
@@ -482,6 +657,7 @@ async function applyApprovedOnce(
   expectedRevision: number,
   expectedHash: string,
   proposalIds?: string[],
+  options: ApplyApprovedOptions = {},
 ): Promise<ApplyResult> {
   const doc = getDocument(ws, documentId);
   if (doc.revision !== expectedRevision || doc.contentHash !== expectedHash) {
@@ -495,6 +671,24 @@ async function applyApprovedOnce(
       )
     : listProposals(ws, documentId, "decided"));
   if (!proposals.length) return { ok: false, reason: "nothing_to_apply" };
+  if (options.requireAll) {
+    if (
+      !proposalIds ||
+      !requestedIds ||
+      requestedIds.size !== proposalIds.length ||
+      proposals.length !== requestedIds.size
+    ) {
+      return { ok: false, reason: "batch_not_applicable" };
+    }
+    const targets = new Set<string>();
+    for (const proposal of proposals) {
+      const target = proposal.tableCell
+        ? `${proposal.blockId}:cell:${proposal.tableCell.row}:${proposal.tableCell.column}`
+        : `${proposal.blockId}:block`;
+      if (targets.has(target)) return { ok: false, reason: "conflicting_proposals" };
+      targets.add(target);
+    }
+  }
   const decisions = latestDecisionsByProposal(ws, proposals.map((proposal) => proposal.id));
 
   const abs = resolveWorkspacePath(ws.root, doc.relativePath);
@@ -566,6 +760,10 @@ async function applyApprovedOnce(
       block.contentHash = contentHash(nextText);
     }
     applied.push({ proposal: p, decision });
+  }
+
+  if (options.requireAll && (failedEvents.length > 0 || applied.length !== proposals.length)) {
+    return { ok: false, reason: "batch_not_applicable" };
   }
 
   if (!applied.length) {

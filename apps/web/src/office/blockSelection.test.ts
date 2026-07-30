@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { Block } from "../api";
-import { createOfficeBlockResolver, findOfficeBlockId, findSelectionStart } from "./blockSelection";
+import {
+  buildOfficeSelectionRanges,
+  canvasFocusRangeIndexes,
+  createOfficeBlockResolver,
+  findOfficeBlockId,
+  findSelectionStart,
+  resolveOfficeBlocksForRange,
+  splitOfficeSelectionParagraphs,
+} from "./blockSelection";
 
 const blocks: Block[] = [
   { id: "p-1", kind: "paragraph", text: "第一段中文内容", order: 0, contentHash: "a" },
@@ -92,5 +100,126 @@ describe("findSelectionStart", () => {
 
   it("does not guess between repeated text without a range hint", () => {
     expect(findSelectionStart("same then same", "same")).toBeNull();
+  });
+});
+
+describe("canvasFocusRangeIndexes", () => {
+  it("applies empty-paragraph stream drift before focusing a keyword range", () => {
+    expect(canvasFocusRangeIndexes({ startIndex: 40, endIndex: 44 }, 3)).toEqual({
+      startIndex: 42,
+      endIndex: 47,
+    });
+  });
+
+  it("keeps the executeSetRange start boundary non-negative", () => {
+    expect(canvasFocusRangeIndexes({ startIndex: 0, endIndex: 2 }, 0)).toEqual({
+      startIndex: 0,
+      endIndex: 2,
+    });
+  });
+});
+
+describe("precise Office selection ranges", () => {
+  const rangeBlocks = [
+    { id: "a", kind: "paragraph", text: "same then same", order: 0, contentHash: "a" },
+    { id: "b", kind: "paragraph", text: "middle", order: 1, contentHash: "b" },
+    { id: "c", kind: "paragraph", text: "tail kept", order: 2, contentHash: "c" },
+  ] as Block[];
+
+  it("splits cross-paragraph canvas elements at paragraph sentinels", () => {
+    expect(splitOfficeSelectionParagraphs([
+      { value: "same" },
+      { value: "\u200b" },
+      { value: "middle" },
+      { value: "\u200b" },
+      { value: "tail" },
+    ], 3)).toEqual(["same", "middle", "tail"]);
+  });
+
+  it("splits newline sentinels and preserves empty canvas paragraphs", () => {
+    expect(splitOfficeSelectionParagraphs([
+      { value: "tail" },
+      { value: "\n" },
+      { value: "" },
+      { value: "\n" },
+      { value: "head" },
+    ], 3)).toEqual(["tail", "", "head"]);
+  });
+
+  it("keeps grouped title content as its own paragraph", () => {
+    expect(splitOfficeSelectionParagraphs([
+      { value: "end" },
+      { type: "title", valueList: [{ value: "Heading" }] },
+      { value: "\u200b" },
+      { value: "next" },
+    ], 3)).toEqual(["end", "Heading", "next"]);
+  });
+
+  it("builds partial first/last ranges and a full middle range", () => {
+    expect(buildOfficeSelectionRanges(
+      rangeBlocks,
+      ["a", "b", "c"],
+      "samemiddletail",
+      ["same", "middle", "tail"],
+    )).toEqual([
+      { blockId: "a", start: 10, end: 14, before: "same" },
+      { blockId: "b", start: 0, end: 6, before: "middle" },
+      { blockId: "c", start: 0, end: 4, before: "tail" },
+    ]);
+  });
+
+  it("uses an exact single-block offset for repeated short text", () => {
+    expect(buildOfficeSelectionRanges(
+      rangeBlocks,
+      ["a"],
+      "same",
+      ["same"],
+      10,
+    )).toEqual([{ blockId: "a", start: 10, end: 14, before: "same" }]);
+    expect(buildOfficeSelectionRanges(rangeBlocks, ["a"], "same", ["same"])).toBeNull();
+  });
+
+  it("returns null instead of fabricating a mismatched edge offset", () => {
+    expect(buildOfficeSelectionRanges(
+      rangeBlocks,
+      ["a", "c"],
+      "then tail",
+      ["then ", "tail"],
+    )).toBeNull();
+  });
+
+  it("skips empty OOXML paragraphs and aligns canvas boundary whitespace", () => {
+    const fixtureBlocks = [
+      { id: "ooxml-p-0-a", kind: "paragraph", text: "Body tail", order: 0, contentHash: "a" },
+      { id: "ooxml-p-2-b", kind: "paragraph", text: "Abstract:", order: 1, contentHash: "b" },
+      { id: "ooxml-p-4-c", kind: "paragraph", text: "Keywords: agent", order: 2, contentHash: "c" },
+    ] as Block[];
+    const fragments = ["tail", "", "Abstract: ", "   ", "Keywords"];
+    const selectionText = fragments.join("");
+    const resolved = resolveOfficeBlocksForRange(
+      createOfficeBlockResolver(fixtureBlocks),
+      { startParagraphNo: 0, endParagraphNo: 4 },
+      selectionText,
+      "",
+      fragments,
+    );
+
+    expect(resolved).toEqual({
+      blockId: "ooxml-p-0-a",
+      blockIds: ["ooxml-p-0-a", "ooxml-p-2-b", "ooxml-p-4-c"],
+    });
+    const ranges = buildOfficeSelectionRanges(
+      fixtureBlocks,
+      resolved.blockIds!,
+      selectionText,
+      fragments,
+    );
+    expect(ranges).toEqual([
+      { blockId: "ooxml-p-0-a", start: 5, end: 9, before: "tail" },
+      { blockId: "ooxml-p-2-b", start: 0, end: 9, before: "Abstract:" },
+      { blockId: "ooxml-p-4-c", start: 0, end: 8, before: "Keywords" },
+    ]);
+    expect(ranges?.map((range) => range.before).join(""))
+      .toBe("tailAbstract:Keywords");
   });
 });

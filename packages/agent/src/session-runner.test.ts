@@ -4,11 +4,20 @@ import type { WorkspaceBridge } from "./session-tools.js";
 
 const mocks = vi.hoisted(() => ({
   runPiAgentLoop: vi.fn(),
+  streamDiscuss: vi.fn(),
 }));
 
 vi.mock("./pi-loop.js", () => ({
   runPiAgentLoop: mocks.runPiAgentLoop,
 }));
+
+vi.mock("@margin/llm", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@margin/llm")>();
+  return {
+    ...actual,
+    streamDiscuss: mocks.streamDiscuss,
+  };
+});
 
 vi.mock("./resolve-model.js", () => ({
   effectiveThinkingLevel: () => undefined,
@@ -16,7 +25,11 @@ vi.mock("./resolve-model.js", () => ({
   resolveRuntimeModel: () => ({ model: {}, apiKey: "test-key" }),
 }));
 
-const { runPiSessionTurn, CONTEXT_TIER_PRESETS } = await import("./session-runner.js");
+const {
+  runOfflineSessionTurn,
+  runPiSessionTurn,
+  CONTEXT_TIER_PRESETS,
+} = await import("./session-runner.js");
 
 const bridge: WorkspaceBridge = {
   listSourceFiles: () => [],
@@ -44,10 +57,57 @@ function loopResult(): PiLoopResult {
 beforeEach(() => {
   mocks.runPiAgentLoop.mockReset();
   mocks.runPiAgentLoop.mockResolvedValue(loopResult());
+  mocks.streamDiscuss.mockReset();
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+describe("session assistant text boundaries", () => {
+  it("returns a clean reply while preserving the raw Pi transcript", async () => {
+    const rawText = "Visible<thinking>private chain of thought</thinking> answer";
+    mocks.runPiAgentLoop.mockResolvedValue({
+      ...loopResult(),
+      messages: [{
+        role: "assistant",
+        content: [{ type: "text", text: rawText }],
+      }],
+      streamedText: "Visible answer",
+    });
+
+    const turn = await runPiSessionTurn({
+      message: "继续",
+      bridge,
+      bag: { revision: 0, blocks: [] },
+    });
+
+    expect(turn.reply).toBe("Visible answer");
+    expect(JSON.stringify(turn.messages)).toContain(rawText);
+  });
+
+  it("filters thinking blocks split across streamDiscuss chunks", async () => {
+    const chunks = [
+      "Visible <thi",
+      "nking>private chain of thought</think",
+      "ing> answer",
+    ];
+    mocks.streamDiscuss.mockImplementation(async (_input, onDelta) => {
+      for (const chunk of chunks) onDelta?.(chunk);
+      return chunks.join("");
+    });
+    const deltas: string[] = [];
+
+    const turn = await runOfflineSessionTurn({
+      message: "谈谈这个研究问题",
+      bridge,
+      bag: { revision: 0, blocks: [] },
+      onDelta: (chunk) => deltas.push(chunk),
+    });
+
+    expect(deltas.join("")).toBe("Visible  answer");
+    expect(turn.reply).toBe("Visible  answer");
+  });
 });
 
 describe("runPiSessionTurn proposal status hint", () => {
@@ -114,7 +174,7 @@ describe("runPiSessionTurn timeout resolution", () => {
       bridge,
       bag: { revision: 0, blocks: [] },
     });
-    expect(mocks.runPiAgentLoop.mock.calls[0]![0].timeoutMs).toBe(120_000);
+    expect(mocks.runPiAgentLoop.mock.calls[0]![0].timeoutMs).toBe(300_000);
   });
 
   it("honors MARGIN_PI_TIMEOUT_MS when the input carries no timeout", async () => {
@@ -171,44 +231,47 @@ describe("runPiSessionTurn context tiers", () => {
   it("exports the spec preset table", () => {
     expect(CONTEXT_TIER_PRESETS).toEqual({
       eco: {
-        selectionChars: 400,
-        outlineHeadings: 12,
-        contextMessages: 40,
-        contextChars: 60_000,
-        compactionFloor: 32,
-        adjacentBlocks: false,
-      },
-      standard: {
         selectionChars: 2_000,
         outlineHeadings: 24,
-        contextMessages: 80,
-        contextChars: 200_000,
-        compactionFloor: 128,
-        adjacentBlocks: false,
+        contextMessages: 48,
+        contextChars: 80_000,
+        compactionFloor: 64,
+        adjacentBlocksPerSide: 0,
+        adjacentBlockChars: 0,
+      },
+      standard: {
+        selectionChars: 12_000,
+        outlineHeadings: 48,
+        contextMessages: 120,
+        contextChars: 300_000,
+        compactionFloor: 512,
+        adjacentBlocksPerSide: 1,
+        adjacentBlockChars: 1_200,
       },
       max: {
-        selectionChars: 12_000,
+        selectionChars: 48_000,
         outlineHeadings: 0,
-        contextMessages: 120,
-        contextChars: 600_000,
-        compactionFloor: 1_000,
-        adjacentBlocks: true,
+        contextMessages: 180,
+        contextChars: 800_000,
+        compactionFloor: 2_000,
+        adjacentBlocksPerSide: 2,
+        adjacentBlockChars: 2_000,
       },
     });
   });
 
-  it("slices the selection inline at 2000 chars when contextTier is unset", async () => {
+  it("uses the complete standard selection budget when contextTier is unset", async () => {
     await runPiSessionTurn({
       message: "继续修订",
       bridge,
       bag: { revision: 0, blocks: [] },
-      selectionHint: "x".repeat(3_000),
+      selectionHint: "x".repeat(13_000),
     });
-    expect(lastPrompt()).toContain("x".repeat(2_000));
-    expect(lastPrompt()).not.toContain("x".repeat(2_001));
+    expect(lastPrompt()).toContain("x".repeat(12_000));
+    expect(lastPrompt()).not.toContain("x".repeat(12_001));
   });
 
-  it("slices the selection inline per tier (eco 400 / max 12000)", async () => {
+  it("slices the selection inline per tier (eco 2000 / max 48000)", async () => {
     await runPiSessionTurn({
       message: "继续修订",
       bridge,
@@ -216,29 +279,29 @@ describe("runPiSessionTurn context tiers", () => {
       selectionHint: "x".repeat(3_000),
       contextTier: "eco",
     });
-    expect(lastPrompt()).toContain("x".repeat(400));
-    expect(lastPrompt()).not.toContain("x".repeat(401));
+    expect(lastPrompt()).toContain("x".repeat(2_000));
+    expect(lastPrompt()).not.toContain("x".repeat(2_001));
 
     await runPiSessionTurn({
       message: "继续修订",
       bridge,
       bag: { revision: 0, blocks: [] },
-      selectionHint: "x".repeat(13_000),
+      selectionHint: "x".repeat(49_000),
       contextTier: "max",
     });
-    expect(lastPrompt()).toContain("x".repeat(12_000));
-    expect(lastPrompt()).not.toContain("x".repeat(12_001));
+    expect(lastPrompt()).toContain("x".repeat(48_000));
+    expect(lastPrompt()).not.toContain("x".repeat(48_001));
   });
 
-  it("keeps current loop limits and no compaction floor when contextTier is unset", async () => {
+  it("uses the complete standard loop preset when contextTier is unset", async () => {
     await runPiSessionTurn({
       message: "继续修订",
       bridge,
       bag: { revision: 0, blocks: [] },
     });
-    expect(lastOpts().maxContextMessages).toBe(80);
-    expect(lastOpts().maxContextChars).toBe(200_000);
-    expect(lastOpts().toolCompactionFloor).toBeUndefined();
+    expect(lastOpts().maxContextMessages).toBe(120);
+    expect(lastOpts().maxContextChars).toBe(300_000);
+    expect(lastOpts().toolCompactionFloor).toBe(512);
   });
 
   it("passes tier loop limits to the pi loop", async () => {
@@ -248,9 +311,9 @@ describe("runPiSessionTurn context tiers", () => {
       bag: { revision: 0, blocks: [] },
       contextTier: "eco",
     });
-    expect(lastOpts().maxContextMessages).toBe(40);
-    expect(lastOpts().maxContextChars).toBe(60_000);
-    expect(lastOpts().toolCompactionFloor).toBe(32);
+    expect(lastOpts().maxContextMessages).toBe(48);
+    expect(lastOpts().maxContextChars).toBe(80_000);
+    expect(lastOpts().toolCompactionFloor).toBe(64);
 
     await runPiSessionTurn({
       message: "继续修订",
@@ -258,9 +321,9 @@ describe("runPiSessionTurn context tiers", () => {
       bag: { revision: 0, blocks: [] },
       contextTier: "standard",
     });
-    expect(lastOpts().maxContextMessages).toBe(80);
-    expect(lastOpts().maxContextChars).toBe(200_000);
-    expect(lastOpts().toolCompactionFloor).toBe(128);
+    expect(lastOpts().maxContextMessages).toBe(120);
+    expect(lastOpts().maxContextChars).toBe(300_000);
+    expect(lastOpts().toolCompactionFloor).toBe(512);
 
     await runPiSessionTurn({
       message: "继续修订",
@@ -268,17 +331,17 @@ describe("runPiSessionTurn context tiers", () => {
       bag: { revision: 0, blocks: [] },
       contextTier: "max",
     });
-    expect(lastOpts().maxContextMessages).toBe(120);
-    expect(lastOpts().maxContextChars).toBe(600_000);
-    expect(lastOpts().toolCompactionFloor).toBe(1_000);
+    expect(lastOpts().maxContextMessages).toBe(180);
+    expect(lastOpts().maxContextChars).toBe(800_000);
+    expect(lastOpts().toolCompactionFloor).toBe(2_000);
   });
 
-  it("caps outline headings at 24 by default, 12 on eco, unlimited on max", async () => {
-    const blocks = Array.from({ length: 30 }, (_, i) => heading(`h${i + 1}`, i, `标题 ${i + 1}`));
+  it("caps outline headings at 48 by default, 24 on eco, unlimited on max", async () => {
+    const blocks = Array.from({ length: 60 }, (_, i) => heading(`h${i + 1}`, i, `标题 ${i + 1}`));
 
     await runPiSessionTurn({ message: "继续修订", bridge, bag: { revision: 0, blocks } });
-    expect(lastPrompt()).toContain("标题 24");
-    expect(lastPrompt()).not.toContain("标题 25");
+    expect(lastPrompt()).toContain("标题 48");
+    expect(lastPrompt()).not.toContain("标题 49");
 
     await runPiSessionTurn({
       message: "继续修订",
@@ -286,8 +349,8 @@ describe("runPiSessionTurn context tiers", () => {
       bag: { revision: 0, blocks },
       contextTier: "eco",
     });
-    expect(lastPrompt()).toContain("标题 12");
-    expect(lastPrompt()).not.toContain("标题 13");
+    expect(lastPrompt()).toContain("标题 24");
+    expect(lastPrompt()).not.toContain("标题 25");
 
     await runPiSessionTurn({
       message: "继续修订",
@@ -295,10 +358,10 @@ describe("runPiSessionTurn context tiers", () => {
       bag: { revision: 0, blocks },
       contextTier: "max",
     });
-    expect(lastPrompt()).toContain("标题 30");
+    expect(lastPrompt()).toContain("标题 60");
   });
 
-  it("injects the blocks adjacent to the selection on max tier", async () => {
+  it("injects one block per side on the default standard tier", async () => {
     const blocks = [
       paragraph("b1", 0, "前文段落内容"),
       paragraph("b2", 1, "选中段落内容"),
@@ -309,30 +372,35 @@ describe("runPiSessionTurn context tiers", () => {
       bridge,
       bag: { revision: 0, blocks },
       selectionBlockIds: ["b2"],
-      contextTier: "max",
     });
     expect(lastPrompt()).toContain("[选区上下文]");
     expect(lastPrompt()).toContain("前文段落内容");
     expect(lastPrompt()).toContain("后文段落内容");
   });
 
-  it("caps each injected adjacent block at 800 chars on max tier", async () => {
+  it("injects two blocks per side and caps each at 2000 chars on max tier", async () => {
     const blocks = [
-      paragraph("b1", 0, "p".repeat(1_000)),
-      paragraph("b2", 1, "选中段落"),
+      paragraph("b1", 0, "far-before"),
+      paragraph("b2", 1, "p".repeat(2_500)),
+      paragraph("b3", 2, "选中段落"),
+      paragraph("b4", 3, "near-after"),
+      paragraph("b5", 4, "far-after"),
     ];
     await runPiSessionTurn({
       message: "继续修订",
       bridge,
       bag: { revision: 0, blocks },
-      selectionBlockIds: ["b2"],
+      selectionBlockIds: ["b3"],
       contextTier: "max",
     });
-    expect(lastPrompt()).toContain("p".repeat(800));
-    expect(lastPrompt()).not.toContain("p".repeat(801));
+    expect(lastPrompt()).toContain("far-before");
+    expect(lastPrompt()).toContain("p".repeat(2_000));
+    expect(lastPrompt()).not.toContain("p".repeat(2_001));
+    expect(lastPrompt()).toContain("near-after");
+    expect(lastPrompt()).toContain("far-after");
   });
 
-  it("does not inject adjacent blocks outside max tier or without a locatable selection", async () => {
+  it("does not inject adjacent blocks on eco or without a locatable selection", async () => {
     const blocks = [
       paragraph("b1", 0, "前文段落内容"),
       paragraph("b2", 1, "选中段落内容"),
@@ -343,7 +411,7 @@ describe("runPiSessionTurn context tiers", () => {
       bridge,
       bag: { revision: 0, blocks },
       selectionBlockIds: ["b2"],
-      contextTier: "standard",
+      contextTier: "eco",
     });
     expect(lastPrompt()).not.toContain("[选区上下文]");
 
@@ -370,10 +438,45 @@ describe("runPiSessionTurn context tiers", () => {
       message: "继续修订",
       bridge,
       bag: { revision: 0, blocks: [] },
-      selectionHint: "x".repeat(3_000),
+      selectionHint: "x".repeat(13_000),
       contextTier: "ludicrous" as never,
     });
-    expect(lastPrompt()).toContain("x".repeat(2_000));
-    expect(lastPrompt()).not.toContain("x".repeat(2_001));
+    expect(lastPrompt()).toContain("x".repeat(12_000));
+    expect(lastPrompt()).not.toContain("x".repeat(12_001));
+    expect(lastOpts().maxContextMessages).toBe(120);
+    expect(lastOpts().toolCompactionFloor).toBe(512);
+  });
+
+  it("lets a valid custom selection cap override the context tier", async () => {
+    await runPiSessionTurn({
+      message: "继续修订",
+      bridge,
+      bag: { revision: 0, blocks: [] },
+      selectionHint: "x".repeat(64_001),
+      selectionContextChars: 64_000,
+      contextTier: "eco",
+    });
+    expect(lastPrompt()).toContain("x".repeat(64_000));
+    expect(lastPrompt()).not.toContain("x".repeat(64_001));
+  });
+
+  it("budgets and preserves a 100k quote-heavy selection by serialized size", async () => {
+    const selection = '"'.repeat(100_000);
+    await runPiSessionTurn({
+      message: "继续修订",
+      bridge,
+      bag: { revision: 0, blocks: [] },
+      selectionHint: selection,
+      selectionContextChars: 100_000,
+      contextTier: "eco",
+    });
+
+    const prompt = lastPrompt();
+    const selectionStart = prompt.indexOf('：\n"""\n') + '：\n"""\n'.length;
+    const selectionEnd = prompt.indexOf('\n"""', selectionStart);
+    expect(prompt.slice(selectionStart, selectionEnd)).toBe(selection);
+    expect(lastOpts().maxContextChars).toBeGreaterThan(
+      JSON.stringify({ role: "user", content: prompt }).length,
+    );
   });
 });

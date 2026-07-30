@@ -23,6 +23,10 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
+  MAX_SELECTION_BLOCKS,
+  type SelectionBlockRange,
+} from "@margin/domain";
+import {
   fetchNativeDocx,
   NativeDocxRebuildRequiredError,
   saveNativeDocx,
@@ -31,7 +35,19 @@ import {
   type DocumentMeta,
   type Proposal,
 } from "../api";
-import { createOfficeBlockResolver, findSelectionStart } from "../office/blockSelection";
+import {
+  buildOfficeSelectionRanges,
+  canvasFocusRangeIndexes,
+  createOfficeBlockResolver,
+  findSelectionStart,
+  resolveOfficeBlocksForRange,
+  splitOfficeSelectionParagraphs,
+} from "../office/blockSelection";
+import {
+  officeEditorReadOnly,
+  withInternalEditorEdit,
+  type OfficeEditorMode,
+} from "../office/editorMode";
 import { importDocxIntoCanvas } from "../office/docxImport";
 import {
   buildAnchor,
@@ -46,6 +62,9 @@ import {
   markProposalId,
   planInjectionOrder,
   planMarkRestoreOrder,
+  proposalFocusQueries,
+  proposalsToReinjectAfterSave,
+  selectionContainsMark,
   sliceElements,
 } from "../office/revisionMarks";
 import { readableMobilePageScale } from "../layoutGeometry";
@@ -54,6 +73,7 @@ import type { CanvasFocusRequest, TableCellSelection } from "./canvasTypes";
 type SelectionInfo = {
   blockId: string | null;
   blockIds?: string[];
+  selectionRanges?: SelectionBlockRange[];
   text: string;
   selectionStart?: number;
   tableCell?: TableCellSelection;
@@ -61,43 +81,6 @@ type SelectionInfo = {
   crossTableCells?: boolean;
   anchor?: { x: number; y: number } | null;
 };
-
-/** Map the editor range to immutable block ids; spans multiple blocks when the
- *  selection crosses paragraphs. */
-function resolveBlocksForRange(
-  resolve: ReturnType<typeof createOfficeBlockResolver>,
-  context: { startParagraphNo: number; endParagraphNo: number; isTable?: boolean },
-  text: string,
-  paragraphText: string,
-  paragraphElements: IElement[] | null,
-): { blockId: string | null; blockIds?: string[] } {
-  if (context.startParagraphNo === context.endParagraphNo) {
-    return {
-      blockId: resolve({
-        paragraphText,
-        selectionText: text,
-        paragraphNo: context.startParagraphNo,
-        isTable: context.isTable,
-      }),
-    };
-  }
-  const perParagraph = splitRangeParagraphTexts(paragraphElements);
-  const ids: string[] = [];
-  for (
-    let paragraphNo = context.startParagraphNo, index = 0;
-    paragraphNo <= context.endParagraphNo && ids.length < 12;
-    paragraphNo += 1, index += 1
-  ) {
-    const id = resolve({
-      paragraphNo,
-      isTable: context.isTable,
-      paragraphText: perParagraph[index],
-      selectionText: index === 0 ? text : undefined,
-    });
-    if (id && !ids.includes(id)) ids.push(id);
-  }
-  return { blockId: ids[0] ?? null, blockIds: ids.length > 1 ? ids : undefined };
-}
 
 type Props = {
   document: DocumentMeta;
@@ -117,6 +100,7 @@ type Props = {
     y: number;
     blockId: string | null;
     blockIds?: string[];
+    selectionRanges?: SelectionBlockRange[];
     text: string;
     selectionStart?: number;
     tableCell?: TableCellSelection;
@@ -165,6 +149,7 @@ type MarkRecord = {
 const STREAM_PROBE_MAX_DRIFT = 150;
 function probeStreamDrift(editor: Editor, streamPos: number, expectedText: string): number | null {
   if (!expectedText) return null;
+  const previous = editor.command.getRange();
   for (let step = 0; step <= STREAM_PROBE_MAX_DRIFT; step += 1) {
     const candidates = step === 0 ? [0] : [step, -step];
     for (const d of candidates) {
@@ -176,7 +161,96 @@ function probeStreamDrift(editor: Editor, streamPos: number, expectedText: strin
       if (context?.selectionText === expectedText) return d;
     }
   }
+  if (previous) {
+    editor.command.executeSetRange(
+      previous.startIndex,
+      previous.endIndex,
+      previous.tableId,
+      previous.startTdIndex,
+      previous.endTdIndex,
+      previous.startTrIndex,
+      previous.endTrIndex,
+    );
+  }
   return null;
+}
+
+function utf16OffsetAtStreamOffset(text: string, query: string, streamOffset: number): number | null {
+  let offset = text.indexOf(query);
+  while (offset >= 0) {
+    if (Array.from(text.slice(0, offset)).length === streamOffset) return offset;
+    offset = text.indexOf(query, offset + Math.max(query.length, 1));
+  }
+  return null;
+}
+
+/** Match the live canvas range to one keyword occurrence before restoring it. */
+function preciseCanvasSelectionStart(
+  editor: Editor,
+  blockText: string,
+  selectedText: string,
+  tableCell: TableCellSelection | undefined,
+): number | null {
+  if (!selectedText || !blockText) return null;
+  const current = editor.command.getRange();
+  const sameTableTarget = (candidate: ReturnType<Editor["command"]["getRange"]>) =>
+    tableCell
+      ? candidate.tableId === current.tableId &&
+        candidate.startTrIndex === current.startTrIndex &&
+        candidate.startTdIndex === current.startTdIndex
+      : !candidate.tableId;
+  const candidates = editor.command.getKeywordRangeList(selectedText)
+    .filter((candidate) =>
+      sameTableTarget(candidate) &&
+      Math.abs(candidate.startIndex - (current.startIndex + 1)) <= STREAM_PROBE_MAX_DRIFT + 1,
+    );
+  let selectedRange: (typeof candidates)[number] | undefined;
+  try {
+    for (const candidate of candidates) {
+      const drift = probeStreamDrift(editor, candidate.startIndex, selectedText);
+      if (
+        drift != null &&
+        current.startIndex === candidate.startIndex + drift - 1 &&
+        current.endIndex === candidate.endIndex + drift
+      ) {
+        selectedRange = candidate;
+        break;
+      }
+    }
+  } finally {
+    editor.command.executeSetRange(
+      current.startIndex,
+      current.endIndex,
+      current.tableId,
+      current.startTdIndex,
+      current.endTdIndex,
+      current.startTrIndex,
+      current.endTrIndex,
+    );
+  }
+  if (!selectedRange) return null;
+  const containers = editor.command.getKeywordRangeList(blockText).filter(sameTableTarget);
+  const container = containers.find((candidate) =>
+    candidate.startIndex <= selectedRange.startIndex && candidate.endIndex >= selectedRange.endIndex,
+  );
+  if (!container) return null;
+  return utf16OffsetAtStreamOffset(
+    blockText,
+    selectedText,
+    selectedRange.startIndex - container.startIndex,
+  );
+}
+
+function canvasRangeKey(range: ReturnType<Editor["command"]["getRange"]>): string {
+  return JSON.stringify([
+    range.startIndex,
+    range.endIndex,
+    range.tableId ?? null,
+    range.startTdIndex ?? null,
+    range.endTdIndex ?? null,
+    range.startTrIndex ?? null,
+    range.endTrIndex ?? null,
+  ]);
 }
 
 function ToolButton({ label, active, disabled, onClick, children }: ToolButtonProps) {
@@ -338,6 +412,8 @@ export function OfficeCanvas(props: Props) {
   const marksRef = useRef(new Map<string, MarkRecord>());
   const loadGenerationRef = useRef(0);
   const programmaticRevealRef = useRef(false);
+  const programmaticRevealGenerationRef = useRef(0);
+  const editorShouldReadOnlyRef = useRef(false);
   const suppressDirtyRef = useRef(false);
   const observedDocumentRevisionRef = useRef(props.document.revision);
   const pendingProgrammaticContentChangesRef = useRef(0);
@@ -347,7 +423,7 @@ export function OfficeCanvas(props: Props) {
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [mode, setMode] = useState<"edit" | "read">("edit");
+  const [mode, setMode] = useState<OfficeEditorMode>("edit");
   const [zoom, setZoom] = useState(100);
   const [style, setStyle] = useState(EMPTY_STYLE);
   const blockResolver = useMemo(() => createOfficeBlockResolver(props.blocks), [props.blocks]);
@@ -374,6 +450,7 @@ export function OfficeCanvas(props: Props) {
   onMarkNoticeRef.current = props.onMarkNotice;
   onSelectionChangeRef.current = props.onSelectionChange;
   onDirtyChangeRef.current = props.onDirtyChange;
+  editorShouldReadOnlyRef.current = officeEditorReadOnly(mode, props.busy, saving);
 
   const setCanvasDirty = useCallback((nextDirty: boolean) => {
     dirtyRef.current = nextDirty;
@@ -412,12 +489,16 @@ export function OfficeCanvas(props: Props) {
     const text = context.selectionText ?? editor.command.getRangeText() ?? "";
     const paragraphElements = editor.command.getRangeParagraph();
     const paragraphText = elementText(paragraphElements);
-    const { blockId, blockIds } = resolveBlocksForRange(
+    const paragraphCount = context.endParagraphNo - context.startParagraphNo + 1;
+    const paragraphSelections = text
+      ? splitOfficeSelectionParagraphs(context.selectionElementList, paragraphCount)
+      : null;
+    const { blockId, blockIds } = resolveOfficeBlocksForRange(
       blockResolverRef.current,
       context,
       text,
       paragraphText,
-      paragraphElements,
+      paragraphSelections ?? splitRangeParagraphTexts(paragraphElements),
     );
     const block = blocksRef.current.find((candidate) => candidate.id === blockId);
     const startElementIndex = paragraphElements?.indexOf(context.startElement) ?? -1;
@@ -426,6 +507,7 @@ export function OfficeCanvas(props: Props) {
       : undefined;
     const tableCell = currentTableCell(context);
     const range = editor.command.getRange();
+    const stableRangeKey = canvasRangeKey(range);
     const crossTableCells = Boolean(
       context.isTable &&
         (range.isCrossRowCol ||
@@ -433,13 +515,45 @@ export function OfficeCanvas(props: Props) {
             range.endTdIndex != null &&
             (range.startTdIndex !== range.endTdIndex || range.startTrIndex !== range.endTrIndex))),
     );
+    let preciseSelectionStart: number | null = null;
+    if (text && (tableCell || block) && (!blockIds || blockIds.length === 1)) {
+      const revealGeneration = ++programmaticRevealGenerationRef.current;
+      programmaticRevealRef.current = true;
+      try {
+        preciseSelectionStart = preciseCanvasSelectionStart(
+          editor,
+          tableCell?.before ?? block!.text,
+          text,
+          tableCell,
+        );
+      } finally {
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (programmaticRevealGenerationRef.current !== revealGeneration) return;
+          programmaticRevealRef.current = false;
+          if (editorRef.current !== editor) return;
+          if (canvasRangeKey(editor.command.getRange()) !== stableRangeKey) emitSelection();
+        }));
+      }
+    }
     const selectionStart = text
       ? tableCell
-        ? findSelectionStart(tableCell.before, text, preferredStart)
+        ? preciseSelectionStart ?? findSelectionStart(tableCell.before, text, preferredStart)
         : block
-          ? findSelectionStart(block.text, text, preferredStart)
+          ? preciseSelectionStart ?? findSelectionStart(block.text, text, preferredStart)
           : null
       : null;
+    const resolvedBlockIds = blockIds?.length ? blockIds : blockId ? [blockId] : [];
+    const selectionRanges = !tableCell && resolvedBlockIds.length <= MAX_SELECTION_BLOCKS
+      ? buildOfficeSelectionRanges(
+          blocksRef.current,
+          resolvedBlockIds,
+          text,
+          paragraphSelections,
+          selectionStart ?? undefined,
+        ) ?? undefined
+      : undefined;
+    const canonicalSelectionText = selectionRanges?.map((range) => range.before).join("") ?? text;
+    const canonicalSelectionStart = selectionRanges?.[0]?.start ?? selectionStart ?? undefined;
     const rangeRect = context.rangeRects.at(-1);
     const hostRect = hostRef.current?.getBoundingClientRect();
     const rangeAnchor = rangeRect && hostRect
@@ -451,8 +565,9 @@ export function OfficeCanvas(props: Props) {
     onSelectionChangeRef.current({
       blockId,
       blockIds,
-      text,
-      selectionStart: selectionStart ?? undefined,
+      selectionRanges,
+      text: canonicalSelectionText,
+      selectionStart: canonicalSelectionStart,
       tableCell,
       crossTableCells,
       anchor: text.trim() ? rangeAnchor ?? lastPointerRef.current : null,
@@ -472,6 +587,9 @@ export function OfficeCanvas(props: Props) {
     setCanvasDirty(false);
     changedBlockIdsRef.current.clear();
     marksRef.current.clear();
+    programmaticRevealGenerationRef.current += 1;
+    programmaticRevealRef.current = false;
+    suppressDirtyRef.current = true;
     initializedRef.current = false;
     loadedRevisionRef.current = props.document.revision;
     host.replaceChildren();
@@ -532,7 +650,11 @@ export function OfficeCanvas(props: Props) {
       requestAnimationFrame(() => requestAnimationFrame(() => {
         suppressDirtyRef.current = false;
       }));
-      return range;
+      return {
+        ...range,
+        startIndex: range.startIndex + drift,
+        endIndex: range.endIndex + drift,
+      };
     });
     Reflect.set(host, "__marginOfficeTestCursorAfter", (query: string, occurrence = 0) => {
       const ranges = editor.command.getKeywordRangeList(query);
@@ -633,7 +755,9 @@ export function OfficeCanvas(props: Props) {
         undo: nextStyle.undo,
         redo: nextStyle.redo,
       });
-      queueMicrotask(emitSelection);
+      // preciseCanvasSelectionStart probes temporary ranges. Scheduling a new
+      // selection pass for those probes creates a self-sustaining feedback loop.
+      if (!programmaticRevealRef.current) queueMicrotask(emitSelection);
     };
     editor.listener.pageScaleChange = (scale) => {
       pageScaleRef.current = scale;
@@ -685,6 +809,40 @@ export function OfficeCanvas(props: Props) {
     };
   }, [props.document.id, emitSelection, fitPageForViewport, setCanvasDirty]);
 
+  const locateProposalFocusRange = useCallback((editor: Editor, proposal: Proposal) => {
+    const record = marksRef.current.get(proposal.id);
+    if (record) {
+      const markedRange = editor.command.getKeywordRangeList(record.key)[record.occurrence];
+      if (markedRange) return { range: markedRange, query: record.key };
+    }
+
+    for (const query of proposalFocusQueries(proposal)) {
+      const ranges = editor.command.getKeywordRangeList(query);
+      if (!ranges.length) continue;
+      let range = ranges[0];
+      if (proposal.tableCell) {
+        const tableOrdinal = blocksRef.current
+          .filter((block) => block.kind === "table")
+          .findIndex((block) => block.id === proposal.blockId);
+        const cellRanges = ranges.filter((candidate) =>
+          candidate.startTrIndex === proposal.tableCell!.row - 1
+          && candidate.startTdIndex === proposal.tableCell!.column - 1,
+        );
+        range = cellRanges[Math.max(0, tableOrdinal)] ?? cellRanges[0] ?? range;
+      } else {
+        const normalizedBefore = proposal.before.replace(/\s+/g, "").trim();
+        const duplicateOrdinal = blocksRef.current
+          .filter((block) =>
+            block.kind !== "table" && block.text.replace(/\s+/g, "").trim() === normalizedBefore,
+          )
+          .findIndex((block) => block.id === proposal.blockId);
+        if (duplicateOrdinal >= 0) range = ranges[duplicateOrdinal] ?? range;
+      }
+      if (range) return { range, query };
+    }
+    return null;
+  }, []);
+
   // App-level "清除" only resets store state; also collapse the canvas-editor
   // range so its painted highlight does not linger (and re-emit on next click).
   const clearSelectionSignalRef = useRef(props.clearSelectionSignal);
@@ -702,33 +860,25 @@ export function OfficeCanvas(props: Props) {
     const editor = editorRef.current;
     const proposal = props.proposals.find((candidate) => candidate.id === props.activeProposalId);
     if (!editor || !proposal) return;
-    const query = proposal.tableCell?.before || proposal.before;
-    if (!query.trim()) return;
-    const ranges = editor.command.getKeywordRangeList(query);
-    const normalizedQuery = query.replace(/\s+/g, "").trim();
-    let range = ranges[0];
-    if (proposal.tableCell) {
-      const tableOrdinal = props.blocks
-        .filter((block) => block.kind === "table")
-        .findIndex((block) => block.id === proposal.blockId);
-      const cellRanges = ranges.filter((candidate) =>
-        candidate.startTrIndex === proposal.tableCell!.row - 1 &&
-        candidate.startTdIndex === proposal.tableCell!.column - 1,
-      );
-      range = cellRanges[Math.max(0, tableOrdinal)] ?? cellRanges[0] ?? range;
-    } else {
-      const duplicateOrdinal = props.blocks
-        .filter((block) => block.kind !== "table" && block.text.replace(/\s+/g, "").trim() === normalizedQuery)
-        .findIndex((block) => block.id === proposal.blockId);
-      if (duplicateOrdinal >= 0) range = ranges[duplicateOrdinal] ?? range;
-    }
-    if (!range) return;
+    const target = locateProposalFocusRange(editor, proposal);
+    if (!target) return;
+    const { range, query } = target;
+    const revealGeneration = ++programmaticRevealGenerationRef.current;
     programmaticRevealRef.current = true;
     suppressDirtyRef.current = true;
+    const streamDrift = range.tableId
+      ? 0
+      : probeStreamDrift(editor, range.startIndex, query);
+    if (streamDrift == null) {
+      programmaticRevealRef.current = false;
+      suppressDirtyRef.current = false;
+      return;
+    }
     pendingProgrammaticContentChangesRef.current += 1;
+    const focusRange = canvasFocusRangeIndexes(range, streamDrift);
     editor.command.executeSetRange(
-      Math.max(0, range.startIndex - 1),
-      range.endIndex,
+      focusRange.startIndex,
+      focusRange.endIndex,
       range.tableId,
       range.startTdIndex,
       range.endTdIndex,
@@ -736,6 +886,10 @@ export function OfficeCanvas(props: Props) {
       range.endTrIndex,
     );
     requestAnimationFrame(() => {
+      if (
+        programmaticRevealGenerationRef.current !== revealGeneration ||
+        editorRef.current !== editor
+      ) return;
       const context = editor.command.getRangeContext();
       const rect = context?.rangeRects[0];
       const scroll = scrollRef.current;
@@ -746,24 +900,32 @@ export function OfficeCanvas(props: Props) {
         });
       }
       requestAnimationFrame(() => {
+        if (
+          programmaticRevealGenerationRef.current !== revealGeneration ||
+          editorRef.current !== editor
+        ) return;
         programmaticRevealRef.current = false;
         suppressDirtyRef.current = false;
         emitSelection();
       });
     });
-  }, [loading, props.activeProposalId, props.proposals]);
+  }, [loading, props.activeProposalId, props.proposals, locateProposalFocusRange]);
 
   useEffect(() => {
     if (loading || !props.focusRequest) return;
     const editor = editorRef.current;
     if (!editor) return;
     const request = props.focusRequest;
+    const proposal = request.proposalId
+      ? props.proposals.find((candidate) => candidate.id === request.proposalId)
+      : undefined;
+    const proposalTarget = proposal ? locateProposalFocusRange(editor, proposal) : null;
     const query = request.tableCell?.before || request.query;
     if (!query.trim()) return;
     const ranges = editor.command.getKeywordRangeList(query);
     const normalizedQuery = query.replace(/\s+/g, "").trim();
-    let range = ranges[0];
-    if (request.tableCell) {
+    let range = proposalTarget?.range ?? ranges[0];
+    if (!proposalTarget && request.tableCell) {
       const tableOrdinal = props.blocks
         .filter((block) => block.kind === "table")
         .findIndex((block) => block.id === request.blockId);
@@ -772,7 +934,7 @@ export function OfficeCanvas(props: Props) {
         candidate.startTdIndex === request.tableCell!.column - 1,
       );
       range = cellRanges[Math.max(0, tableOrdinal)] ?? cellRanges[0] ?? range;
-    } else if (request.blockId) {
+    } else if (!proposalTarget && request.blockId) {
       const matching = props.blocks.filter((block) =>
         block.kind !== "table" && normalizedQuery && block.text.replace(/\s+/g, "").includes(normalizedQuery),
       );
@@ -780,12 +942,23 @@ export function OfficeCanvas(props: Props) {
       if (ordinal >= 0) range = ranges[ordinal] ?? range;
     }
     if (!range) return;
+    const focusQuery = proposalTarget?.query ?? query;
+    const revealGeneration = ++programmaticRevealGenerationRef.current;
     programmaticRevealRef.current = true;
     suppressDirtyRef.current = true;
+    const streamDrift = range.tableId
+      ? 0
+      : probeStreamDrift(editor, range.startIndex, focusQuery);
+    if (streamDrift == null) {
+      programmaticRevealRef.current = false;
+      suppressDirtyRef.current = false;
+      return;
+    }
     pendingProgrammaticContentChangesRef.current += 1;
+    const focusRange = canvasFocusRangeIndexes(range, streamDrift);
     editor.command.executeSetRange(
-      Math.max(0, range.startIndex - 1),
-      range.endIndex,
+      focusRange.startIndex,
+      focusRange.endIndex,
       range.tableId,
       range.startTdIndex,
       range.endTdIndex,
@@ -793,6 +966,10 @@ export function OfficeCanvas(props: Props) {
       range.endTrIndex,
     );
     requestAnimationFrame(() => {
+      if (
+        programmaticRevealGenerationRef.current !== revealGeneration ||
+        editorRef.current !== editor
+      ) return;
       const context = editor.command.getRangeContext();
       const rect = context?.rangeRects[0];
       const scroll = scrollRef.current;
@@ -803,12 +980,16 @@ export function OfficeCanvas(props: Props) {
         });
       }
       requestAnimationFrame(() => {
+        if (
+          programmaticRevealGenerationRef.current !== revealGeneration ||
+          editorRef.current !== editor
+        ) return;
         programmaticRevealRef.current = false;
         suppressDirtyRef.current = false;
         emitSelection();
       });
     });
-  }, [loading, props.focusRequest, props.blocks]);
+  }, [loading, props.focusRequest, props.blocks, props.proposals, locateProposalFocusRange]);
 
   // —— 修订标记（Task 2）：pending 提案以 Word 修订样式注入画布 ——
   // 定位失败或 editor 未就绪时返回 false，提案保持 pending-rail 卡片展示，
@@ -825,77 +1006,88 @@ export function OfficeCanvas(props: Props) {
     // （rangeCount=0），改为片段 + 前后少量上下文定位，命中后换算替换区间。
     const fragment = buildAnchor(proposal.before, anchor);
     if (!fragment) return false;
-    const ranges = editor.command.getKeywordRangeList(fragment.key);
-    if (!ranges.length) return false;
-    // ordinal 消歧沿用上方 activeProposal 定位的既有模式（块级）；
-    // 全文命中序号 = 块级 ordinal × 块内 key 总数 + 块内第 N 次出现。
-    const ordinal = duplicateBlockOrdinal(
-      blocks,
-      proposal.blockId,
-      proposal.before.replace(/\s+/g, "").trim(),
+    return withInternalEditorEdit(
+      editor.command,
+      editorShouldReadOnlyRef.current,
+      () => {
+        const ranges = editor.command.getKeywordRangeList(fragment.key);
+        if (!ranges.length) return false;
+        // ordinal 消歧沿用上方 activeProposal 定位的既有模式（块级）；
+        // 全文命中序号 = 块级 ordinal × 块内 key 总数 + 块内第 N 次出现。
+        const ordinal = duplicateBlockOrdinal(
+          blocks,
+          proposal.blockId,
+          proposal.before.replace(/\s+/g, "").trim(),
+        );
+        const range = ranges[ordinal * fragment.occurrences + fragment.occurrence];
+        if (!range || range.tableId) return false;
+        // 搜索流位置 → 元素下标的漂移校正（空段占位元素所致，随段落深度累积）。
+        // 探针文本用定位 key 本身——搜索在该位置逐字命中过，与服务端/画布空白差异无关。
+        const drift = probeStreamDrift(editor, range.startIndex, fragment.key);
+        if (drift == null) return false;
+        // key 命中序号用搜索流坐标记录（与 restoreMark 的 getKeywordRangeList 同源）。
+        const markOffset = fragment.replaceStart - fragment.keyStart;
+        const streamFragmentStart = range.startIndex + markOffset;
+        const fragmentStart = streamFragmentStart + drift;
+        const fragmentLength = change.beforeFragment.length;
+        // 纯插入向左扩选 1 字符，使快照非空——还原才能走 executeInsertElementList
+        // （executeBackspace 会提交历史、污染 undo 栈）。
+        const expandLeft = fragmentLength === 0 ? 1 : 0;
+        // executeSetRange 拒绝负 start（选中被替换区需 regionStart-1），
+        // 文档开头处的变更本轮不注入，降级为 rail 卡片。
+        if (fragmentStart - expandLeft < 1) return false;
+        editor.command.executeSetRange(fragmentStart - expandLeft - 1, fragmentStart + fragmentLength - 1);
+        // 快照直接取选中区的原始元素（含样式），绕开 zip 视图与搜索流的坐标差；
+        // 同时校验选中区确实是目标片段（stale-base 的片段级等价），不是再继续（防误替换）。
+        const context = editor.command.getRangeContext();
+        const expected = proposal.before.slice(fragment.replaceStart - expandLeft, fragment.replaceEnd);
+        if (!context || context.selectionText !== expected) return false;
+        const snapshot = (context.selectionElementList ?? []).map((element) => {
+          const clone = { ...element };
+          delete clone.id;
+          return clone;
+        });
+        if (!snapshot.length) return false;
+        const spans = [
+          ...(expandLeft ? structuredClone(snapshot) : []),
+          ...buildMarkSpans(
+            markBaseStyle(snapshot[0]),
+            change.beforeFragment,
+            change.afterFragment,
+            proposal.id,
+          ),
+        ];
+        suppressDirtyRef.current = true;
+        editor.command.executeInsertElementList(spans, { isSubmitHistory: false });
+        const markedMain = editor.command.getValue({ extraPickAttrs: ["extension"] }).data.main;
+        if (!locateMarkRun(markedMain, proposal.id)) {
+          suppressDirtyRef.current = false;
+          return false;
+        }
+        // 收回光标到标记前（参照 __marginOfficeTestCursorAfter 模式），避免光标留在标记内。
+        editor.command.executeSetRange(fragmentStart - 1, fragmentStart - 1);
+        // 注入后定位用 markedKey（上文尾部 + 标记文本头部）：含后上下文的 key
+        // 会被插入的 ins 文本截断而失效。markedKey 命中起点与注入前 key 相同。
+        const keyRanges = editor.command.getKeywordRangeList(fragment.markedKey);
+        const occurrence = Math.max(
+          0,
+          keyRanges.findIndex((candidate) => candidate.startIndex === range.startIndex),
+        );
+        marksRef.current.set(proposal.id, {
+          snapshot,
+          key: fragment.markedKey,
+          blockId: proposal.blockId,
+          occurrence,
+          expandLeft,
+          markOffset: fragment.markedOffset,
+          markText: fragment.markText,
+        });
+        requestAnimationFrame(() => {
+          suppressDirtyRef.current = false;
+        });
+        return true;
+      },
     );
-    const range = ranges[ordinal * fragment.occurrences + fragment.occurrence];
-    if (!range || range.tableId) return false;
-    // 搜索流位置 → 元素下标的漂移校正（空段占位元素所致，随段落深度累积）。
-    // 探针文本用定位 key 本身——搜索在该位置逐字命中过，与服务端/画布空白差异无关。
-    const drift = probeStreamDrift(editor, range.startIndex, fragment.key);
-    if (drift == null) return false;
-    // key 命中序号用搜索流坐标记录（与 restoreMark 的 getKeywordRangeList 同源）。
-    const markOffset = fragment.replaceStart - fragment.keyStart;
-    const streamFragmentStart = range.startIndex + markOffset;
-    const fragmentStart = streamFragmentStart + drift;
-    const fragmentLength = change.beforeFragment.length;
-    // 纯插入向左扩选 1 字符，使快照非空——还原才能走 executeInsertElementList
-    // （executeBackspace 会提交历史、污染 undo 栈）。
-    const expandLeft = fragmentLength === 0 ? 1 : 0;
-    // executeSetRange 拒绝负 start（选中被替换区需 regionStart-1），
-    // 文档开头处的变更本轮不注入，降级为 rail 卡片。
-    if (fragmentStart - expandLeft < 1) return false;
-    editor.command.executeSetRange(fragmentStart - expandLeft - 1, fragmentStart + fragmentLength - 1);
-    // 快照直接取选中区的原始元素（含样式），绕开 zip 视图与搜索流的坐标差；
-    // 同时校验选中区确实是目标片段（stale-base 的片段级等价），不是再继续（防误替换）。
-    const context = editor.command.getRangeContext();
-    const expected = proposal.before.slice(fragment.replaceStart - expandLeft, fragment.replaceEnd);
-    if (!context || context.selectionText !== expected) return false;
-    const snapshot = (context.selectionElementList ?? []).map((element) => {
-      const clone = { ...element };
-      delete clone.id;
-      return clone;
-    });
-    if (!snapshot.length) return false;
-    const spans = [
-      ...(expandLeft ? structuredClone(snapshot) : []),
-      ...buildMarkSpans(
-        markBaseStyle(snapshot[0]),
-        change.beforeFragment,
-        change.afterFragment,
-        proposal.id,
-      ),
-    ];
-    suppressDirtyRef.current = true;
-    editor.command.executeInsertElementList(spans, { isSubmitHistory: false });
-    // 收回光标到标记前（参照 __marginOfficeTestCursorAfter 模式），避免光标留在标记内。
-    editor.command.executeSetRange(fragmentStart - 1, fragmentStart - 1);
-    // 注入后定位用 markedKey（上文尾部 + 标记文本头部）：含后上下文的 key
-    // 会被插入的 ins 文本截断而失效。markedKey 命中起点与注入前 key 相同。
-    const keyRanges = editor.command.getKeywordRangeList(fragment.markedKey);
-    const occurrence = Math.max(
-      0,
-      keyRanges.findIndex((candidate) => candidate.startIndex === range.startIndex),
-    );
-    marksRef.current.set(proposal.id, {
-      snapshot,
-      key: fragment.markedKey,
-      blockId: proposal.blockId,
-      occurrence,
-      expandLeft,
-      markOffset: fragment.markedOffset,
-      markText: fragment.markText,
-    });
-    requestAnimationFrame(() => {
-      suppressDirtyRef.current = false;
-    });
-    return true;
   }, []);
 
   // 用快照原文替换标记片段。定位失败时保留记录，交给 Task 3 篡改检测/保存兜底。
@@ -904,40 +1096,55 @@ export function OfficeCanvas(props: Props) {
     if (!record) return false;
     const editor = editorRef.current;
     if (!editor || !initializedRef.current) return false;
-    const ranges = editor.command.getKeywordRangeList(record.key);
-    // 严格取记录的命中序号；对不上说明 key 已被编辑破坏，交给
-    // forceRestoreMark 的 extension 扫描兜底，不做 ?? ranges[0] 静默回退。
-    const range = ranges[record.occurrence];
-    if (!range) return false;
-    // 同 injectMark：搜索流位置 → 元素下标的漂移校正（探针文本用 key 本身）。
-    const drift = probeStreamDrift(editor, range.startIndex, record.key);
-    if (drift == null) return false;
-    // 标记文本起点 = key 命中区起点 + 上文尾部偏移；还原区间 = （左扩字符 +）标记文本。
-    const markStart = range.startIndex + drift + record.markOffset;
-    const regionStart = Math.max(1, markStart - record.expandLeft);
-    const regionEnd = markStart + record.markText.length - 1;
-    editor.command.executeSetRange(
-      regionStart - 1,
-      regionEnd,
-      range.tableId,
-      range.startTdIndex,
-      range.endTdIndex,
-      range.startTrIndex,
-      range.endTrIndex,
+    return withInternalEditorEdit(
+      editor.command,
+      editorShouldReadOnlyRef.current,
+      () => {
+        const ranges = editor.command.getKeywordRangeList(record.key);
+        // 严格取记录的命中序号；对不上说明 key 已被编辑破坏，交给
+        // forceRestoreMark 的 extension 扫描兜底，不做 ?? ranges[0] 静默回退。
+        const range = ranges[record.occurrence];
+        if (!range) return false;
+        // 同 injectMark：搜索流位置 → 元素下标的漂移校正（探针文本用 key 本身）。
+        const drift = probeStreamDrift(editor, range.startIndex, record.key);
+        if (drift == null) return false;
+        // 标记文本起点 = key 命中区起点 + 上文尾部偏移；还原区间 = （左扩字符 +）标记文本。
+        const markStart = range.startIndex + drift + record.markOffset;
+        const regionStart = Math.max(1, markStart - record.expandLeft);
+        const regionEnd = markStart + record.markText.length - 1;
+        editor.command.executeSetRange(
+          regionStart - 1,
+          regionEnd,
+          range.tableId,
+          range.startTdIndex,
+          range.endTdIndex,
+          range.startTrIndex,
+          range.endTrIndex,
+        );
+        // 选中区必须是（左扩字符 +）标记文本原文，否则保留记录交给扫描兜底。
+        const snapshotText = record.snapshot.map((element) => element.value).join("");
+        const expected = snapshotText.slice(0, record.expandLeft) + record.markText;
+        const context = editor.command.getRangeContext();
+        if (
+          !context
+          || context.selectionText !== expected
+          || !selectionContainsMark(context.selectionElementList ?? [], proposalId)
+        ) return false;
+        suppressDirtyRef.current = true;
+        editor.command.executeInsertElementList(structuredClone(record.snapshot), { isSubmitHistory: false });
+        const restoredMain = editor.command.getValue({ extraPickAttrs: ["extension"] }).data.main;
+        if (locateMarkRun(restoredMain, proposalId)) {
+          suppressDirtyRef.current = false;
+          return false;
+        }
+        editor.command.executeSetRange(regionStart - 1, regionStart - 1);
+        marksRef.current.delete(proposalId);
+        requestAnimationFrame(() => {
+          suppressDirtyRef.current = false;
+        });
+        return true;
+      },
     );
-    // 选中区必须是（左扩字符 +）标记文本原文，否则保留记录交给扫描兜底。
-    const snapshotText = record.snapshot.map((element) => element.value).join("");
-    const expected = snapshotText.slice(0, record.expandLeft) + record.markText;
-    const context = editor.command.getRangeContext();
-    if (!context || context.selectionText !== expected) return false;
-    suppressDirtyRef.current = true;
-    editor.command.executeInsertElementList(structuredClone(record.snapshot), { isSubmitHistory: false });
-    editor.command.executeSetRange(regionStart - 1, regionStart - 1);
-    marksRef.current.delete(proposalId);
-    requestAnimationFrame(() => {
-      suppressDirtyRef.current = false;
-    });
-    return true;
   }, []);
 
   // key 失效（用户在标记内编辑把 key 改坏）时的兜底还原：按 extension
@@ -946,34 +1153,60 @@ export function OfficeCanvas(props: Props) {
     const record = marksRef.current.get(proposalId);
     const editor = editorRef.current;
     if (!record || !editor || !initializedRef.current) return false;
-    const main = editor.command.getValue({ extraPickAttrs: ["extension"] }).data.main;
-    const run = locateMarkRun(main, proposalId);
-    if (!run) return false;
-    const runText = sliceElements(main, run.start, run.end)
-      .map((element) => element.value)
-      .join("");
-    if (!runText) return false;
-    // run.start 是 zip 视图坐标；重新按文本搜索并对齐到元素下标。
-    const hits = editor.command.getKeywordRangeList(runText);
-    const hit = hits[0];
-    if (!hit) return false;
-    const drift = probeStreamDrift(editor, hit.startIndex, runText);
-    if (drift == null) return false;
-    const regionStart = Math.max(1, hit.startIndex + drift - record.expandLeft);
-    const regionEnd = hit.startIndex + drift + runText.length - 1;
-    editor.command.executeSetRange(regionStart - 1, regionEnd);
-    const snapshotText = record.snapshot.map((element) => element.value).join("");
-    const expected = snapshotText.slice(0, record.expandLeft) + runText;
-    const context = editor.command.getRangeContext();
-    if (!context || context.selectionText !== expected) return false;
-    suppressDirtyRef.current = true;
-    editor.command.executeInsertElementList(structuredClone(record.snapshot), { isSubmitHistory: false });
-    editor.command.executeSetRange(regionStart - 1, regionStart - 1);
-    marksRef.current.delete(proposalId);
-    requestAnimationFrame(() => {
-      suppressDirtyRef.current = false;
-    });
-    return true;
+    return withInternalEditorEdit(
+      editor.command,
+      editorShouldReadOnlyRef.current,
+      () => {
+        const main = editor.command.getValue({ extraPickAttrs: ["extension"] }).data.main;
+        const run = locateMarkRun(main, proposalId);
+        if (!run) return false;
+        const runText = sliceElements(main, run.start, run.end)
+          .map((element) => element.value)
+          .join("");
+        if (!runText) return false;
+        // run.start 是 zip 视图坐标；重新按文本搜索并对齐到元素下标。
+        const snapshotText = record.snapshot.map((element) => element.value).join("");
+        const expected = snapshotText.slice(0, record.expandLeft) + runText;
+        let regionStart: number | null = null;
+        for (const hit of editor.command.getKeywordRangeList(runText)) {
+          const drift = probeStreamDrift(editor, hit.startIndex, runText);
+          if (drift == null) continue;
+          const candidateStart = Math.max(1, hit.startIndex + drift - record.expandLeft);
+          const candidateEnd = hit.startIndex + drift + runText.length - 1;
+          editor.command.executeSetRange(
+            candidateStart - 1,
+            candidateEnd,
+            hit.tableId,
+            hit.startTdIndex,
+            hit.endTdIndex,
+            hit.startTrIndex,
+            hit.endTrIndex,
+          );
+          const context = editor.command.getRangeContext();
+          if (
+            context?.selectionText === expected
+            && selectionContainsMark(context.selectionElementList ?? [], proposalId)
+          ) {
+            regionStart = candidateStart;
+            break;
+          }
+        }
+        if (regionStart == null) return false;
+        suppressDirtyRef.current = true;
+        editor.command.executeInsertElementList(structuredClone(record.snapshot), { isSubmitHistory: false });
+        const restoredMain = editor.command.getValue({ extraPickAttrs: ["extension"] }).data.main;
+        if (locateMarkRun(restoredMain, proposalId)) {
+          suppressDirtyRef.current = false;
+          return false;
+        }
+        editor.command.executeSetRange(regionStart - 1, regionStart - 1);
+        marksRef.current.delete(proposalId);
+        requestAnimationFrame(() => {
+          suppressDirtyRef.current = false;
+        });
+        return true;
+      },
+    );
   }, []);
 
   // 篡改检测/保存兜底共用：先走 key 定位，失败退回 extension 扫描；
@@ -1065,25 +1298,36 @@ export function OfficeCanvas(props: Props) {
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
 
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || loading) return;
+    editor.command.executeMode(
+      officeEditorReadOnly(mode, props.busy, saving) ? EditorMode.READONLY : EditorMode.EDIT,
+    );
+  }, [loading, mode, props.busy, saving]);
+
   const command = (run: (editor: Editor) => void) => {
     const editor = editorRef.current;
     if (!editor || loading) return;
     run(editor);
   };
 
-  const changeMode = (next: "edit" | "read") => {
+  const changeMode = (next: OfficeEditorMode) => {
+    if (props.busy || saving) return;
     setMode(next);
     command((editor) => editor.command.executeMode(next === "edit" ? EditorMode.EDIT : EditorMode.READONLY));
   };
 
   const save = async () => {
     const editor = editorRef.current;
-    if (!editor || loading || saving || !dirty) return;
+    if (!editor || loading || saving || props.busy || !dirty) return;
     // 保存前确认（Task 2）：手动保存会 supersede 全部待审提案。确认必须
     // 发生在下面"还原→导出→重注入"兜底之前，取消时标记与提案保持原样。
     const pendingCount = countPendingProposals(proposalsRef.current);
     if (pendingCount > 0 && !window.confirm(buildSaveConfirmMessage(pendingCount))) return;
     setSaving(true);
+    editorShouldReadOnlyRef.current = true;
+    editor.command.executeMode(EditorMode.READONLY);
     setError(null);
     // 保存兜底（Task 3）：修订标记的 strikeout/下划线样式绝不进 docx。
     // 一律先全量还原标记再导出，结束后重新注入仍 pending 的标记。
@@ -1093,6 +1337,7 @@ export function OfficeCanvas(props: Props) {
         forceRestoreMark(id);
       }
     }
+    let saveSucceeded = false;
     try {
       const value = editor.command.getValue();
       if (!value.data.main.length) {
@@ -1126,32 +1371,54 @@ export function OfficeCanvas(props: Props) {
       lastSaveModeRef.current = result.saveMode;
       changedBlockIdsRef.current.clear();
       setCanvasDirty(false);
+      saveSucceeded = true;
       props.onDocumentSaved(result.document, result.blocks);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      // 重新注入仍 pending 的标记（保存成功/失败都恢复展示；injectMark 自带
-      // initialized 守卫，失败时留给 diff effect 下次重试）。
-      const pending = proposalsRef.current.filter(
-        (proposal) => proposal.status === "proposed" && !marksRef.current.has(proposal.id),
+      // Only a failed/cancelled save keeps proposals pending. A successful save
+      // supersedes them server-side, so reusing the stale prop list would revive
+      // closed cards and marks until the follow-up refresh succeeds.
+      const pending = proposalsToReinjectAfterSave(
+        proposalsRef.current,
+        new Set(marksRef.current.keys()),
+        saveSucceeded,
       );
       for (const proposal of planInjectionOrder(pending, blocksRef.current)) {
         injectMark(proposal);
       }
+      editorShouldReadOnlyRef.current = officeEditorReadOnly(mode, props.busy, false);
+      editor.command.executeMode(
+        editorShouldReadOnlyRef.current ? EditorMode.READONLY : EditorMode.EDIT,
+      );
       setSaving(false);
     }
   };
 
   const handleContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
     const editor = editorRef.current;
-    if (!editor) return;
+    // Do not steal the reveal generation while a proposal/thread focus is
+    // waiting for its second animation frame; that owner also guards dirty state.
+    if (!editor || programmaticRevealRef.current) return;
     const text = editor.command.getRangeText();
     if (!text.trim()) return;
     const context = editor.command.getRangeContext();
     const paragraphElements = editor.command.getRangeParagraph();
     const paragraphText = elementText(paragraphElements);
+    const paragraphSelections = context
+      ? splitOfficeSelectionParagraphs(
+          context.selectionElementList,
+          context.endParagraphNo - context.startParagraphNo + 1,
+        )
+      : null;
     const { blockId, blockIds } = context
-      ? resolveBlocksForRange(blockResolverRef.current, context, text, paragraphText, paragraphElements)
+      ? resolveOfficeBlocksForRange(
+          blockResolverRef.current,
+          context,
+          text,
+          paragraphText,
+          paragraphSelections ?? splitRangeParagraphTexts(paragraphElements),
+        )
       : { blockId: null };
     const block = props.blocks.find((candidate) => candidate.id === blockId);
     const startElementIndex = context && paragraphElements
@@ -1169,30 +1436,63 @@ export function OfficeCanvas(props: Props) {
             range.endTdIndex != null &&
             (range.startTdIndex !== range.endTdIndex || range.startTrIndex !== range.endTrIndex))),
     );
+    let preciseSelectionStart: number | null = null;
+    if (blockIds?.length ? blockIds.length === 1 : !!blockId) {
+      const revealGeneration = ++programmaticRevealGenerationRef.current;
+      programmaticRevealRef.current = true;
+      try {
+        preciseSelectionStart = preciseCanvasSelectionStart(
+          editor,
+          tableCell?.before ?? block?.text ?? "",
+          text,
+          tableCell,
+        );
+      } finally {
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (programmaticRevealGenerationRef.current !== revealGeneration) return;
+          programmaticRevealRef.current = false;
+        }));
+      }
+    }
+    const selectionStart = tableCell
+      ? preciseSelectionStart ?? findSelectionStart(tableCell.before, text, preferredStart) ?? undefined
+      : block
+        ? preciseSelectionStart ?? findSelectionStart(block.text, text, preferredStart) ?? undefined
+        : undefined;
+    const resolvedBlockIds = blockIds?.length ? blockIds : blockId ? [blockId] : [];
+    const selectionRanges = !tableCell && resolvedBlockIds.length <= MAX_SELECTION_BLOCKS
+      ? buildOfficeSelectionRanges(
+          props.blocks,
+          resolvedBlockIds,
+          text,
+          paragraphSelections,
+          selectionStart,
+        ) ?? undefined
+      : undefined;
+    const canonicalSelectionText = selectionRanges?.map((range) => range.before).join("") ?? text;
+    const canonicalSelectionStart = selectionRanges?.[0]?.start ?? selectionStart;
     event.preventDefault();
     props.onContextMenu({
       x: event.clientX,
       y: event.clientY,
       blockId,
       blockIds,
-      text,
-      selectionStart: tableCell
-        ? findSelectionStart(tableCell.before, text, preferredStart) ?? undefined
-        : block
-          ? findSelectionStart(block.text, text, preferredStart) ?? undefined
-          : undefined,
+      selectionRanges,
+      text: canonicalSelectionText,
+      selectionStart: canonicalSelectionStart,
       tableCell,
       crossTableCells,
     });
   };
 
   const disabled = loading || !!error;
+  const editDisabled = disabled || props.busy || saving || mode === "read";
   return (
     <div className="office-workspace">
       <div className="office-toolbar" role="toolbar" aria-label="Word 编辑工具">
         <div className="office-tool-group office-history-tools">
-          <ToolButton label="撤销" disabled={disabled || !style.undo} onClick={() => command((e) => e.command.executeUndo())}><Undo2 /></ToolButton>
-          <ToolButton label="重做" disabled={disabled || !style.redo} onClick={() => command((e) => e.command.executeRedo())}><Redo2 /></ToolButton>
+          <ToolButton label="撤销" disabled={editDisabled || !style.undo} onClick={() => command((e) => e.command.executeUndo())}><Undo2 /></ToolButton>
+          <ToolButton label="重做" disabled={editDisabled || !style.redo} onClick={() => command((e) => e.command.executeRedo())}><Redo2 /></ToolButton>
         </div>
         <div className="office-tool-group">
           <select
@@ -1200,7 +1500,7 @@ export function OfficeCanvas(props: Props) {
             aria-label="字体"
             title="字体"
             value={style.font || "Times New Roman"}
-            disabled={disabled || mode === "read"}
+            disabled={editDisabled}
             onChange={(event) => command((e) => e.command.executeFont(event.target.value))}
           >
             {!(["Times New Roman", "Arial", "宋体", "黑体", "Calibri", "Cambria"] as Array<string | null>).includes(style.font) && style.font ? (
@@ -1218,7 +1518,7 @@ export function OfficeCanvas(props: Props) {
             aria-label="字号"
             title="字号"
             value={String(Math.round(style.size || 16))}
-            disabled={disabled || mode === "read"}
+            disabled={editDisabled}
             onChange={(event) => command((e) => e.command.executeSize(Number(event.target.value)))}
           >
             {![12, 14, 16, 19, 21].includes(Math.round(style.size || 16)) ? (
@@ -1232,15 +1532,15 @@ export function OfficeCanvas(props: Props) {
           </select>
         </div>
         <div className="office-tool-group">
-          <ToolButton label="加粗" active={style.bold} disabled={disabled || mode === "read"} onClick={() => command((e) => e.command.executeBold())}><BoldIcon /></ToolButton>
-          <ToolButton label="斜体" active={style.italic} disabled={disabled || mode === "read"} onClick={() => command((e) => e.command.executeItalic())}><ItalicIcon /></ToolButton>
-          <ToolButton label="下划线" active={style.underline} disabled={disabled || mode === "read"} onClick={() => command((e) => e.command.executeUnderline())}><UnderlineIcon /></ToolButton>
+          <ToolButton label="加粗" active={style.bold} disabled={editDisabled} onClick={() => command((e) => e.command.executeBold())}><BoldIcon /></ToolButton>
+          <ToolButton label="斜体" active={style.italic} disabled={editDisabled} onClick={() => command((e) => e.command.executeItalic())}><ItalicIcon /></ToolButton>
+          <ToolButton label="下划线" active={style.underline} disabled={editDisabled} onClick={() => command((e) => e.command.executeUnderline())}><UnderlineIcon /></ToolButton>
         </div>
         <div className="office-tool-group office-align-tools">
-          <ToolButton label="左对齐" active={style.rowFlex === RowFlex.LEFT} disabled={disabled || mode === "read"} onClick={() => command((e) => e.command.executeRowFlex(RowFlex.LEFT))}><AlignLeft /></ToolButton>
-          <ToolButton label="居中" active={style.rowFlex === RowFlex.CENTER} disabled={disabled || mode === "read"} onClick={() => command((e) => e.command.executeRowFlex(RowFlex.CENTER))}><AlignCenter /></ToolButton>
-          <ToolButton label="右对齐" active={style.rowFlex === RowFlex.RIGHT} disabled={disabled || mode === "read"} onClick={() => command((e) => e.command.executeRowFlex(RowFlex.RIGHT))}><AlignRight /></ToolButton>
-          <ToolButton label="两端对齐" active={style.rowFlex === RowFlex.ALIGNMENT} disabled={disabled || mode === "read"} onClick={() => command((e) => e.command.executeRowFlex(RowFlex.ALIGNMENT))}><AlignJustify /></ToolButton>
+          <ToolButton label="左对齐" active={style.rowFlex === RowFlex.LEFT} disabled={editDisabled} onClick={() => command((e) => e.command.executeRowFlex(RowFlex.LEFT))}><AlignLeft /></ToolButton>
+          <ToolButton label="居中" active={style.rowFlex === RowFlex.CENTER} disabled={editDisabled} onClick={() => command((e) => e.command.executeRowFlex(RowFlex.CENTER))}><AlignCenter /></ToolButton>
+          <ToolButton label="右对齐" active={style.rowFlex === RowFlex.RIGHT} disabled={editDisabled} onClick={() => command((e) => e.command.executeRowFlex(RowFlex.RIGHT))}><AlignRight /></ToolButton>
+          <ToolButton label="两端对齐" active={style.rowFlex === RowFlex.ALIGNMENT} disabled={editDisabled} onClick={() => command((e) => e.command.executeRowFlex(RowFlex.ALIGNMENT))}><AlignJustify /></ToolButton>
         </div>
         <div className="office-tool-group office-zoom-tools">
           <ToolButton label="缩小" disabled={disabled} onClick={() => { mobileAutoFitRef.current = false; command((e) => e.command.executePageScaleMinus()); }}><ZoomOut /></ToolButton>
@@ -1262,10 +1562,10 @@ export function OfficeCanvas(props: Props) {
         </div>
         <div className="office-toolbar-spacer" />
         <div className="office-mode" aria-label="编辑模式">
-          <button type="button" className={mode === "read" ? "active" : ""} onClick={() => changeMode("read")}><Eye />阅读</button>
-          <button type="button" className={mode === "edit" ? "active" : ""} onClick={() => changeMode("edit")}><Pencil />编辑</button>
+          <button type="button" className={mode === "read" ? "active" : ""} disabled={props.busy || saving} onClick={() => changeMode("read")}><Eye />阅读</button>
+          <button type="button" className={mode === "edit" ? "active" : ""} disabled={props.busy || saving} onClick={() => changeMode("edit")}><Pencil />编辑</button>
         </div>
-        <button className="office-save" type="button" disabled={disabled || saving || !dirty} onClick={() => void save()}>
+        <button className="office-save" type="button" disabled={disabled || saving || props.busy || !dirty} onClick={() => void save()}>
           {saving ? <RotateCcw className="spin" /> : <Save />}
           {saving ? "保存中" : dirty ? "保存" : "已保存"}
         </button>

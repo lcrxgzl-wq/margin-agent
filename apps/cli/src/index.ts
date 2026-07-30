@@ -57,6 +57,7 @@ import {
   type Workspace,
 } from "@margin/storage-local";
 import {
+  CONTEXT_TIER_PRESETS,
   isUserFacingPhase,
   PiLoopFailure,
   runBlockScan,
@@ -67,8 +68,10 @@ import {
 } from "@margin/agent";
 import {
   contentHash,
+  MAX_SELECTION_BLOCKS,
   type ProposalOperationKind,
   type ProposalTargetLanguage,
+  type SelectionBlockRange,
 } from "@margin/domain";
 import {
   getHarness,
@@ -113,6 +116,11 @@ import {
   type CcSwitchRouteId,
 } from "./cc-switch-connect.js";
 import { setBoundedMap } from "./run-state.js";
+import {
+  assertSelectionBlockCount,
+  resolveSelectionContextLimit,
+  validateProposalSelectionRanges,
+} from "./proposal-selection.js";
 import { abortOnClientDisconnect } from "./stream-lifecycle.js";
 import {
   callEnabledRemoteMcpTool,
@@ -128,6 +136,13 @@ import {
   type McpApprovalAuditEntry,
 } from "./mcp-approvals.js";
 import { MARGIN_VERSION } from "./version.js";
+import { chatSelectionError } from "./chat-selection.js";
+import {
+  isActiveDocumentRequest,
+  parseResolveProposalsInput,
+  resolveProposalsAtomically,
+} from "./proposal-batch.js";
+import { buildQuickEditSourceContext } from "./quick-edit-sources.js";
 
 function llmMode(): "mock" | "byok" {
   if (
@@ -255,6 +270,13 @@ async function main() {
     const requestedId = typeof requested === "string" ? requested.trim() : "";
     return getHarness(requestedId || configured?.trim() || undefined).id;
   };
+  const currentSelectionContextLimit = () => {
+    const settings = readLlmSettingsStore(workspacePath);
+    return resolveSelectionContextLimit(
+      settings.selectionContextChars,
+      CONTEXT_TIER_PRESETS[settings.contextTier ?? "standard"].selectionChars,
+    );
+  };
 
   /** Structured per-turn Skill ids: unknown / blocked / disabled all fail visibly. */
   const resolveSelectedSkills = (raw: unknown):
@@ -352,7 +374,7 @@ async function main() {
       opened,
       chat: {
         turns: state.chat.list(),
-        maxTurns: 12,
+        maxTurns: 80,
       },
       review: {
         threads: state.reviewThreads.filter(
@@ -405,6 +427,8 @@ async function main() {
       instruction?: string;
       selectionText?: string;
       selectionStart?: number;
+      selectionRanges?: SelectionBlockRange[];
+      selectionContextChars?: number;
       operation?: ProposalOperationKind;
       targetLanguage?: ProposalTargetLanguage;
       tableCell?: { row: number; column: number; address: string; before: string };
@@ -422,24 +446,16 @@ async function main() {
       setBoundedMap(state.runs, runId, { ...cur, ...partial });
     };
     try {
-      const sourceContext = [] as Array<{ sourceRef: string; text: string }>;
-      let remainingSourceChars = 24_000;
-      for (const relativePath of opts?.sourcePaths ?? []) {
-        if (remainingSourceChars <= 0) break;
-        const source = await readSourceExcerpt(relativePath);
-        const end = Math.min(source.text.length, 4_000, remainingSourceChars);
-        if (end <= 0) continue;
-        sourceContext.push({
-          sourceRef: `${source.relativePath}#sha256=${source.contentHash}&chars=0-${end}`,
-          text: source.text.slice(0, end),
-        });
-        remainingSourceChars -= end;
-      }
+      const sourceContext = await buildQuickEditSourceContext(
+        opts?.sourcePaths ?? [],
+        readSourceExcerpt,
+      );
       const scanLlmStore = readLlmSettingsStore(workspacePath);
       const scan = await runBlockScan(
         {
           reasoningMode: scanLlmStore.reasoningMode,
           reasoningOptIn: activeProfile(scanLlmStore).reasoningOptIn,
+          timeoutMs: scanLlmStore.agentTimeoutMs,
           documentId,
           revision: doc.revision,
           blocks,
@@ -447,6 +463,8 @@ async function main() {
           instruction: opts?.instruction,
           selectionText: opts?.selectionText,
           selectionStart: opts?.selectionStart,
+          selectionRanges: opts?.selectionRanges,
+          selectionContextChars: opts?.selectionContextChars,
           operation: opts?.operation,
           targetLanguage: opts?.targetLanguage,
           tableCell: opts?.tableCell,
@@ -467,6 +485,10 @@ async function main() {
       if (state.runs.get(runId)?.status === "cancelled") return;
       if (state.latestScanRunByDocument.get(documentId) !== runId) {
         patch({ status: "superseded", phase: "已被较新的任务替代" });
+        return;
+      }
+      if (!isActiveDocumentRequest(state.agent.bag.documentId, documentId)) {
+        patch({ status: "superseded", phase: "文稿已切换，结果未写入" });
         return;
       }
       const proposalIds: string[] = [];
@@ -535,6 +557,8 @@ async function main() {
       instruction?: string;
       selectionText?: string;
       selectionStart?: number;
+      selectionRanges?: SelectionBlockRange[];
+      selectionContextChars?: number;
       operation?: ProposalOperationKind;
       targetLanguage?: ProposalTargetLanguage;
       tableCell?: { row: number; column: number; address: string; before: string };
@@ -689,6 +713,8 @@ async function main() {
       reasoningMode?: "auto" | "fast" | "standard" | "deep" | null;
       harnessId?: string | null;
       agentTimeoutMs?: number | null;
+      contextTier?: "eco" | "standard" | "max" | null;
+      selectionContextChars?: number | null;
       /** Automatic context compaction toggle; null clears back to default. */
       compactionAuto?: boolean | null;
     };
@@ -801,12 +827,44 @@ async function main() {
     },
   );
 
-  app.post<{ Body: { relativePath: string } }>("/api/v1/documents/open", async (req, reply) => {
+  app.post<{
+    Body: {
+      relativePath: string;
+      expectedDocument?: { id?: string; revision?: number } | null;
+    };
+  }>("/api/v1/documents/open", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
     const relativePath = req.body?.relativePath;
     if (!relativePath) return reply.code(400).send({ error: "relativePath required" });
+    const hasExpectedDocument = Boolean(
+      req.body && Object.prototype.hasOwnProperty.call(req.body, "expectedDocument"),
+    );
+    const expectedDocument = req.body?.expectedDocument;
+    if (
+      hasExpectedDocument &&
+      expectedDocument !== null &&
+      (
+        !expectedDocument ||
+        typeof expectedDocument.id !== "string" ||
+        !expectedDocument.id.trim() ||
+        !Number.isSafeInteger(expectedDocument.revision) ||
+        Number(expectedDocument.revision) < 0
+      )
+    ) {
+      return reply.code(400).send({ error: "expectedDocument must be { id, revision } or null" });
+    }
     try {
       return await enqueueChat(async () => {
+        if (hasExpectedDocument) {
+          const activeDocumentId = state.agent.bag.documentId;
+          const activeRevision = state.agent.bag.revision;
+          const matchesExpectedDocument = expectedDocument === null
+            ? activeDocumentId === undefined
+            : activeDocumentId === expectedDocument?.id && activeRevision === expectedDocument?.revision;
+          if (!matchesExpectedDocument) {
+            return reply.code(409).send({ ok: false, reason: "document_mismatch" });
+          }
+        }
         const doc = await openDocumentFile(workspace, relativePath);
         const blocks = listBlocks(workspace, doc.id);
         const switched = syncBagFromDocument(state.agent, doc, blocks);
@@ -822,12 +880,38 @@ async function main() {
     }
   });
 
-  app.post<{ Body: { relativePath: string } }>("/api/v1/documents/import-docx", async (req, reply) => {
+  app.post<{
+    Body: {
+      relativePath: string;
+      expectedDocument?: { id?: string; revision?: number } | null;
+    };
+  }>("/api/v1/documents/import-docx", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
     const relativePath = req.body?.relativePath;
     if (!relativePath) return reply.code(400).send({ error: "relativePath required" });
+    const expectedDocument = req.body?.expectedDocument;
+    if (
+      expectedDocument !== null &&
+      (
+        !expectedDocument ||
+        typeof expectedDocument.id !== "string" ||
+        !expectedDocument.id.trim() ||
+        !Number.isSafeInteger(expectedDocument.revision) ||
+        Number(expectedDocument.revision) < 0
+      )
+    ) {
+      return reply.code(400).send({ error: "expectedDocument must be { id, revision } or null" });
+    }
     try {
       return await enqueueChat(async () => {
+        const activeDocumentId = state.agent.bag.documentId;
+        const activeRevision = state.agent.bag.revision;
+        const matchesExpectedDocument = expectedDocument === null
+          ? activeDocumentId === undefined
+          : activeDocumentId === expectedDocument.id && activeRevision === expectedDocument.revision;
+        if (!matchesExpectedDocument) {
+          return reply.code(409).send({ ok: false, reason: "document_mismatch" });
+        }
         const { document, report } = await importDocxDocument(workspace, relativePath);
         const blocks = listBlocks(workspace, document.id);
         const switched = syncBagFromDocument(state.agent, document, blocks);
@@ -901,6 +985,7 @@ async function main() {
       instruction?: string;
       selectionText?: string;
       selectionStart?: number;
+      selectionRanges?: unknown;
       operation?: ProposalOperationKind;
       targetLanguage?: ProposalTargetLanguage;
       tableCell?: { row: number; column: number; address: string; before: string };
@@ -910,19 +995,28 @@ async function main() {
     };
   }>("/api/v1/documents/:id/proposal-runs", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
+    if (!isActiveDocumentRequest(state.agent.bag.documentId, req.params.id)) {
+      return reply.code(409).send({ ok: false, reason: "document_mismatch" });
+    }
     const selectedSkillsResult = resolveSelectedSkills(req.body?.selectedSkills);
     if (!selectedSkillsResult.ok) {
       return reply.code(400).send({ error: selectedSkillsResult.error });
     }
     const documentId = req.params.id;
     const blocks = listBlocks(workspace, documentId);
+    const requestedBlockIds = req.body?.blockIds?.length ? req.body.blockIds : undefined;
+    try {
+      if (requestedBlockIds) assertSelectionBlockCount(requestedBlockIds);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
     const selected =
-      req.body?.blockIds?.length
-        ? blocks.filter((b) => req.body.blockIds!.includes(b.id))
-        : blocks.slice(0, 8);
+      requestedBlockIds
+        ? blocks.filter((b) => requestedBlockIds.includes(b.id))
+        : blocks.slice(0, MAX_SELECTION_BLOCKS);
     if (!selected.length) return reply.code(400).send({ error: "no blocks" });
-    if (selected.length > 12) {
-      return reply.code(400).send({ error: "select at most 12 blocks per scan" });
+    if (selected.length > MAX_SELECTION_BLOCKS) {
+      return reply.code(400).send({ error: `select at most ${MAX_SELECTION_BLOCKS} blocks per scan` });
     }
 
     const instruction =
@@ -932,12 +1026,26 @@ async function main() {
     const selectionText = typeof req.body?.selectionText === "string"
       ? req.body.selectionText
       : undefined;
-    if (selectionText && selectionText.length > 6_000) {
-      return reply.code(413).send({ error: "选区超过 6000 字符，请缩小选区后重试；Margin 不会静默截断正文。" });
+    const selectionContextChars = currentSelectionContextLimit();
+    if (selectionText && selectionText.length > selectionContextChars) {
+      return reply.code(413).send({
+        error: `选区超过当前上限 ${selectionContextChars} 字符，请在 Agent 设置中提高“选区上下文”，或缩小选区后重试；Margin 不会静默截断正文。`,
+      });
     }
     const selectionStart = Number.isInteger(req.body?.selectionStart) && req.body!.selectionStart! >= 0
       ? req.body!.selectionStart
       : undefined;
+    let selectionRanges: SelectionBlockRange[] | undefined;
+    try {
+      selectionRanges = validateProposalSelectionRanges({
+        selected,
+        selectionText,
+        selectionStart,
+        selectionRanges: req.body?.selectionRanges,
+      });
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
     const operation = req.body?.operation;
     if (operation && !["rewrite", "translate", "polish"].includes(operation)) {
       return reply.code(400).send({ error: "invalid selection operation" });
@@ -992,6 +1100,8 @@ async function main() {
         instruction: instruction || undefined,
         selectionText: selectionText?.trim() ? selectionText : undefined,
         selectionStart,
+        selectionRanges,
+        selectionContextChars,
         operation,
         targetLanguage,
         tableCell,
@@ -1048,14 +1158,36 @@ async function main() {
     }
   });
 
-  app.put<{ Body: { sourcePaths?: string[] } }>("/api/v1/session/sources", async (req, reply) => {
+  app.put<{
+    Body: { documentId?: string | null; sourcePaths?: string[] };
+  }>("/api/v1/session/sources", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
+    const hasDocumentId = Boolean(
+      req.body && Object.prototype.hasOwnProperty.call(req.body, "documentId"),
+    );
+    const requestedDocumentId = req.body?.documentId;
+    if (
+      !hasDocumentId ||
+      (
+        requestedDocumentId !== null &&
+        (
+          typeof requestedDocumentId !== "string" ||
+          !requestedDocumentId.trim() ||
+          requestedDocumentId !== requestedDocumentId.trim()
+        )
+      )
+    ) {
+      return reply.code(400).send({ error: "documentId must be a non-empty string or null" });
+    }
     try {
-      await enqueueChat(async () => {
+      return await enqueueChat(async () => {
+        if ((state.agent.bag.documentId ?? null) !== requestedDocumentId) {
+          return reply.code(409).send({ ok: false, reason: "document_mismatch" });
+        }
         replaceAttachedSources(state.agent, workspace, req.body?.sourcePaths ?? []);
         persistSession();
+        return { sourcePaths: state.agent.sourcePaths };
       });
-      return { sourcePaths: state.agent.sourcePaths };
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
     }
@@ -1112,6 +1244,9 @@ async function main() {
     return enqueueChat(async () => {
       try {
         const proposal = getProposal(workspace, req.params.id);
+        if (!isActiveDocumentRequest(state.agent.bag.documentId, proposal.documentId)) {
+          return reply.code(409).send({ error: "文稿状态已变化，请刷新页面后重试" });
+        }
         const decision = saveDecision(
           workspace,
           req.params.id,
@@ -1135,6 +1270,9 @@ async function main() {
     requireAuth(state, req.headers.authorization);
     // I1: apply mutates the bag and appends agent notes; serialize with chat turns.
     return enqueueChat(async () => {
+      if (!isActiveDocumentRequest(state.agent.bag.documentId, req.params.id)) {
+        return reply.code(409).send({ ok: false, reason: "document_mismatch" });
+      }
       if (!Array.isArray(req.body.proposalIds) || req.body.proposalIds.length === 0) {
         return reply.code(400).send({ error: "proposalIds must be a non-empty explicit list" });
       }
@@ -1172,7 +1310,7 @@ async function main() {
     requireAuth(state, req.headers.authorization);
     return {
       turns: state.chat.list(),
-      maxTurns: 12,
+      maxTurns: 80,
       clarificationRounds: state.agent.clarificationRounds ?? 0,
     };
   });
@@ -1428,6 +1566,48 @@ async function main() {
     },
   );
 
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    "/api/v1/documents/:id/resolve-proposals",
+    async (req, reply) => {
+      requireAuth(state, req.headers.authorization);
+      let input: ReturnType<typeof parseResolveProposalsInput>;
+      try {
+        input = parseResolveProposalsInput(req.body);
+      } catch (error) {
+        return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+      }
+      return enqueueChat(async () => {
+        if (!isActiveDocumentRequest(state.agent.bag.documentId, req.params.id)) {
+          return reply.code(409).send({ ok: false, reason: "document_mismatch" });
+        }
+        try {
+          const result = await resolveProposalsAtomically(workspace, req.params.id, input);
+          if (!result.ok) return reply.code(409).send(result);
+          syncBagFromDocument(state.agent, result.document, result.blocks);
+          if (!result.replayed) {
+            for (let index = 0; index < result.proposals.length; index += 1) {
+              appendConversationNote(
+                state.agent,
+                decisionConversationNote(result.proposals[index]!, result.decisions[index]!),
+              );
+            }
+            appendConversationNote(state.agent, applyConversationNote(result.proposals));
+          }
+          persistSession();
+          return {
+            ok: true,
+            document: result.document,
+            blocks: result.blocks,
+            decisions: result.decisions,
+            ...(result.replayed ? { replayed: true } : {}),
+          };
+        } catch (error) {
+          return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+        }
+      });
+    },
+  );
+
   app.post<{
     Params: { id: string };
     Body: {
@@ -1447,6 +1627,9 @@ async function main() {
       try {
         const proposal = getProposal(workspace, req.params.id);
         if (req.body.documentId !== proposal.documentId) {
+          return reply.code(409).send({ ok: false, reason: "document_mismatch" });
+        }
+        if (!isActiveDocumentRequest(state.agent.bag.documentId, proposal.documentId)) {
           return reply.code(409).send({ ok: false, reason: "document_mismatch" });
         }
         if (proposal.status !== "proposed") {
@@ -1569,6 +1752,15 @@ async function main() {
     }
     const clearRequested = /^(清空对话|清除对话|新会话|reset\s*chat)(?:。|！|!)?$/i.test(message);
     const closeRequested = isCloseDocumentRequest(message);
+    if (!clearRequested && !closeRequested) {
+      const selectionError = chatSelectionError(
+        req.body?.selectionText,
+        currentSelectionContextLimit(),
+      );
+      if (selectionError) {
+        return reply.code(selectionError.statusCode).send({ error: selectionError.error });
+      }
+    }
 
     try {
       const outcome = await enqueueChat(async () => {
@@ -1686,6 +1878,15 @@ async function main() {
     }
     const clearRequested = /^(清空对话|清除对话|新会话|reset\s*chat)(?:。|！|!)?$/i.test(message);
     const closeRequested = isCloseDocumentRequest(message);
+    if (!clearRequested && !closeRequested) {
+      const selectionError = chatSelectionError(
+        req.body?.selectionText,
+        currentSelectionContextLimit(),
+      );
+      if (selectionError) {
+        return reply.code(selectionError.statusCode).send({ error: selectionError.error });
+      }
+    }
 
     reply.hijack();
     reply.raw.writeHead(200, {
@@ -1894,6 +2095,9 @@ async function main() {
       }
       try {
         return await enqueueChat(async () => {
+          if (!isActiveDocumentRequest(state.agent.bag.documentId, req.params.id)) {
+            return reply.code(409).send({ ok: false, reason: "document_mismatch" });
+          }
           const result = await saveNativeDocx(
             workspace,
             req.params.id,

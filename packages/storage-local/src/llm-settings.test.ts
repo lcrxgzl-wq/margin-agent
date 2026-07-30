@@ -350,11 +350,16 @@ describe("reasoning settings", () => {
     expect(publicLlmSettings(readLlmSettingsStore(root)).agentTimeoutMs).toBeUndefined();
   });
 
+  it("accepts the thirty-minute agent timeout boundary", async () => {
+    await saveLlmSettings(root, { agentTimeoutMs: 1_800_000 });
+    expect(readLlmSettingsStore(root).agentTimeoutMs).toBe(1_800_000);
+  });
+
   it("rejects invalid agent timeouts at save", async () => {
     await expect(saveLlmSettings(root, { agentTimeoutMs: 999 })).rejects.toThrow(
       /agentTimeoutMs|超时/,
     );
-    await expect(saveLlmSettings(root, { agentTimeoutMs: 600_001 })).rejects.toThrow(
+    await expect(saveLlmSettings(root, { agentTimeoutMs: 1_800_001 })).rejects.toThrow(
       /agentTimeoutMs|超时/,
     );
     await expect(saveLlmSettings(root, { agentTimeoutMs: 120_000.5 })).rejects.toThrow(
@@ -382,6 +387,57 @@ describe("reasoning settings", () => {
     );
     expect(readLlmSettingsStore(root).agentTimeoutMs).toBeUndefined();
     expect(publicLlmSettings(readLlmSettingsStore(root)).agentTimeoutMs).toBeUndefined();
+  });
+
+  it("persists a custom selection context cap and clears it with null", async () => {
+    expect(readLlmSettingsStore(root).selectionContextChars).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).selectionContextChars).toBeUndefined();
+
+    await saveLlmSettings(root, { selectionContextChars: 64_000 });
+    expect(readLlmSettingsStore(root).selectionContextChars).toBe(64_000);
+    expect(publicLlmSettings(readLlmSettingsStore(root)).selectionContextChars).toBe(64_000);
+
+    await saveLlmSettings(root, { selectionContextChars: null });
+    expect(readLlmSettingsStore(root).selectionContextChars).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).selectionContextChars).toBeUndefined();
+  });
+
+  it("validates custom selection context boundaries", async () => {
+    await saveLlmSettings(root, { selectionContextChars: 1_000 });
+    expect(readLlmSettingsStore(root).selectionContextChars).toBe(1_000);
+    await saveLlmSettings(root, { selectionContextChars: 100_000 });
+    expect(readLlmSettingsStore(root).selectionContextChars).toBe(100_000);
+
+    await expect(saveLlmSettings(root, { selectionContextChars: 999 })).rejects.toThrow(
+      /selectionContextChars/,
+    );
+    await expect(saveLlmSettings(root, { selectionContextChars: 100_001 })).rejects.toThrow(
+      /selectionContextChars/,
+    );
+    await expect(saveLlmSettings(root, { selectionContextChars: 12_000.5 })).rejects.toThrow(
+      /selectionContextChars/,
+    );
+  });
+
+  it("ignores an invalid persisted selection context cap", () => {
+    fs.writeFileSync(
+      path.join(root, ".margin", "llm-settings.json"),
+      JSON.stringify({
+        activeId: "custom",
+        selectionContextChars: 100_001,
+        providers: [{
+          id: "custom",
+          name: "Custom",
+          apiFormat: "openai",
+          authStyle: "bearer",
+          baseURL: "https://provider.test/v1",
+          model: "model-a",
+        }],
+      }),
+      "utf8",
+    );
+    expect(readLlmSettingsStore(root).selectionContextChars).toBeUndefined();
+    expect(publicLlmSettings(readLlmSettingsStore(root)).selectionContextChars).toBeUndefined();
   });
 
   it("persists an explicit context tier and clears it with null", async () => {

@@ -8,6 +8,12 @@ import {
   agentTimeoutSecondsToMs,
 } from "../../agentTimeout";
 import {
+  SELECTION_CONTEXT_MAX_CHARS,
+  SELECTION_CONTEXT_MIN_CHARS,
+  selectionContextCharsToInput,
+  selectionContextInputToChars,
+} from "../../selectionContext";
+import {
   getLlmSettings,
   listHarnesses,
   saveLlmSettings,
@@ -36,6 +42,19 @@ const CONTEXT_TIERS: Array<{ id: ContextTier; label: string; hint: string }> = [
   { id: "max", label: "最强", hint: "最大上下文与预算，效果最好，token 成本最高" },
 ];
 
+const TIMEOUT_PRESETS = [
+  { seconds: 300, label: "5 分钟" },
+  { seconds: 600, label: "10 分钟" },
+  { seconds: 1_200, label: "20 分钟" },
+  { seconds: 1_800, label: "30 分钟" },
+] as const;
+const SELECTION_CONTEXT_PRESETS = [12_000, 32_000, 64_000, 100_000] as const;
+const TIER_SELECTION_DEFAULTS: Record<ContextTier, number> = {
+  eco: 2_000,
+  standard: 12_000,
+  max: 48_000,
+};
+
 /** Agent 档位（修订模式）与推理强度。自定义服务的推理 opt-in 在模型页高级设置里。 */
 export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
   const [harnesses, setHarnesses] = useState<HarnessSummary[]>([]);
@@ -50,6 +69,8 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
   const [savedCompactionAuto, setSavedCompactionAuto] = useState(true);
   const [timeoutInput, setTimeoutInput] = useState("");
   const [savedTimeoutInput, setSavedTimeoutInput] = useState("");
+  const [selectionContextInput, setSelectionContextInput] = useState("");
+  const [savedSelectionContextInput, setSavedSelectionContextInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -81,6 +102,11 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
         const currentTimeout = agentTimeoutMsToSeconds(settings.agentTimeoutMs);
         setTimeoutInput(currentTimeout);
         setSavedTimeoutInput(currentTimeout);
+        const currentSelectionContext = selectionContextCharsToInput(
+          settings.selectionContextChars,
+        );
+        setSelectionContextInput(currentSelectionContext);
+        setSavedSelectionContextInput(currentSelectionContext);
       })
       .catch((reason) => {
         if (active) setError(reason instanceof Error ? reason.message : String(reason));
@@ -105,7 +131,8 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
     reasoningMode !== savedReasoningMode ||
     contextTier !== savedContextTier ||
     compactionAuto !== savedCompactionAuto ||
-    timeoutInput !== savedTimeoutInput;
+    timeoutInput !== savedTimeoutInput ||
+    selectionContextInput !== savedSelectionContextInput;
   const harnessDefaultTitle = harnesses.find((h) => h.id === harnessDefaultId)?.title ?? "";
 
   const save = async () => {
@@ -117,6 +144,13 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
       );
       return;
     }
+    const selectionContextChars = selectionContextInputToChars(selectionContextInput);
+    if (selectionContextChars === undefined) {
+      setError(
+        `选区上下文需为 ${SELECTION_CONTEXT_MIN_CHARS}–${SELECTION_CONTEXT_MAX_CHARS} 的整数，或留空跟随上下文档位。`,
+      );
+      return;
+    }
     setSaving(true);
     setError(null);
     setNotice(null);
@@ -125,6 +159,7 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
         harnessId: harnessId || null,
         reasoningMode,
         agentTimeoutMs,
+        selectionContextChars,
         contextTier,
         compactionAuto,
       });
@@ -134,6 +169,7 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
       setSavedContextTier(contextTier);
       setSavedCompactionAuto(compactionAuto);
       setSavedTimeoutInput(timeoutInput);
+      setSavedSelectionContextInput(selectionContextInput);
       setNotice("已保存 Agent 设置。");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -215,6 +251,38 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
       </div>
 
       <div className="settings-field">
+        <span id="selection-context-label">选区上下文上限（字符）</span>
+        <input
+          type="number"
+          min={SELECTION_CONTEXT_MIN_CHARS}
+          max={SELECTION_CONTEXT_MAX_CHARS}
+          step={1}
+          value={selectionContextInput}
+          disabled={busy}
+          placeholder={String(TIER_SELECTION_DEFAULTS[contextTier])}
+          onChange={(event) => setSelectionContextInput(event.target.value)}
+          aria-labelledby="selection-context-label"
+        />
+        <div className="preset-row" aria-label="选区上下文快捷值">
+          {SELECTION_CONTEXT_PRESETS.map((chars) => (
+            <button
+              key={chars}
+              type="button"
+              className={selectionContextInput === String(chars) ? "chip accent" : "chip"}
+              disabled={busy}
+              aria-pressed={selectionContextInput === String(chars)}
+              onClick={() => setSelectionContextInput(String(chars))}
+            >
+              {chars.toLocaleString("zh-CN")}
+            </button>
+          ))}
+        </div>
+        <small className="settings-field-note">
+          留空跟随上下文档位；当前档位默认 {TIER_SELECTION_DEFAULTS[contextTier].toLocaleString("zh-CN")} 字符
+        </small>
+      </div>
+
+      <div className="settings-field">
         <span>自动压缩上下文</span>
         <label className="settings-field-inline">
           <input
@@ -231,8 +299,9 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
         </small>
       </div>
 
-      <label className="settings-field">
-        <span>请求超时（秒）</span>        <input
+      <div className="settings-field">
+        <span id="agent-timeout-label">请求超时（秒）</span>
+        <input
           type="number"
           min={AGENT_TIMEOUT_MIN_SECONDS}
           max={AGENT_TIMEOUT_MAX_SECONDS}
@@ -241,12 +310,26 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
           disabled={busy}
           placeholder={String(AGENT_TIMEOUT_DEFAULT_SECONDS)}
           onChange={(event) => setTimeoutInput(event.target.value)}
-          aria-label="请求超时"
+          aria-labelledby="agent-timeout-label"
         />
+        <div className="preset-row" aria-label="请求超时快捷值">
+          {TIMEOUT_PRESETS.map(({ seconds, label }) => (
+            <button
+              key={seconds}
+              type="button"
+              className={timeoutInput === String(seconds) ? "chip accent" : "chip"}
+              disabled={busy}
+              aria-pressed={timeoutInput === String(seconds)}
+              onClick={() => setTimeoutInput(String(seconds))}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <small className="settings-field-note">
           单次 Agent 请求的最长等待（{AGENT_TIMEOUT_MIN_SECONDS}–{AGENT_TIMEOUT_MAX_SECONDS} 秒）；留空使用默认 {AGENT_TIMEOUT_DEFAULT_SECONDS} 秒
         </small>
-      </label>
+      </div>
 
       {notice ? <p className="settings-msg ok" role="status">{notice}</p> : null}
       {error ? <p className="settings-msg err" role="alert">{error}</p> : null}

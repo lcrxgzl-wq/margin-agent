@@ -85,6 +85,28 @@ beforeEach(() => {
 });
 
 describe("runPiAgentLoop external cancellation", () => {
+  it("defaults to a five-minute timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const running = runPiAgentLoop({
+        prompt: "test",
+        systemPrompt: "test",
+        tools: [],
+        model: {},
+      });
+
+      await vi.advanceTimersByTimeAsync(299_999);
+      expect(mockAgent.abortCalls).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(running).resolves.toMatchObject({
+        outcome: "timed_out",
+        notes: ["aborted after 300000ms"],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("immediately aborts an active Pi run", async () => {
     const controller = new AbortController();
     const running = runPiAgentLoop({
@@ -126,6 +148,46 @@ describe("runPiAgentLoop external cancellation", () => {
 });
 
 describe("Pi runtime boundaries", () => {
+  it("hides literal thinking blocks from streamed output without mutating the transcript", async () => {
+    const deltas: string[] = [];
+    const rawText = "Visible <thinking>Continue reading chunks</thinking> answer";
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      onDelta: (chunk) => deltas.push(chunk),
+      timeoutMs: 10_000,
+    });
+    if (mockAgent.instance) {
+      mockAgent.instance.state.messages = [{
+        role: "assistant",
+        content: [{ type: "text", text: rawText }],
+      }];
+    }
+    for (const delta of [
+      "Visible <thi",
+      "nking>Continue reading chunks</think",
+      "ing> answer",
+    ]) {
+      mockAgent.subscriber?.({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta },
+      });
+    }
+    mockAgent.subscriber?.({
+      type: "message_end",
+      message: { role: "assistant" },
+    });
+    mockAgent.resolvePrompt?.();
+
+    const result = await running;
+
+    expect(deltas.join("")).toBe("Visible  answer");
+    expect(result.streamedText).toBe("Visible  answer");
+    expect(JSON.stringify(result.messages)).toContain(rawText);
+  });
+
   it("does not turn a natural final turn at the cap into an abort", async () => {
     const running = runPiAgentLoop({
       prompt: "test",
@@ -253,27 +315,27 @@ describe("Pi runtime boundaries", () => {
     expect(JSON.stringify(trimmed).length).toBeLessThan(4_000);
   });
 
-  it("defaults the final compaction rung to 32 chars", () => {
-    const messages = [{ role: "user", content: "x".repeat(2_000) }] as never[];
+  it("never truncates a lone current user request above the soft character budget", () => {
+    const currentRequest = '"'.repeat(100_000);
+    const messages = [{ role: "user", content: currentRequest }] as never[];
 
     const trimmed = trimAgentMessages(messages, 10, 100);
 
     const content = (trimmed[0] as { content: string }).content;
-    expect(content.startsWith("x".repeat(32))).toBe(true);
-    expect(content.length).toBe(32 + "...[message text truncated]".length);
+    expect(content).toBe(currentRequest);
+    expect(JSON.stringify(trimmed).length).toBeGreaterThan(100);
   });
 
-  it("keeps the final compaction rung at or above toolCompactionFloor", () => {
+  it("does not let toolCompactionFloor truncate the current user request", () => {
     const messages = [{ role: "user", content: "x".repeat(2_000) }] as never[];
 
     const floored = trimAgentMessages(messages, 10, 100, 1_000);
 
     const content = (floored[0] as { content: string }).content;
-    expect(content.length).toBeGreaterThan(100);
-    expect(content.startsWith("x".repeat(128))).toBe(true);
+    expect(content).toBe("x".repeat(2_000));
   });
 
-  it("threads toolCompactionFloor into Pi context trimming", async () => {
+  it("preserves an oversized current request through Pi context trimming", async () => {
     const running = runPiAgentLoop({
       prompt: "test",
       systemPrompt: "test",
@@ -288,14 +350,15 @@ describe("Pi runtime boundaries", () => {
     };
     const big = [{ role: "user", content: "x".repeat(2_000) }] as never[];
     const trimmed = await options.transformContext(big);
-    expect((trimmed[0] as { content: string }).content.length).toBeGreaterThan(100);
+    expect((trimmed[0] as { content: string }).content).toBe("x".repeat(2_000));
     mockAgent.resolvePrompt?.();
     await running;
   });
 
-  it("bounds one oversized current turn without dropping its user request", () => {
+  it("drops tool units before altering an oversized current user request", () => {
+    const currentRequest = "u".repeat(10_000);
     const messages = [
-      { role: "user", content: "u".repeat(10_000) },
+      { role: "user", content: currentRequest },
       ...Array.from({ length: 20 }, (_, index) => [
         { role: "assistant", content: [{ type: "toolCall", id: `call-${index}` }] },
         {
@@ -308,9 +371,10 @@ describe("Pi runtime boundaries", () => {
 
     const trimmed = trimAgentMessages(messages, 8, 2_000);
 
-    expect(trimmed.length).toBeLessThanOrEqual(8);
+    expect(trimmed).toHaveLength(1);
     expect((trimmed[0] as { role: string }).role).toBe("user");
-    expect(JSON.stringify(trimmed).length).toBeLessThanOrEqual(2_000);
+    expect((trimmed[0] as { content: string }).content).toBe(currentRequest);
+    expect(JSON.stringify(trimmed).length).toBeGreaterThan(2_000);
   });
 
   it("redacts secrets from bounded tool argument summaries", () => {

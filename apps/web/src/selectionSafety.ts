@@ -1,9 +1,11 @@
 import type { TableCellSelection } from "./components/canvasTypes";
+import { MAX_SELECTION_BLOCKS, type SelectionBlockRange } from "@margin/domain";
 
 export type SelectionTarget = {
   blockId: string | null;
   /** All blocks covered when the selection crosses paragraphs. */
   blockIds?: string[];
+  selectionRanges?: SelectionBlockRange[];
   text: string;
   tableCell?: TableCellSelection;
   /** True when the range spans more than one table cell. */
@@ -21,8 +23,11 @@ export function selectionEditUnavailableReason(target: SelectionTarget): string 
   }
   if (target.tableCell) return null;
   if (target.blockIds?.length) {
-    if (target.blockIds.length > 8) {
-      return "跨段落选区一次最多覆盖 8 个段落，请缩小选区后重试。";
+    if (target.blockIds.length > MAX_SELECTION_BLOCKS) {
+      return `跨段落选区一次最多覆盖 ${MAX_SELECTION_BLOCKS} 个段落，请缩小选区后重试。`;
+    }
+    if (target.blockIds.length > 1 && !target.selectionRanges?.length) {
+      return "当前格式无法精确定位跨段选区；仍可讨论，或改用 Word 文档后生成提案。";
     }
     return null;
   }

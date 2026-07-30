@@ -56,7 +56,14 @@ const OutputSchema = z.object({
 });
 
 const MAX_COMPLETION_BYTES = 1024 * 1024;
-const COMPLETION_TIMEOUT_MS = 90_000;
+const DEFAULT_COMPLETION_TIMEOUT_MS = 300_000;
+
+function completionTimeoutMs(explicit?: number): number {
+  const value = explicit ?? Number(process.env.MARGIN_PI_TIMEOUT_MS ?? DEFAULT_COMPLETION_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : DEFAULT_COMPLETION_TIMEOUT_MS;
+}
 
 type RuntimeFormat = "openai" | "anthropic";
 
@@ -136,6 +143,7 @@ async function requestTextCompletion(
   prompt: string,
   system: string,
   signal?: AbortSignal,
+  timeoutMs?: number,
 ): Promise<string> {
   const format = runtimeFormat();
   const key = runtimeApiKey(format);
@@ -144,7 +152,7 @@ async function requestTextCompletion(
   const body = format === "anthropic"
     ? { model, max_tokens: 4096, system, messages: [{ role: "user", content: prompt }] }
     : { model, max_tokens: 4096, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] };
-  const timeout = AbortSignal.timeout(COMPLETION_TIMEOUT_MS);
+  const timeout = AbortSignal.timeout(completionTimeoutMs(timeoutMs));
   const headers = runtimeHeaders(format, key ?? "ollama");
   const response = await fetch(runtimeEndpoint(format), {
     method: "POST",
@@ -207,6 +215,8 @@ export type GenerateInput = {
   harnessId?: string;
   /** Directed rewrite instruction from the author. */
   instruction?: string;
+  /** Request timeout supplied by the Host; falls back to env, then five minutes. */
+  timeoutMs?: number;
   signal?: AbortSignal;
 };
 
@@ -269,6 +279,7 @@ ${instruction ? `作者指令（必须优先遵循）:\n"""\n${instruction.slice
         `${attempt === 0 ? prompt : `${prompt}\n\n上次输出不合规，请严格返回同一 blockId 与非空 after。`}\n\n只返回 JSON：{"blockId":"...","after":"...","rationale":"...","risk":"language|structure|argument|fact","evidence":[]}`,
         directIdentity(input.harnessId),
         input.signal,
+        input.timeoutMs,
       );
       const object = OutputSchema.parse(parseProposalJson(completion));
       return validateOutput(input.block.id, object);
@@ -288,6 +299,8 @@ export type DiscussInput = {
   /** Prior turns (excluding the current user message). */
   history?: ChatHistoryTurn[];
   hasDocument?: boolean;
+  /** Request timeout supplied by the Host; falls back to env, then five minutes. */
+  timeoutMs?: number;
   signal?: AbortSignal;
 };
 
@@ -322,6 +335,7 @@ export async function streamDiscuss(
       buildAgentUserPrompt(replyInput),
       directIdentity(input.harnessId),
       input.signal,
+      input.timeoutMs,
     );
     const text = full.trim() || mockAgentReply(replyInput);
     await emitTextChunks(text, onDelta, { delayMs: 0 });

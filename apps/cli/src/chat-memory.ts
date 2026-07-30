@@ -1,6 +1,7 @@
+import { stripLiteralThinkingBlocks } from "@margin/agent";
 import { trimHistory, type ChatHistoryTurn } from "@margin/llm";
 
-const MAX_TURNS = 12;
+const MAX_TURNS = 80;
 
 export type ChatMemoryTurn = {
   /** "system" turns are UI-visible host notes; never sent to the LLM. */
@@ -12,6 +13,10 @@ export type ChatMemoryTurn = {
 /** In-process short memory for one localhost session. */
 export class ChatMemory {
   private turns: ChatMemoryTurn[] = [];
+
+  private cleanText(role: ChatMemoryTurn["role"], text: string): string {
+    return role === "assistant" ? stripLiteralThinkingBlocks(text) : text;
+  }
 
   list(): ChatMemoryTurn[] {
     return [...this.turns];
@@ -26,7 +31,7 @@ export class ChatMemory {
   }
 
   remember(role: "user" | "assistant" | "system", text: string, threadId?: string) {
-    const t = text.trim();
+    const t = this.cleanText(role, text).trim();
     if (!t) return;
     this.turns = trimHistory([
       ...this.turns,
@@ -41,7 +46,7 @@ export class ChatMemory {
         .filter((t) => (t.role === "user" || t.role === "assistant" || t.role === "system") && t.text?.trim())
         .map((t) => ({
           role: t.role,
-          text: t.text.trim(),
+          text: this.cleanText(t.role, t.text).trim(),
           ...(t.threadId ? { threadId: t.threadId } : {}),
         })),
       MAX_TURNS,

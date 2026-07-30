@@ -7,20 +7,39 @@ import {
   type DocumentMeta,
 } from "../api";
 import { useDialogFocus } from "../dialogFocus";
+import {
+  ASYNC_DOCUMENT_CONFLICT_MESSAGE,
+  confirmDocumentReplacement,
+} from "../documentSafety";
 
 type ImportReport = { ok: boolean; flags?: string[] };
 
 type Props = {
   open: boolean;
+  documentDirty?: boolean;
+  documentGeneration: number;
+  expectedDocument: Pick<DocumentMeta, "id" | "revision"> | null;
   onClose: () => void;
-  onOpened: (document: DocumentMeta, blocks: Block[], report?: ImportReport) => void;
+  onOpened: (
+    document: DocumentMeta,
+    blocks: Block[],
+    report: ImportReport | undefined,
+    requestDocumentGeneration: number,
+  ) => boolean;
 };
 
 /**
  * 直接打开 DOCX：列出工作区内可见的 .docx（如 imports/），选中即导入。
  * 不经过模型解释路径；loading / empty / error / success 状态都在本对话框内。
  */
-export function OpenDocxDialog({ open, onClose, onOpened }: Props) {
+export function OpenDocxDialog({
+  open,
+  documentDirty = false,
+  documentGeneration,
+  expectedDocument,
+  onClose,
+  onOpened,
+}: Props) {
   const [files, setFiles] = useState<string[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [importing, setImporting] = useState<string | null>(null);
@@ -57,15 +76,29 @@ export function OpenDocxDialog({ open, onClose, onOpened }: Props) {
 
   const importFile = async (relativePath: string) => {
     if (importing) return;
+    if (!confirmDocumentReplacement(documentDirty)) return;
+    const requestDocumentGeneration = documentGeneration;
     setImporting(relativePath);
     setImportError(null);
     try {
-      const result = await importWorkspaceDocx(relativePath);
-      onOpened(result.document, result.blocks, result.report);
+      const result = await importWorkspaceDocx(relativePath, expectedDocument);
+      if (!onOpened(
+        result.document,
+        result.blocks,
+        result.report,
+        requestDocumentGeneration,
+      )) {
+        setImportError(ASYNC_DOCUMENT_CONFLICT_MESSAGE);
+        setImporting(null);
+        return;
+      }
       onClose();
     } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
       setImportError(
-        `导入 ${relativePath} 失败：${reason instanceof Error ? reason.message : String(reason)}`,
+        message === "document_mismatch"
+          ? ASYNC_DOCUMENT_CONFLICT_MESSAGE
+          : `导入 ${relativePath} 失败：${message}`,
       );
       setImporting(null);
     }

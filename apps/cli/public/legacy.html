@@ -413,7 +413,12 @@
           if (!relativePath) return;
           const data = await api("/api/v1/documents/import-docx", {
             method: "POST",
-            body: JSON.stringify({ relativePath }),
+            body: JSON.stringify({
+              relativePath,
+              expectedDocument: documentMeta
+                ? { id: documentMeta.id, revision: documentMeta.revision }
+                : null,
+            }),
           });
           documentMeta = data.document;
           blocks = data.blocks;

@@ -48,6 +48,52 @@ describe("marginReducer document isolation", () => {
     expect(next.selection).toEqual(initialMarginState.selection);
   });
 
+  it("preserves dirty canvas state when a session hydrates the same document", () => {
+    const state = {
+      ...initialMarginState,
+      doc: documentA,
+      documentDirty: true,
+    };
+    const next = marginReducer(state, {
+      type: "setDocBundle",
+      doc: documentA,
+      blocks: [],
+      preserveDocumentDirty: true,
+    });
+
+    expect(next.documentDirty).toBe(true);
+  });
+
+  it("resets dirty state when a session really switches documents", () => {
+    const state = {
+      ...initialMarginState,
+      doc: documentA,
+      documentDirty: true,
+    };
+    const next = marginReducer(state, {
+      type: "setDocBundle",
+      doc: documentB,
+      blocks: [],
+      preserveDocumentDirty: true,
+    });
+
+    expect(next.documentDirty).toBe(false);
+  });
+
+  it("clears dirty state after a normal same-document save", () => {
+    const next = marginReducer({
+      ...initialMarginState,
+      doc: documentA,
+      documentDirty: true,
+    }, {
+      type: "setDocBundle",
+      doc: { ...documentA, revision: 2 },
+      blocks: [],
+    });
+
+    expect(next.documentDirty).toBe(false);
+  });
+
   it("bounds the in-memory chat transcript during long sessions", () => {
     let state = initialMarginState;
     for (let index = 0; index < 150; index += 1) {
@@ -102,5 +148,31 @@ describe("marginReducer document isolation", () => {
       anchor: { blockId: "b1", selectionStart: 4 },
     }]);
     expect(next.activeThreadId).toBeNull();
+  });
+
+  it("does not merge equal text selected at different offsets", () => {
+    const state = {
+      ...initialMarginState,
+      threads: [{
+        id: "thread-1",
+        anchor: { blockId: "b1", selectionText: "重复", selectionStart: 2 },
+        pos: null,
+        collapsed: true,
+        createdAt: "2026-07-23T00:00:00.000Z",
+      }],
+    };
+    const next = marginReducer(state, {
+      type: "openThread",
+      thread: {
+        id: "thread-2",
+        anchor: { blockId: "b1", selectionText: "重复", selectionStart: 12 },
+        pos: null,
+        collapsed: false,
+        createdAt: "2026-07-23T00:01:00.000Z",
+      },
+    });
+
+    expect(next.threads.map((thread) => thread.id)).toEqual(["thread-1", "thread-2"]);
+    expect(next.activeThreadId).toBe("thread-2");
   });
 });

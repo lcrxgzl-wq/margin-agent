@@ -19,6 +19,9 @@ import {
   markProposalId,
   planInjectionOrder,
   planMarkRestoreOrder,
+  proposalFocusQueries,
+  proposalsToReinjectAfterSave,
+  selectionContainsMark,
   sliceElements,
   stripMarks,
 } from "./revisionMarks";
@@ -50,6 +53,28 @@ describe("markKey", () => {
     expect(markKey("旧", "新")).toBe("旧新");
     expect(markKey("", "纯插入")).toBe("纯插入");
     expect(markKey("纯删除", "")).toBe("纯删除");
+  });
+});
+
+describe("proposalFocusQueries", () => {
+  it("prioritizes the live marked fragment before the now-discontinuous original block", () => {
+    const proposal = makeProposal({
+      before: "前文旧词后文",
+      after: "前文新词后文",
+    });
+    expect(proposalFocusQueries(proposal)).toEqual([
+      "前文旧新",
+      "前文旧词后文",
+    ]);
+  });
+
+  it("keeps table-cell focus on the cell text", () => {
+    const proposal = makeProposal({
+      before: "单元格",
+      after: "新单元格",
+      tableCell: { address: "A1", row: 1, column: 1, before: "单元格", after: "新单元格" },
+    });
+    expect(proposalFocusQueries(proposal)).toEqual(["单元格"]);
   });
 });
 
@@ -115,6 +140,14 @@ describe("markBaseStyle / markProposalId", () => {
     expect(markProposalId({ value: "a" })).toBeNull();
     expect(markProposalId({ value: "a", extension: { marginMark: 7 } })).toBeNull();
     expect(markProposalId({ value: "a", extension: "other" })).toBeNull();
+  });
+
+  it("用 extension 区分重复文本中真正带标记的选区", () => {
+    const plain: IElement[] = [{ value: "重复文本" }];
+    const marked: IElement[] = [{ value: "重复文本", extension: { marginMark: "p-1" } }];
+    expect(selectionContainsMark(plain, "p-1")).toBe(false);
+    expect(selectionContainsMark(marked, "p-1")).toBe(true);
+    expect(selectionContainsMark(marked, "p-2")).toBe(false);
   });
 });
 
@@ -491,6 +524,17 @@ describe("countPendingProposals / buildSaveConfirmMessage（保存前确认）",
   it("确认文案包含待审数量", () => {
     expect(buildSaveConfirmMessage(3)).toContain("3");
     expect(buildSaveConfirmMessage(3)).toContain("待审提案");
+  });
+
+  it("保存成功后不重注入已被服务端关闭的旧提案，失败时才恢复未标记提案", () => {
+    const proposals = [
+      makeProposal({ id: "fresh", status: "proposed" }),
+      makeProposal({ id: "marked", status: "proposed" }),
+      makeProposal({ id: "closed", status: "superseded" }),
+    ];
+    expect(proposalsToReinjectAfterSave(proposals, new Set(["marked"]), true)).toEqual([]);
+    expect(proposalsToReinjectAfterSave(proposals, new Set(["marked"]), false).map((p) => p.id))
+      .toEqual(["fresh"]);
   });
 });
 

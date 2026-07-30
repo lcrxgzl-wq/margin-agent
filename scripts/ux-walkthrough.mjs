@@ -372,7 +372,7 @@ try {
     await waitMarks(false);
     await page.waitForTimeout(800);
     if ((await proposalCount()) !== 0) {
-      note("保存后仍有 pending 提案（预期被 supersede）");
+      throw new Error("保存后仍有 pending 提案（预期被 supersede）");
     }
     // 导出的 docx 不得多出删除线 run（保存兜底核心断言）。
     const strikeAfterSave = await countStrikeRuns(await nativeDocxBuffer());
@@ -498,9 +498,13 @@ try {
   if (!rangeText || !rangeText.trim()) throw new Error("cross-paragraph range is empty");
   await page.locator(".sel-bubble").waitFor({ state: "visible", timeout: 10_000 });
   const limitText = await page.locator(".sel-bubble .selection-limit").textContent().catch(() => null);
-  if (limitText) throw new Error(`cross-paragraph selection still blocked: ${limitText}`);
+  if (limitText) {
+    throw new Error(`cross-paragraph selection still blocked: ${limitText}`);
+  }
   const crossStrip = await page.locator(".attention-strip").textContent();
-  if (!/段选区/.test(crossStrip ?? "")) note("跨段选区时注意力条未显示“N 段选区” chip");
+  if (!/段选区/.test(crossStrip ?? "")) {
+    throw new Error(`跨段选区时注意力条未显示“N 段选区” chip: ${crossStrip}`);
+  }
   await page.waitForTimeout(300);
   await page.screenshot({ path: path.join(outDir, "06-cross-paragraph.png") });
   await page.locator(".sel-bubble button", { hasText: "改写" }).first().click();

@@ -3,6 +3,7 @@ import type {
   Proposal,
   ProposalOperationKind,
   ProposalTargetLanguage,
+  SelectionBlockRange,
   TableCellChange,
 } from "@margin/domain";
 
@@ -20,6 +21,10 @@ export type PaperAgentContext = {
   selectionText?: string;
   /** UTF-16 offset inside the immutable block; disambiguates repeated selected text. */
   selectionStart?: number;
+  /** Host-verified UTF-16 ranges for every block covered by a precise selection. */
+  selectionRanges?: SelectionBlockRange[];
+  /** Maximum full-selection context accepted by the Host for this run. */
+  selectionContextChars?: number;
   operation?: ProposalOperationKind;
   targetLanguage?: ProposalTargetLanguage;
   /** Host-verified table cell target. Direct mode may replace text only inside this cell. */
@@ -39,6 +44,8 @@ export type PaperAgentContext = {
   reasoningMode?: ReasoningMode;
   /** Custom provider opt-in to reasoning controls (set after a passing connection test). */
   reasoningOptIn?: boolean;
+  /** User-configured request timeout (ms); wins over env/profile fallback. */
+  timeoutMs?: number;
 };
 
 export type AgentComment = {

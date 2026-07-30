@@ -1,3 +1,5 @@
+import type { SelectionBlockRange } from "@margin/domain";
+
 export type Block = {
   id: string;
   kind: string;
@@ -59,6 +61,7 @@ export type SessionReviewThread = {
   anchor: {
     blockId: string;
     blockIds?: string[];
+    selectionRanges?: SelectionBlockRange[];
     selectionText: string;
     selectionStart?: number;
     tableCell?: {
@@ -101,10 +104,13 @@ export async function api<T = unknown>(path: string, opts: RequestInit = {}): Pr
   return data as T;
 }
 
-export async function openDocument(relativePath: string) {
+export async function openDocument(
+  relativePath: string,
+  expectedDocument?: Pick<DocumentMeta, "id" | "revision"> | null,
+) {
   return api<{ document: DocumentMeta; blocks: Block[] }>("/api/v1/documents/open", {
     method: "POST",
-    body: JSON.stringify({ relativePath }),
+    body: JSON.stringify({ relativePath, expectedDocument }),
   });
 }
 
@@ -112,10 +118,10 @@ export async function listFiles() {
   return api<{ files: string[] }>("/api/v1/workspace/files");
 }
 
-export async function saveSessionSources(sourcePaths: string[]) {
+export async function saveSessionSources(documentId: string | null, sourcePaths: string[]) {
   return api<{ sourcePaths: string[] }>("/api/v1/session/sources", {
     method: "PUT",
-    body: JSON.stringify({ sourcePaths }),
+    body: JSON.stringify({ documentId, sourcePaths }),
   });
 }
 
@@ -321,6 +327,8 @@ export type LlmSettingsPublic = {
   reasoningMode?: ReasoningMode;
   /** Pi session timeout in ms; absent means the profile default applies. */
   agentTimeoutMs?: number;
+  /** Custom inline selection cap; absent means the context tier applies. */
+  selectionContextChars?: number;
   /** Context budget tier; absent means the standard tier applies. */
   contextTier?: ContextTier;
   /** Automatic context compaction; absent means enabled (default). */
@@ -365,6 +373,7 @@ export async function saveLlmSettings(body: {
   reasoningOptIn?: boolean;
   reasoningMode?: ReasoningMode | null;
   agentTimeoutMs?: number | null;
+  selectionContextChars?: number | null;
   contextTier?: ContextTier | null;
   compactionAuto?: boolean | null;
   harnessId?: string | null;
@@ -398,14 +407,17 @@ export async function connectCcSwitchRoute(route: "claude" | "codex") {
 }
 
 /** Import a workspace .docx as a Margin document (no model involved). */
-export async function importWorkspaceDocx(relativePath: string) {
+export async function importWorkspaceDocx(
+  relativePath: string,
+  expectedDocument: Pick<DocumentMeta, "id" | "revision"> | null,
+) {
   return api<{
     document: DocumentMeta;
     blocks: Block[];
     report?: { ok: boolean; flags?: string[] };
   }>("/api/v1/documents/import-docx", {
     method: "POST",
-    body: JSON.stringify({ relativePath }),
+    body: JSON.stringify({ relativePath, expectedDocument }),
   });
 }
 
@@ -519,6 +531,7 @@ export async function startProposalRun(
     instruction?: string;
     selectionText?: string;
     selectionStart?: number;
+    selectionRanges?: SelectionBlockRange[];
     operation?: "rewrite" | "translate" | "polish";
     targetLanguage?: "zh-CN" | "en";
     tableCell?: {
@@ -540,6 +553,7 @@ export async function startProposalRun(
       instruction: opts?.instruction,
       selectionText: opts?.selectionText,
       selectionStart: opts?.selectionStart,
+      selectionRanges: opts?.selectionRanges,
       operation: opts?.operation,
       targetLanguage: opts?.targetLanguage,
       tableCell: opts?.tableCell,
@@ -552,7 +566,7 @@ export async function startProposalRun(
 
 export async function waitRun(
   runId: string,
-  maxMs = 130_000,
+  maxMs: number | undefined = undefined,
   onTick?: (info: {
     elapsedMs: number;
     status: string;
@@ -562,7 +576,7 @@ export async function waitRun(
   signal?: AbortSignal,
 ) {
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
+  while (maxMs === undefined || Date.now() - start < maxMs) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const run = await api<{
       status: string;
@@ -592,9 +606,9 @@ export async function waitRun(
         signal?.removeEventListener("abort", abort);
         resolve();
       };
-      const timer = window.setTimeout(finish, 500);
+      const timer = globalThis.setTimeout(finish, 500);
       const abort = () => {
-        window.clearTimeout(timer);
+        globalThis.clearTimeout(timer);
         signal?.removeEventListener("abort", abort);
         reject(new DOMException("Aborted", "AbortError"));
       };
@@ -652,6 +666,22 @@ export async function resolveProposal(
       expectedRevision: doc.revision,
       expectedHash: doc.contentHash,
       documentId: doc.id,
+    }),
+  });
+}
+
+export async function resolveProposals(doc: DocumentMeta, proposalIds: string[]) {
+  return api<{
+    ok: true;
+    document: DocumentMeta;
+    blocks: Block[];
+    replayed?: true;
+  }>(`/api/v1/documents/${doc.id}/resolve-proposals`, {
+    method: "POST",
+    body: JSON.stringify({
+      proposalIds,
+      expectedRevision: doc.revision,
+      expectedHash: doc.contentHash,
     }),
   });
 }

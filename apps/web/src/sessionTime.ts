@@ -13,3 +13,14 @@ export function formatSessionTime(iso: string, now = Date.now()): string {
   const d = new Date(ts);
   return `${d.getMonth() + 1}月${d.getDate()}日`;
 }
+
+/** Stable mm:ss / h:mm:ss label for long-running Agent work. */
+export function formatElapsedTime(totalSeconds: number): string {
+  const seconds = Number.isFinite(totalSeconds) ? Math.max(0, Math.floor(totalSeconds)) : 0;
+  const hours = Math.floor(seconds / 3_600);
+  const minutes = Math.floor((seconds % 3_600) / 60);
+  const remainder = seconds % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+    : `${minutes}:${String(remainder).padStart(2, "0")}`;
+}

@@ -9,7 +9,10 @@ export function buildSelectionCommand(
   blockId: string,
   selectionText?: string,
   instruction?: string,
-  options?: Pick<SelectionCommand, "selectionStart" | "operation" | "targetLanguage" | "tableCell" | "blockIds">,
+  options?: Pick<
+    SelectionCommand,
+    "selectionStart" | "selectionRanges" | "operation" | "targetLanguage" | "tableCell" | "blockIds"
+  >,
 ): SelectionCommand {
   return SelectionCommandSchema.parse({
     kind,

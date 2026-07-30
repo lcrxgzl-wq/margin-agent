@@ -22,6 +22,7 @@ import {
   type ModelUsage,
 } from "@margin/llm";
 import { toolPhaseLabel } from "./progress.js";
+import { LiteralThinkingBlockFilter } from "./assistant-text.js";
 
 export type PiLoopOutcome = "completed" | "aborted" | "timed_out" | "error";
 
@@ -170,8 +171,18 @@ function compactToolMessages(messages: AgentMessage[], textLimit: number): Agent
 }
 
 function compactAllMessageText(messages: AgentMessage[], textLimit: number): AgentMessage[] {
-  return messages.map((message) => {
+  let latestUserIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (roleOf(messages[index]!) === "user") {
+      latestUserIndex = index;
+      break;
+    }
+  }
+  return messages.map((message, index) => {
     if (!message || typeof message !== "object") return message;
+    // The current request is immutable. If it alone exceeds this soft budget,
+    // let the provider reject it visibly instead of changing what the author asked.
+    if (index === latestUserIndex) return message;
     const value = message as unknown as {
       content?: string | Array<Record<string, unknown>>;
     };
@@ -289,11 +300,17 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
   );
   const terminatingToolCalls = new Set<string>();
   const turnCap = opts.maxTurns ?? 20;
-  const limit = opts.timeoutMs ?? 120_000;
+  const limit = opts.timeoutMs ?? 300_000;
   let turns = 0;
   let outcome: PiLoopOutcome = "completed";
   let streamedText = "";
   let thrownError: string | undefined;
+  const visibleTextFilter = new LiteralThinkingBlockFilter();
+  const emitVisibleText = (text: string) => {
+    if (!text) return;
+    streamedText += text;
+    opts.onDelta?.(text);
+  };
 
   // Context compaction state (Round A): prune always; summarize when the
   // tier allows it, the user has not disabled it, and this session has not
@@ -453,6 +470,7 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
   const unsub = agent.subscribe((event) => {
     if (event.type === "message_end") {
       const message = event.message as { role?: string; usage?: Partial<ModelUsage> };
+      if (message.role === "assistant") emitVisibleText(visibleTextFilter.finish());
       if (message.role === "assistant" && message.usage) {
         usageTotal.input += message.usage.input ?? 0;
         usageTotal.output += message.usage.output ?? 0;
@@ -468,8 +486,7 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
     if (event.type === "message_update") {
       const update = event.assistantMessageEvent as { type?: string; delta?: string };
       if (update.type === "text_delta" && typeof update.delta === "string" && update.delta) {
-        streamedText += update.delta;
-        opts.onDelta?.(update.delta);
+        emitVisibleText(visibleTextFilter.push(update.delta));
       }
       return;
     }
@@ -574,6 +591,7 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
     opts.signal?.removeEventListener("abort", onExternalAbort);
     unsub();
   }
+  emitVisibleText(visibleTextFilter.finish());
 
   const errorMessage = agent.state.errorMessage ?? thrownError;
   if (outcome === "completed" && errorMessage) {

@@ -4,8 +4,8 @@
  * Never forks pi-coding-agent; no bash / arbitrary FS / apply tools.
  */
 import { randomUUID } from "node:crypto";
-import type { BlockSnapshot } from "@margin/domain";
-import { contentHash } from "@margin/domain";
+import type { BlockSnapshot, SelectionBlockRange } from "@margin/domain";
+import { contentHash, MAX_SELECTION_BLOCKS } from "@margin/domain";
 import { generateProposal } from "@margin/llm";
 import { getHarness } from "@margin/harness";
 import { getHeuristicComments } from "./packs/registry.js";
@@ -47,6 +47,7 @@ export { AnalysisRunStore } from "./data/store.js";
 export { buildOutline, searchBlocks } from "./outline.js";
 export { toolPhaseLabel, isUserFacingPhase } from "./progress.js";
 export { runPiAgentLoop } from "./pi-loop.js";
+export { stripLiteralThinkingBlocks } from "./assistant-text.js";
 export {
   COMPACTION_SUMMARY_PREFIX,
   createPiSummarizer,
@@ -101,6 +102,7 @@ export type {
   RemoteMcpCallResult,
 } from "./mcp-tools.js";
 export type { SessionTurnResult, SessionTurnInput } from "./session-runner.js";
+export { CONTEXT_TIER_PRESETS } from "./session-runner.js";
 export type { WorkspaceBridge, SessionDocBag } from "./session-tools.js";
 export {
   MAX_CLARIFICATION_ROUNDS,
@@ -169,8 +171,12 @@ async function runDirectBlockProposal(
   if (!selected.length) {
     throw new Error("direct proposal requires at least one selected block");
   }
+  if (selected.length > MAX_SELECTION_BLOCKS) {
+    throw new Error(`direct proposal supports at most ${MAX_SELECTION_BLOCKS} blocks`);
+  }
+  const selectionRanges = validateSelectionRanges(ctx, selected);
   if (selected.length > 1) {
-    return runDirectMultiBlockProposal(ctx, selected, onProgress);
+    return runDirectMultiBlockProposal(ctx, selected, selectionRanges, onProgress);
   }
 
   const block = selected[0]!;
@@ -187,19 +193,21 @@ async function runDirectBlockProposal(
   const targetBlock = ctx.tableCell
     ? { ...block, kind: "paragraph" as const, text: ctx.tableCell.before, contentHash: contentHash(ctx.tableCell.before) }
     : block;
+  const selectionRange = selectionRanges.get(block.id);
   const output = await generateDirectProposal({
     block: targetBlock,
     neighbors: ctx.blocks.slice(Math.max(0, index - 1), index + 2),
     harnessId: ctx.harnessId,
     instruction: ctx.instruction,
-    selectionText: ctx.selectionText,
-    selectionStart: ctx.selectionStart,
+    selectionText: selectionRange?.before ?? ctx.selectionText,
+    selectionStart: selectionRange?.start ?? ctx.selectionStart,
     operation: ctx.operation,
     targetLanguage: ctx.targetLanguage,
     sourceContext: ctx.sourceContext,
     workspaceSkillsRoot: ctx.skillsRoot,
     disabledSkills: ctx.disabledSkills,
     selectedSkills: ctx.selectedSkills,
+    timeoutMs: ctx.timeoutMs,
     signal: ctx.signal,
   });
   emit("生成修订提案", block.id);
@@ -226,11 +234,62 @@ async function runDirectBlockProposal(
   return { engine: "simple", proposals: [proposal], comments, steps, notes };
 }
 
-/** Cross-paragraph selection: one whole-block proposal per covered paragraph,
- *  each generated with the full selection as read-only context. */
+function validateSelectionRanges(
+  ctx: PaperAgentContext,
+  selected: BlockSnapshot[],
+): Map<string, SelectionBlockRange> {
+  const ranges = ctx.selectionRanges;
+  if (!ranges?.length) {
+    if (selected.length > 1 && ctx.selectionText?.trim()) {
+      throw new Error("cross-block selection requires exact per-block ranges");
+    }
+    return new Map();
+  }
+  if (!ctx.selectionText?.length) {
+    throw new Error("selection ranges require the exact selected text");
+  }
+  if (ranges.length !== selected.length) {
+    throw new Error("selection ranges must cover every selected block");
+  }
+  const byId = new Map<string, SelectionBlockRange>();
+  for (const [index, block] of selected.entries()) {
+    const range = ranges[index];
+    if (!range || range.blockId !== block.id || byId.has(range.blockId)) {
+      throw new Error("selection ranges must match selected blocks in document order");
+    }
+    if (
+      range.end !== range.start + range.before.length ||
+      block.text.slice(range.start, range.end) !== range.before
+    ) {
+      throw new Error(`selection range does not match immutable block ${block.id}`);
+    }
+    if (selected.length > 1) {
+      const isFirst = index === 0;
+      const isLast = index === selected.length - 1;
+      if (isFirst && range.end !== block.text.length) {
+        throw new Error("the first cross-block range must end at the block boundary");
+      }
+      if (isLast && range.start !== 0) {
+        throw new Error("the last cross-block range must start at the block boundary");
+      }
+      if (!isFirst && !isLast && (range.start !== 0 || range.end !== block.text.length)) {
+        throw new Error("middle cross-block ranges must cover their whole blocks");
+      }
+    }
+    byId.set(range.blockId, range);
+  }
+  if (ranges.map((range) => range.before).join("") !== ctx.selectionText) {
+    throw new Error("selection ranges do not reproduce the exact selected text");
+  }
+  return byId;
+}
+
+/** Cross-paragraph selection: partial edge blocks use precise selection proposals;
+ *  fully covered middle blocks may use whole-block proposals. */
 async function runDirectMultiBlockProposal(
   ctx: PaperAgentContext,
   selected: BlockSnapshot[],
+  selectionRanges: Map<string, SelectionBlockRange>,
   onProgress?: ScanProgressHandler,
 ): Promise<PaperAgentResult> {
   if (ctx.tableCell) {
@@ -251,18 +310,26 @@ async function runDirectMultiBlockProposal(
     }
     emit(`生成修订提案 ${i + 1}/${selected.length}`, block.id);
     const index = ctx.blocks.findIndex((candidate) => candidate.id === block.id);
+    const range = selectionRanges.get(block.id);
+    const partialRange = range && (range.start !== 0 || range.end !== block.text.length)
+      ? range
+      : undefined;
     const output = await generateDirectProposal({
       block,
       neighbors: ctx.blocks.slice(Math.max(0, index - 1), index + 2),
       harnessId: ctx.harnessId,
       instruction: ctx.instruction,
+      selectionText: partialRange?.before,
+      selectionStart: partialRange?.start,
       selectionContext: ctx.selectionText,
+      selectionContextChars: ctx.selectionContextChars,
       operation: ctx.operation,
       targetLanguage: ctx.targetLanguage,
       sourceContext: ctx.sourceContext,
       workspaceSkillsRoot: ctx.skillsRoot,
-    disabledSkills: ctx.disabledSkills,
-    selectedSkills: ctx.selectedSkills,
+      disabledSkills: ctx.disabledSkills,
+      selectedSkills: ctx.selectedSkills,
+      timeoutMs: ctx.timeoutMs,
       signal: ctx.signal,
     });
     proposals.push({
@@ -321,6 +388,7 @@ export async function runSimpleBlockScan(
       harnessId: harness.id,
       styleHint: harness.styleHint,
       instruction: ctx.instruction,
+      timeoutMs: ctx.timeoutMs,
       signal: ctx.signal,
     });
     if (ctx.signal?.aborted) throw new DOMException("Aborted", "AbortError");

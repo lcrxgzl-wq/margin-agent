@@ -1,7 +1,10 @@
 import { createContext, useContext, useMemo, useReducer, useRef, type ReactNode } from "react";
 import type { Block, Comment, DocumentMeta, LlmSettingsPublic, Proposal } from "./api";
+import type { SelectionBlockRange } from "@margin/domain";
 import type { ChatMessage } from "./components/Chat";
 import type { TableCellSelection } from "./components/canvasTypes";
+import { sameDocumentIdentity } from "./documentSafety";
+import { sameSelectionIdentity } from "./selectionIdentity";
 
 const MAX_VISIBLE_MESSAGES = 120;
 
@@ -9,6 +12,8 @@ export type Selection = {
   blockId: string | null;
   /** Every block covered by the range when the selection crosses blocks. */
   blockIds?: string[];
+  /** Exact immutable UTF-16 range in every covered Office block. */
+  selectionRanges?: SelectionBlockRange[];
   text: string;
   selectionStart?: number;
   tableCell?: TableCellSelection;
@@ -26,6 +31,7 @@ export type ContextMenu = {
   y: number;
   blockId: string | null;
   blockIds?: string[];
+  selectionRanges?: SelectionBlockRange[];
   text: string;
   selectionStart?: number;
   tableCell?: TableCellSelection;
@@ -36,6 +42,7 @@ export type ContextMenu = {
 export type RewritePromptState = {
   blockId: string;
   blockIds?: string[];
+  selectionRanges?: SelectionBlockRange[];
   excerpt: string;
   selectionText: string;
   selectionStart?: number;
@@ -46,6 +53,7 @@ export type RewritePromptState = {
 export type ThreadAnchor = {
   blockId: string;
   blockIds?: string[];
+  selectionRanges?: SelectionBlockRange[];
   selectionText: string;
   selectionStart?: number;
   tableCell?: TableCellSelection;
@@ -98,7 +106,12 @@ export type MarginState = {
 };
 
 type Action =
-  | { type: "setDocBundle"; doc: DocumentMeta; blocks: Block[] }
+  | {
+      type: "setDocBundle";
+      doc: DocumentMeta;
+      blocks: Block[];
+      preserveDocumentDirty?: boolean;
+    }
   | { type: "clearDocument" }
   | { type: "setProposals"; proposals: Proposal[] }
   | { type: "setComments"; comments: Comment[] }
@@ -170,9 +183,7 @@ export const initialMarginState: MarginState = {
 export function marginReducer(state: MarginState, action: Action): MarginState {
   switch (action.type) {
     case "setDocBundle": {
-      const documentChanged = !state.doc ||
-        state.doc.id !== action.doc.id ||
-        workspacePathKey(state.doc.relativePath) !== workspacePathKey(action.doc.relativePath);
+      const documentChanged = !sameDocumentIdentity(state.doc, action.doc);
       const revisionChanged = documentChanged || state.doc?.revision !== action.doc.revision;
       return {
         ...state,
@@ -185,7 +196,8 @@ export function marginReducer(state: MarginState, action: Action): MarginState {
         selection: revisionChanged ? initialMarginState.selection : state.selection,
         menu: revisionChanged ? null : state.menu,
         rewritePrompt: revisionChanged ? null : state.rewritePrompt,
-        documentDirty: false,
+        documentDirty:
+          action.preserveDocumentDirty && !documentChanged ? state.documentDirty : false,
         reviewError: null,
         sourcePaths:
           state.doc &&
@@ -266,8 +278,7 @@ export function marginReducer(state: MarginState, action: Action): MarginState {
       return { ...state, settingsOpen: action.settingsOpen };
     case "openThread": {
       const existing = state.threads.find((thread) =>
-        thread.anchor.blockId === action.thread.anchor.blockId &&
-        thread.anchor.selectionText === action.thread.anchor.selectionText,
+        sameSelectionIdentity(thread.anchor, action.thread.anchor),
       );
       if (existing) {
         return {
@@ -381,7 +392,11 @@ export function marginReducer(state: MarginState, action: Action): MarginState {
 }
 
 type MarginStore = MarginState & {
-  setDocBundle: (doc: DocumentMeta, blocks: Block[]) => void;
+  setDocBundle: (
+    doc: DocumentMeta,
+    blocks: Block[],
+    opts?: { preserveDocumentDirty?: boolean },
+  ) => void;
   clearDocument: () => void;
   setProposals: (proposals: Proposal[]) => void;
   setComments: (comments: Comment[]) => void;
@@ -427,7 +442,12 @@ export function MarginStoreProvider({ children }: { children: ReactNode }) {
   const generation = useRef(0);
   const actions = useMemo<MarginActions>(
     () => ({
-      setDocBundle: (doc, blocks) => dispatch({ type: "setDocBundle", doc, blocks }),
+      setDocBundle: (doc, blocks, opts) => dispatch({
+        type: "setDocBundle",
+        doc,
+        blocks,
+        preserveDocumentDirty: opts?.preserveDocumentDirty,
+      }),
       clearDocument: () => dispatch({ type: "clearDocument" }),
       setProposals: (proposals) => dispatch({ type: "setProposals", proposals }),
       setComments: (comments) => dispatch({ type: "setComments", comments }),

@@ -30,9 +30,11 @@ export function SelectionBubble({
 }: Props) {
   if (!visible) return null;
   const left = Math.min(Math.max(12, x - 120), Math.max(12, window.innerWidth - 260));
-  const top = y - 48 >= minY
-    ? y - 48
-    : Math.min(Math.max(minY, y + 18), Math.max(minY, window.innerHeight - 52));
+  const preferredTop = y - 48 >= minY ? y - 48 : y + 18;
+  const top = Math.min(
+    Math.max(minY, preferredTop),
+    Math.max(minY, window.innerHeight - 52),
+  );
   return (
     <div className="sel-bubble" style={{ left, top }}>
       {editDisabledReason ? <span className="selection-limit" title={editDisabledReason}>不可编辑</span> : null}

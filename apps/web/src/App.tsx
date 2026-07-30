@@ -35,6 +35,13 @@ import { MarginStoreProvider, useMarginStore, type ReviewThread, type SelectionI
 import { useWorkspaceActions } from "./useWorkspaceActions";
 import { polishIntent, translateAssistInstruction, translationIntent } from "./selectionEditIntent";
 import { selectionEditUnavailableReason } from "./selectionSafety";
+import { clearChatAfterDirectDocumentOpen, resyncChatAfterAgentDocumentOpen } from "./documentChatSync";
+import {
+  canApplyDocumentImportResponse,
+  sameDocumentIdentity,
+  shouldPreserveDirtyDocumentOnImport,
+} from "./documentSafety";
+import { proposalMatchesSelection, sameSelectionIdentity, selectionAnchorAlive } from "./selectionIdentity";
 
 const Canvas = lazy(() =>
   import("./components/Canvas").then((module) => ({ default: module.Canvas })),
@@ -56,6 +63,8 @@ function Workspace() {
     key: `${store.doc?.id ?? "closed"}:${store.doc?.revision ?? "-"}:${store.documentDirty ? "dirty" : "clean"}`,
     generation: 0,
   });
+  const chatDocumentIdRef = useRef(store.doc?.id ?? null);
+  const sessionHydrationDocumentIdRef = useRef<string | null>(null);
   const documentStateKey = `${store.doc?.id ?? "closed"}:${store.doc?.revision ?? "-"}:${store.documentDirty ? "dirty" : "clean"}`;
   if (documentStateRef.current.key !== documentStateKey) {
     documentStateRef.current = {
@@ -234,8 +243,58 @@ function Workspace() {
     if (typeof session.clarificationRounds === "number") {
       storeRef.current.setClarificationRounds(session.clarificationRounds);
     }
+    const restoredThreadIds = new Set(
+      (session.opened ? session.review?.threads ?? [] : [])
+        .filter((thread) => thread.documentId === session.opened?.document.id)
+        .map((thread) => thread.id),
+    );
+    const turns = session.chat?.turns?.filter((turn) =>
+      turn.text?.trim() && (!turn.threadId || restoredThreadIds.has(turn.threadId)),
+    ) ?? [];
+    const hydratedMessages: import("./components/Chat").ChatMessage[] = turns.map((t) => ({
+      id: crypto.randomUUID(),
+      role: t.role,
+      text: t.text,
+      threadId: t.threadId,
+    }));
+    if (session.task) {
+      if (session.task.status === "interrupted") {
+        hydratedMessages.push({
+          id: crypto.randomUUID(),
+          role: "assistant",
+          text: `上轮任务已中断：${session.task.objective}`,
+          task: session.task,
+        });
+      } else {
+        let lastAssistant = -1;
+        for (let index = hydratedMessages.length - 1; index >= 0; index -= 1) {
+          if (hydratedMessages[index]?.role === "assistant") {
+            lastAssistant = index;
+            break;
+          }
+        }
+        if (lastAssistant >= 0) hydratedMessages[lastAssistant] = {
+          ...hydratedMessages[lastAssistant],
+          task: session.task,
+        };
+      }
+    }
+    // Chat is authoritative in the snapshot and must not wait on proposal/comment refreshes.
+    if (hydratedMessages.length || !opts?.keepEmptyMessages) {
+      storeRef.current.setMessages(hydratedMessages);
+    }
     if (session.opened) {
-      storeRef.current.setDocBundle(session.opened.document, session.opened.blocks);
+      const currentDocument = storeRef.current.doc;
+      const preserveDocumentDirty = Boolean(
+        storeRef.current.documentDirty &&
+          sameDocumentIdentity(currentDocument, session.opened.document),
+      );
+      if (currentDocument && currentDocument.id !== session.opened.document.id) {
+        sessionHydrationDocumentIdRef.current = session.opened.document.id;
+      }
+      storeRef.current.setDocBundle(session.opened.document, session.opened.blocks, {
+        preserveDocumentDirty,
+      });
       const [proposals, comments] = await Promise.all([
         listProposals(session.opened.document.id),
         listComments(session.opened.document.id),
@@ -291,47 +350,33 @@ function Workspace() {
       storeRef.current.clearDocument();
     }
     if (session.sourcePaths) storeRef.current.setSourcePaths(session.sourcePaths);
-    const restoredThreadIds = new Set(
-      (session.opened ? session.review?.threads ?? [] : [])
-        .filter((thread) => thread.documentId === session.opened?.document.id)
-        .map((thread) => thread.id),
-    );
-    const turns = session.chat?.turns?.filter((turn) =>
-      turn.text?.trim() && (!turn.threadId || restoredThreadIds.has(turn.threadId)),
-    ) ?? [];
-    const hydratedMessages: import("./components/Chat").ChatMessage[] = turns.map((t) => ({
-      id: crypto.randomUUID(),
-      role: t.role,
-      text: t.text,
-      threadId: t.threadId,
-    }));
-    if (session.task) {
-      if (session.task.status === "interrupted") {
-        hydratedMessages.push({
-          id: crypto.randomUUID(),
-          role: "assistant",
-          text: `上轮任务已中断：${session.task.objective}`,
-          task: session.task,
-        });
-      } else {
-        let lastAssistant = -1;
-        for (let index = hydratedMessages.length - 1; index >= 0; index -= 1) {
-          if (hydratedMessages[index]?.role === "assistant") {
-            lastAssistant = index;
-            break;
-          }
-        }
-        if (lastAssistant >= 0) hydratedMessages[lastAssistant] = {
-          ...hydratedMessages[lastAssistant],
-          task: session.task,
-        };
-      }
-    }
-    // Boot keeps the greeting when the session is empty; new/switch/clear always replace.
-    if (hydratedMessages.length || !opts?.keepEmptyMessages) {
-      storeRef.current.setMessages(hydratedMessages);
-    }
   };
+
+  useEffect(() => {
+    const currentDocumentId = store.doc?.id ?? null;
+    const previousDocumentId = chatDocumentIdRef.current;
+    chatDocumentIdRef.current = currentDocumentId;
+    if (
+      !sessionHydrated ||
+      !previousDocumentId ||
+      !currentDocumentId ||
+      previousDocumentId === currentDocumentId
+    ) return;
+    if (sessionHydrationDocumentIdRef.current === currentDocumentId) {
+      sessionHydrationDocumentIdRef.current = null;
+      return;
+    }
+    void resyncChatAfterAgentDocumentOpen({
+      previousDocumentId,
+      nextDocumentId: currentDocumentId,
+      clearMessages: () => storeRef.current.setMessages([]),
+      loadSnapshot: getSession,
+      applySnapshot: async (session) => {
+        if (storeRef.current.doc?.id !== currentDocumentId) return;
+        await applySessionSnapshot(session);
+      },
+    }).catch(actions.messageError);
+  }, [sessionHydrated, store.doc?.id]);
 
   useEffect(() => {
     let active = true;
@@ -399,9 +444,13 @@ function Workspace() {
     store.focusThread(thread.id);
     const query = thread.anchor.tableCell?.before || thread.anchor.selectionText;
     if (query.trim()) {
+      const proposalId = store.proposals.find((proposal) =>
+        proposalMatchesSelection(proposal, thread.anchor),
+      )?.id;
       setFocusRequest({
         key: `${thread.id}:${Date.now()}`,
         query,
+        proposalId,
         blockId: thread.anchor.blockId,
         tableCell: thread.anchor.tableCell,
       });
@@ -417,28 +466,30 @@ function Workspace() {
     });
     const query = anchor.tableCell?.before || anchor.selectionText;
     if (query.trim()) {
+      const proposalId = store.proposals.find((proposal) =>
+        proposalMatchesSelection(proposal, anchor),
+      )?.id;
       setFocusRequest({
         key: `anchor:${Date.now()}`,
         query,
+        proposalId,
         blockId: anchor.blockId,
         tableCell: anchor.tableCell,
       });
     }
   };
-  const threadAnchorText = activeThread
-    ? activeThread.anchor.tableCell?.before ?? activeThread.anchor.selectionText
-    : "";
-  const threadAnchorAlive = !activeThread ||
-    !threadAnchorText ||
-    Boolean(store.blocks.find((block) => block.id === activeThread.anchor.blockId)?.text.includes(threadAnchorText));
+  const threadAnchorAlive = !activeThread || selectionAnchorAlive(activeThread.anchor, store.blocks);
   const onCanvasSelectionChange = (selection: SelectionInput) => {
     store.setSelection(selection);
     if (!selection.anchor || !selection.blockId) return;
     const thread = storeRef.current.threads.find((candidate) =>
-      candidate.anchor.blockId === selection.blockId &&
-      (candidate.anchor.tableCell
-        ? candidate.anchor.tableCell.address === selection.tableCell?.address
-        : candidate.anchor.selectionText === selection.text),
+      sameSelectionIdentity(candidate.anchor, {
+        blockId: selection.blockId!,
+        selectionRanges: selection.selectionRanges,
+        selectionText: selection.text,
+        selectionStart: selection.selectionStart,
+        tableCell: selection.tableCell,
+      }),
     );
     if (thread) store.updateThreadPosition(thread.id, selection.anchor);
   };
@@ -526,6 +577,10 @@ function Workspace() {
               clearSelectionSignal={selectionClearToken}
               onDocumentSaved={(document, blocks) => {
                 store.setDocBundle(document, blocks);
+                // A successful native save supersedes every pending proposal on
+                // the server. Clear stale cards immediately; the refresh below
+                // remains authoritative for comments and any future statuses.
+                store.setProposals([]);
                 void Promise.all([listProposals(document.id), listComments(document.id)])
                   .then(([proposals, comments]) => {
                     if (storeRef.current.doc?.id !== document.id || storeRef.current.doc.revision !== document.revision) return;
@@ -659,8 +714,25 @@ function Workspace() {
       />
       <OpenDocxDialog
         open={docxPickerOpen}
+        documentDirty={store.documentDirty}
+        documentGeneration={documentStateRef.current.generation}
+        expectedDocument={store.doc ? { id: store.doc.id, revision: store.doc.revision } : null}
         onClose={() => setDocxPickerOpen(false)}
-        onOpened={(document, blocks, report) => {
+        onOpened={(document, blocks, report, requestDocumentGeneration) => {
+          if (!canApplyDocumentImportResponse(
+            requestDocumentGeneration,
+            documentStateRef.current.generation,
+          )) return false;
+          if (shouldPreserveDirtyDocumentOnImport(
+            storeRef.current.doc,
+            document,
+            storeRef.current.documentDirty,
+          )) return true;
+          clearChatAfterDirectDocumentOpen(
+            storeRef.current.doc?.id,
+            document.id,
+            storeRef.current.setMessages,
+          );
           store.setDocBundle(document, blocks);
           void Promise.all([listProposals(document.id), listComments(document.id)])
             .then(([proposals, comments]) => {
@@ -676,6 +748,7 @@ function Workspace() {
               text: `已导入 ${document.relativePath}，但结构检查有告警：${(report.flags ?? []).join("、") || "未知"}`,
             });
           }
+          return true;
         }}
       />
       <McpApprovalDialog
@@ -693,9 +766,10 @@ function Workspace() {
           const selectionStart = store.rewritePrompt?.selectionStart;
           const tableCell = store.rewritePrompt?.tableCell;
           const crossTableCells = store.rewritePrompt?.crossTableCells;
+          const selectionRanges = store.rewritePrompt?.selectionRanges;
           store.setRewritePrompt(null);
           if (blockId) {
-            actions.dispatchSelection("rewrite_directed", blockId, selectionText, instruction, selectionStart, "rewrite", undefined, tableCell, store.rewritePrompt?.blockIds, crossTableCells);
+            actions.dispatchSelection("rewrite_directed", blockId, selectionText, instruction, selectionStart, "rewrite", undefined, tableCell, store.rewritePrompt?.blockIds, crossTableCells, selectionRanges);
           }
         }}
       />
@@ -718,9 +792,10 @@ function Workspace() {
             store.menu!.tableCell,
             store.menu!.blockIds,
             store.menu!.crossTableCells,
+            store.menu!.selectionRanges,
           )}
           onRewriteDirected={() =>
-            actions.dispatchSelection("rewrite_directed", store.menu!.blockId, store.menu!.text, undefined, store.menu!.selectionStart, "rewrite", undefined, store.menu!.tableCell, store.menu!.blockIds, store.menu!.crossTableCells)
+            actions.dispatchSelection("rewrite_directed", store.menu!.blockId, store.menu!.text, undefined, store.menu!.selectionStart, "rewrite", undefined, store.menu!.tableCell, store.menu!.blockIds, store.menu!.crossTableCells, store.menu!.selectionRanges)
           }
           onTranslate={() => {
             const intent = translationIntent(store.menu!.text);
@@ -735,6 +810,7 @@ function Workspace() {
               store.menu!.tableCell,
               store.menu!.blockIds,
               store.menu!.crossTableCells,
+              store.menu!.selectionRanges,
             );
           }}
           onPolish={() =>
@@ -749,10 +825,11 @@ function Workspace() {
               store.menu!.tableCell,
               store.menu!.blockIds,
               store.menu!.crossTableCells,
+              store.menu!.selectionRanges,
             )
           }
           onDiscuss={() => {
-            actions.dispatchSelection("discuss", store.menu!.blockId, store.menu!.text, undefined, undefined, undefined, undefined, store.menu!.tableCell, store.menu!.blockIds, store.menu!.crossTableCells);
+            actions.dispatchSelection("discuss", store.menu!.blockId, store.menu!.text, undefined, undefined, undefined, undefined, store.menu!.tableCell, store.menu!.blockIds, store.menu!.crossTableCells, store.menu!.selectionRanges);
           }}
         />
       ) : null}
@@ -783,6 +860,7 @@ function Workspace() {
           store.selection.tableCell,
           store.selection.blockIds,
           store.selection.crossTableCells,
+          store.selection.selectionRanges,
         )}
         onTranslate={() => {
           const intent = translationIntent(store.selection.text);
@@ -797,10 +875,11 @@ function Workspace() {
             store.selection.tableCell,
             store.selection.blockIds,
             store.selection.crossTableCells,
+            store.selection.selectionRanges,
           );
         }}
         onDiscuss={() => {
-          actions.dispatchSelection("discuss", store.selection.blockId, store.selection.text, undefined, store.selection.selectionStart, undefined, undefined, store.selection.tableCell, store.selection.blockIds, store.selection.crossTableCells);
+          actions.dispatchSelection("discuss", store.selection.blockId, store.selection.text, undefined, store.selection.selectionStart, undefined, undefined, store.selection.tableCell, store.selection.blockIds, store.selection.crossTableCells, store.selection.selectionRanges);
         }}
         onMore={() =>
           store.setMenu({
@@ -808,6 +887,7 @@ function Workspace() {
             y: (store.selection.anchor?.y ?? 120) + 8,
             blockId: store.selection.blockId,
             blockIds: store.selection.blockIds,
+            selectionRanges: store.selection.selectionRanges,
             text: store.selection.text,
             selectionStart: store.selection.selectionStart,
             tableCell: store.selection.tableCell,
@@ -819,7 +899,9 @@ function Workspace() {
         <ThreadPopover
           thread={activeThread}
           anchorAlive={threadAnchorAlive}
-          proposals={store.proposals.filter((proposal) => proposal.blockId === activeThread.anchor.blockId)}
+          proposals={store.proposals.filter((proposal) =>
+            proposalMatchesSelection(proposal, activeThread.anchor),
+          )}
           comments={store.comments.filter((comment) => comment.blockId === activeThread.anchor.blockId)}
           messages={store.messages.filter((message) => message.threadId === activeThread.id)}
           busy={store.busy}
@@ -831,6 +913,7 @@ function Workspace() {
               selection: {
                 blockId: activeThread.anchor.blockId,
                 blockIds: activeThread.anchor.blockIds,
+                selectionRanges: activeThread.anchor.selectionRanges,
                 text: activeThread.anchor.selectionText,
                 selectionStart: activeThread.anchor.selectionStart,
                 tableCell: activeThread.anchor.tableCell,
@@ -840,7 +923,7 @@ function Workspace() {
           }
           onAccept={async (proposalId) => {
             const wasLast = storeRef.current.proposals.filter(
-              (proposal) => proposal.blockId === activeThread.anchor.blockId,
+              (proposal) => proposalMatchesSelection(proposal, activeThread.anchor),
             ).length <= 1;
             const result = await actions.onAccept(proposalId);
             if (result !== false && wasLast) storeRef.current.collapseThread(activeThread.id);
@@ -848,7 +931,7 @@ function Workspace() {
           }}
           onEdit={async (proposalId, editedText) => {
             const wasLast = storeRef.current.proposals.filter(
-              (proposal) => proposal.blockId === activeThread.anchor.blockId,
+              (proposal) => proposalMatchesSelection(proposal, activeThread.anchor),
             ).length <= 1;
             const result = await actions.onEdit(proposalId, editedText);
             if (result !== false && wasLast) storeRef.current.collapseThread(activeThread.id);
@@ -856,7 +939,7 @@ function Workspace() {
           }}
           onUndo={async (proposalId) => {
             const wasLast = storeRef.current.proposals.filter(
-              (proposal) => proposal.blockId === activeThread.anchor.blockId,
+              (proposal) => proposalMatchesSelection(proposal, activeThread.anchor),
             ).length <= 1;
             const result = await actions.onUndo(proposalId);
             if (result !== false && wasLast) storeRef.current.collapseThread(activeThread.id);

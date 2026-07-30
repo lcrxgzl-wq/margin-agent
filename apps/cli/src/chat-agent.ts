@@ -8,6 +8,7 @@ import {
   orchestrateCompaction,
   resolveRuntimeModel,
   runSessionTurn,
+  stripLiteralThinkingBlocks,
   type CompactionEvent,
   type SummarizerFn,
   type AgentMessage,
@@ -598,6 +599,7 @@ export async function runChatAgentTurn(opts: {
         reasoningMode: llmSettings.reasoningMode,
         timeoutMs: llmSettings.agentTimeoutMs,
         contextTier: llmSettings.contextTier,
+        selectionContextChars: llmSettings.selectionContextChars,
         reasoningOptIn: activeProfile(llmSettings).reasoningOptIn,
         compactionAuto: llmSettings.compactionAuto !== false,
         previousSummary: latestAgentCompactionSummary(workspace, agentState.sessionId),
@@ -670,6 +672,8 @@ export async function runChatAgentTurn(opts: {
     }
     throw error;
   }
+
+  turn.reply = stripLiteralThinkingBlocks(turn.reply);
 
   if (
     verifyDocumentOpen &&

@@ -10,6 +10,7 @@ const ENV_KEYS = [
   "MARGIN_AUTH_STYLE",
   "MARGIN_BASE_URL",
   "MARGIN_MODEL",
+  "MARGIN_PI_TIMEOUT_MS",
   "MARGIN_PROVIDER",
   "OPENAI_API_KEY",
 ] as const;
@@ -39,6 +40,36 @@ afterEach(() => {
 });
 
 describe("bounded completion adapter", () => {
+  it("uses the Host timeout, then the environment, then the five-minute default", async () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_BASE_URL = "https://provider.test/v1";
+    process.env.MARGIN_API_KEY = "secret";
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      choices: [{ message: { content: JSON.stringify({
+        blockId: "b1",
+        after: "Revised paragraph.",
+        rationale: "Clearer.",
+        risk: "language",
+        evidence: [],
+      }) } }],
+    })));
+    const timeoutSpy = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockReturnValue(new AbortController().signal);
+
+    await generateProposal({ block });
+    process.env.MARGIN_PI_TIMEOUT_MS = "45000";
+    await generateProposal({ block });
+    await generateProposal({ block, timeoutMs: 90_000 });
+
+    expect(timeoutSpy.mock.calls.map(([value]) => value)).toEqual([
+      300_000,
+      45_000,
+      90_000,
+    ]);
+    timeoutSpy.mockRestore();
+  });
+
   it("requests an OpenAI-compatible proposal without tool fields", async () => {
     process.env.MARGIN_API_FORMAT = "openai";
     process.env.MARGIN_BASE_URL = "https://provider.test/v1";

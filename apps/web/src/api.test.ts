@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.resetModules();
 });
@@ -25,6 +26,39 @@ describe("waitRun", () => {
     await expect(waitRun("old-run", 1_000)).rejects.toThrow("已被较新的任务替代");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps polling without a frontend deadline when maxMs is omitted", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const values = new Map<string, string>();
+    vi.stubGlobal("location", { href: "http://127.0.0.1/#token=test-token" });
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        statusText: "",
+        json: async () => ({ status: "running", phase: "生成中" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        statusText: "",
+        json: async () => ({ status: "done", proposalIds: ["p1"] }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const { waitRun } = await import("./api");
+
+    const pending = waitRun("long-run");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(200_000);
+    await vi.advanceTimersByTimeAsync(500);
+
+    await expect(pending).resolves.toMatchObject({ status: "done" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("compactSession", () => {
@@ -48,5 +82,119 @@ describe("compactSession", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/api/v1/sessions/compact");
     expect(init.method).toBe("POST");
+  });
+});
+
+describe("saveLlmSettings", () => {
+  it("sends custom timeout and selection context settings", async () => {
+    vi.stubGlobal("location", { href: "http://127.0.0.1/#token=test-token" });
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => undefined,
+    });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      statusText: "",
+      json: async () => ({ activeId: "custom", providers: [], presets: [], llmMode: "mock" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { saveLlmSettings } = await import("./api");
+    await saveLlmSettings({
+      agentTimeoutMs: 1_200_000,
+      selectionContextChars: 64_000,
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v1/settings/llm");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      agentTimeoutMs: 1_200_000,
+      selectionContextChars: 64_000,
+    });
+  });
+});
+
+describe("resolveProposals", () => {
+  it("sends one atomic batch request with the document preconditions", async () => {
+    vi.stubGlobal("location", { href: "http://127.0.0.1/#token=test-token" });
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => undefined,
+    });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      statusText: "",
+      json: async () => ({
+        ok: true,
+        document: { id: "doc-1", relativePath: "paper.md", revision: 4, contentHash: "fedcba9876543210" },
+        blocks: [],
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { resolveProposals } = await import("./api");
+    await resolveProposals(
+      { id: "doc-1", relativePath: "paper.md", revision: 3, contentHash: "0123456789abcdef" },
+      ["proposal-1", "proposal-2"],
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v1/documents/doc-1/resolve-proposals");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({
+      proposalIds: ["proposal-1", "proposal-2"],
+      expectedRevision: 3,
+      expectedHash: "0123456789abcdef",
+    });
+  });
+});
+
+describe("document-scoped session requests", () => {
+  it("sends explicit document identity for sources and DOCX imports", async () => {
+    vi.stubGlobal("location", { href: "http://127.0.0.1/#token=test-token" });
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => undefined,
+    });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      statusText: "",
+      json: async () => ({ sourcePaths: [] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { importWorkspaceDocx, openDocument, saveSessionSources } = await import("./api");
+    await saveSessionSources("doc-1", ["sources/notes.md"]);
+    await saveSessionSources(null, []);
+    await importWorkspaceDocx("imports/paper.docx", { id: "doc-1", revision: 4 });
+    await importWorkspaceDocx("imports/paper.docx", null);
+    await openDocument("paper.md", { id: "doc-1", revision: 4 });
+    await openDocument("paper.md");
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/v1/session/sources",
+      "/api/v1/session/sources",
+      "/api/v1/documents/import-docx",
+      "/api/v1/documents/import-docx",
+      "/api/v1/documents/open",
+      "/api/v1/documents/open",
+    ]);
+    expect(fetchMock.mock.calls.map(([, init]) => JSON.parse(String((init as RequestInit).body))))
+      .toEqual([
+        { documentId: "doc-1", sourcePaths: ["sources/notes.md"] },
+        { documentId: null, sourcePaths: [] },
+        {
+          relativePath: "imports/paper.docx",
+          expectedDocument: { id: "doc-1", revision: 4 },
+        },
+        { relativePath: "imports/paper.docx", expectedDocument: null },
+        {
+          relativePath: "paper.md",
+          expectedDocument: { id: "doc-1", revision: 4 },
+        },
+        { relativePath: "paper.md" },
+      ]);
   });
 });

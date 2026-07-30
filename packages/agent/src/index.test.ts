@@ -186,6 +186,64 @@ describe("paper agent adapter", () => {
     ]);
   });
 
+  it("preserves unselected text on both edges of a cross-paragraph selection", async () => {
+    const edgeBlocks = [
+      { id: "a", kind: "paragraph" as const, text: "KEEP-A select-A", order: 0, contentHash: "a" },
+      { id: "b", kind: "paragraph" as const, text: "middle", order: 1, contentHash: "b" },
+      { id: "c", kind: "paragraph" as const, text: "select-C KEEP-C", order: 2, contentHash: "c" },
+    ];
+    const result = await runBlockScan(
+      {
+        documentId: "d1",
+        revision: 2,
+        blocks: edgeBlocks,
+        instruction: "Rewrite only the selection.",
+        operation: "rewrite",
+        selectionText: "select-Amiddleselect-C",
+        selectionRanges: [
+          { blockId: "a", start: 7, end: 15, before: "select-A" },
+          { blockId: "b", start: 0, end: 6, before: "middle" },
+          { blockId: "c", start: 0, end: 8, before: "select-C" },
+        ],
+        selectionContextChars: 48_000,
+        preferSimple: true,
+      },
+      ["a", "b", "c"],
+    );
+
+    expect(result.proposals).toHaveLength(3);
+    expect(result.proposals[0]).toMatchObject({
+      before: "KEEP-A select-A",
+      operation: {
+        scope: "selection",
+        selection: { start: 7, end: 15, before: "select-A" },
+      },
+    });
+    expect(result.proposals[0]?.after.startsWith("KEEP-A ")).toBe(true);
+    expect(result.proposals[1]?.operation?.scope).toBe("block");
+    expect(result.proposals[2]).toMatchObject({
+      before: "select-C KEEP-C",
+      operation: {
+        scope: "selection",
+        selection: { start: 0, end: 8, before: "select-C" },
+      },
+    });
+    expect(result.proposals[2]?.after.endsWith(" KEEP-C")).toBe(true);
+  });
+
+  it("rejects cross-paragraph selection text without exact ranges", async () => {
+    await expect(runBlockScan(
+      {
+        documentId: "d1",
+        revision: 2,
+        blocks: sampleBlocks,
+        selectionText: `${sampleBlocks[0]!.text}${sampleBlocks[1]!.text}`,
+        preferSimple: true,
+      },
+      ["h1", "b1"],
+    )).rejects.toThrow(/requires exact per-block ranges/);
+  });
+
   it("creates a cell-only proposal for an exact table target", async () => {
     const result = await runBlockScan(
       {

@@ -4,6 +4,7 @@ import { listDocumentTimeline, readSourceChunk, type Comment, type Proposal, typ
 import { proposalChange } from "../proposalChange";
 import { filterTimeline, historyEntryView, historyFilters, type HistoryFilter } from "../reviewHistory";
 import type { ReviewThread } from "../store";
+import { proposalMatchesSelection } from "../selectionIdentity";
 
 type Props = {
   proposals: Proposal[];
@@ -157,7 +158,9 @@ export function ReviewPanel({
       {threads.length > 0 && onOpenThread ? (
         <div className="review-threads" aria-label="线程收件箱">
           {threads.map((thread) => {
-            const pending = proposals.filter((proposal) => proposal.blockId === thread.anchor.blockId).length;
+            const pending = proposals.filter((proposal) =>
+              proposalMatchesSelection(proposal, thread.anchor),
+            ).length;
             const excerpt = (thread.anchor.tableCell?.before ?? thread.anchor.selectionText).trim();
             return (
               <button

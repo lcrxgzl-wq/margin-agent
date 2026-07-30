@@ -25,6 +25,8 @@ export type LlmSettingsPutBody = {
   harnessId?: string | null;
   /** Pi session timeout in ms; null clears back to the default. */
   agentTimeoutMs?: number | null;
+  /** Inline selection cap in chars; null follows the context tier. */
+  selectionContextChars?: number | null;
   /** Context budget tier; null clears back to the default (standard). */
   contextTier?: "eco" | "standard" | "max" | null;
   /** Automatic context compaction; null clears back to the default (on). */
@@ -65,6 +67,7 @@ export function buildLlmSettingsUpdate(
     harnessId,
     reasoningMode: body.reasoningMode,
     agentTimeoutMs: body.agentTimeoutMs,
+    selectionContextChars: body.selectionContextChars,
     contextTier: body.contextTier,
     compactionAuto: body.compactionAuto,
     provider: Object.keys(defined).length

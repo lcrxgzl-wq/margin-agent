@@ -23,12 +23,15 @@ type DirectProposalInput = {
   selectionStart?: number;
   /** Full cross-block selection, supplied as context when rewriting per block. */
   selectionContext?: string;
+  /** Host-approved cap for the full cross-block selection context. */
+  selectionContextChars?: number;
   operation?: ProposalOperationKind;
   targetLanguage?: ProposalTargetLanguage;
   sourceContext?: Array<{ sourceRef: string; text: string }>;
   workspaceSkillsRoot?: string;
   disabledSkills?: readonly string[];
   selectedSkills?: readonly string[];
+  timeoutMs?: number;
   signal?: AbortSignal;
 };
 
@@ -39,7 +42,13 @@ export type DirectProposalResult = LlmProposalOutput & {
 type ApiFormat = "anthropic" | "openai";
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
+const MAX_SELECTION_CONTEXT_CHARS = 100_000;
 const REQUEST_TIMEOUT_MS = 60_000;
+
+function configuredTimeoutMs(fallback: number): number {
+  const value = Number(process.env.MARGIN_PI_TIMEOUT_MS ?? fallback);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
 
 function apiFormat(): ApiFormat {
   const value = (process.env.MARGIN_API_FORMAT || process.env.MARGIN_PROVIDER || "openai")
@@ -241,7 +250,16 @@ function promptFor(input: DirectProposalInput): string {
     .map((source) => `[${source.sourceRef}]\n${source.text}`)
     .join("\n\n");
   const selection = input.selectionText?.trim();
-  const selectionContext = input.selectionContext?.trim().slice(0, 2_000);
+  const selectionContext = input.selectionContext?.trim();
+  if (selectionContext) {
+    const configuredLimit = Math.min(
+      MAX_SELECTION_CONTEXT_CHARS,
+      input.selectionContextChars ?? MAX_SELECTION_CONTEXT_CHARS,
+    );
+    if (selectionContext.length > configuredLimit) {
+      throw new Error(`selection context exceeds ${configuredLimit} characters`);
+    }
+  }
   const operationHint = input.operation === "translate"
     ? `This is a translation operation${input.targetLanguage ? ` targeting ${input.targetLanguage}` : ""}. Return only the translation of the selected span.`
     : input.operation === "polish"
@@ -367,6 +385,7 @@ async function requestCompletion(
   externalSignal?: AbortSignal,
   modelOverride?: string,
   timeoutMs = REQUEST_TIMEOUT_MS,
+  maxTokens = 4096,
 ): Promise<string> {
   const model =
     modelOverride?.trim() ||
@@ -376,13 +395,13 @@ async function requestCompletion(
     format === "anthropic"
       ? {
           model,
-          max_tokens: 4096,
+          max_tokens: maxTokens,
           system,
           messages: [{ role: "user", content: prompt }],
         }
       : {
           model,
-          max_tokens: 4096,
+          max_tokens: maxTokens,
           messages: [
             { role: "system", content: system },
             { role: "user", content: prompt },
@@ -433,6 +452,13 @@ async function requestCompletion(
   throw new Error("LLM completion endpoint was not found");
 }
 
+function completionTokenBudget(input: DirectProposalInput): 4096 | 8192 | 16384 {
+  const targetChars = input.selectionText?.length ?? input.block.text.length;
+  if (targetChars > 12_000) return 16_384;
+  if (targetChars > 4_000) return 8_192;
+  return 4_096;
+}
+
 /** Direct text completion: deliberately sends no tools, tool_choice, or response_format. */
 export async function generateDirectProposal(
   input: DirectProposalInput,
@@ -465,7 +491,8 @@ export async function generateDirectProposal(
     promptFor(input),
     input.signal,
     profile.model,
-    profile.limits.timeoutMs,
+    input.timeoutMs ?? configuredTimeoutMs(profile.limits.timeoutMs),
+    completionTokenBudget(input),
   );
   const parsed = parseProposal(input.block.id, raw, hasSelection);
   const proposal = validateEvidence(

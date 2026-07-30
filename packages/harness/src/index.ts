@@ -87,8 +87,8 @@ export function validateAgentProfile(profile: AgentProfile): AgentProfile {
   if (!Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 100) {
     throw new Error("agent profile maxTurns must be an integer from 1 to 100");
   }
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 600_000) {
-    throw new Error("agent profile timeoutMs must be an integer from 1000 to 600000");
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 1_800_000) {
+    throw new Error("agent profile timeoutMs must be an integer from 1000 to 1800000");
   }
   if (!Number.isInteger(maxContextMessages) || maxContextMessages < 4 || maxContextMessages > 200) {
     throw new Error("agent profile maxContextMessages must be an integer from 4 to 200");
@@ -137,7 +137,7 @@ function composePersona(constraints: HarnessConstraints): string {
 
 const DEFAULT_LIMITS: AgentProfile["limits"] = {
   maxTurns: 20,
-  timeoutMs: 120_000,
+  timeoutMs: 300_000,
   maxContextMessages: 80,
   maxContextChars: 200_000,
 };

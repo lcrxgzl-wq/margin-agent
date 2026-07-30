@@ -208,6 +208,37 @@ describe("reasoning fields", () => {
     ).rejects.toThrow(/agentTimeoutMs|超时/);
   });
 
+  it("threads a custom selection cap without touching the provider patch", () => {
+    const update = buildLlmSettingsUpdate({ selectionContextChars: 64_000 }, "custom");
+    expect(update.selectionContextChars).toBe(64_000);
+    expect(update.provider).toBeUndefined();
+  });
+
+  it("persists and clears a custom selection cap through the update flow", async () => {
+    const before = activeProfile(readLlmSettingsStore(root));
+    await saveLlmSettings(
+      root,
+      buildLlmSettingsUpdate({ selectionContextChars: 32_000 }, before.id),
+    );
+    expect(readLlmSettingsStore(root).selectionContextChars).toBe(32_000);
+
+    await saveLlmSettings(
+      root,
+      buildLlmSettingsUpdate({ selectionContextChars: null }, before.id),
+    );
+    expect(readLlmSettingsStore(root).selectionContextChars).toBeUndefined();
+  });
+
+  it("surfaces validation errors for invalid custom selection caps", async () => {
+    const before = activeProfile(readLlmSettingsStore(root));
+    await expect(
+      saveLlmSettings(
+        root,
+        buildLlmSettingsUpdate({ selectionContextChars: 100_001 }, before.id),
+      ),
+    ).rejects.toThrow(/selectionContextChars/);
+  });
+
   it("threads a context tier without touching the provider patch", () => {
     const update = buildLlmSettingsUpdate({ contextTier: "max" }, "custom");
     expect(update.contextTier).toBe("max");

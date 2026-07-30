@@ -49,4 +49,30 @@ describe("ChatMemory thread metadata", () => {
 
     expect(memory.list().map((turn) => turn.role)).toEqual(["user", "system"]);
   });
+
+  it("cleans literal thinking blocks from live and persisted assistant turns only", () => {
+    const memory = new ChatMemory();
+    memory.remember("assistant", "Visible<thinking>private</thinking> answer");
+    memory.hydrate([
+      { role: "user", text: "Quote <thinking>this source tag</thinking> exactly" },
+      { role: "assistant", text: "Restored<thinking>hidden tail" },
+    ]);
+
+    expect(memory.list()).toEqual([
+      { role: "user", text: "Quote <thinking>this source tag</thinking> exactly" },
+      { role: "assistant", text: "Restored" },
+    ]);
+  });
+
+  it("keeps the latest eighty turns for long writing sessions", () => {
+    const memory = new ChatMemory();
+    memory.hydrate(Array.from({ length: 100 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" as const : "assistant" as const,
+      text: `turn-${index}`,
+    })));
+
+    expect(memory.list()).toHaveLength(80);
+    expect(memory.list()[0]?.text).toBe("turn-20");
+    expect(memory.prior()).toHaveLength(80);
+  });
 });

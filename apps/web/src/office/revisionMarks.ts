@@ -85,6 +85,10 @@ export function markProposalId(element: IElement): string | null {
   return typeof value === "string" && value ? value : null;
 }
 
+export function selectionContainsMark(elements: IElement[], proposalId: string): boolean {
+  return elements.some((element) => markProposalId(element) === proposalId);
+}
+
 /**
  * 剥除修订标记：连续的同 id 标记 spans 整体替换为快照原文。快照缺失时保底
  * 去掉标记样式与 extension、保留文本。只处理顶层文本流——标记本轮不会注入
@@ -204,6 +208,17 @@ export type FragmentAnchor = {
   markText: string;
 };
 
+/** Prefer the live marked text when a pending proposal has already been injected. */
+export function proposalFocusQueries(proposal: Proposal): string[] {
+  const anchor = markAnchor(proposal);
+  const fragment = anchor ? buildAnchor(proposal.before, anchor) : null;
+  return [...new Set([
+    fragment?.markedKey,
+    proposal.tableCell?.before,
+    proposal.before,
+  ].filter((query): query is string => Boolean(query?.trim())))];
+}
+
 /**
  * 以变更片段 + 前后各 ANCHOR_CONTEXT 字符上下文构造定位 key（取代整段
  * proposal.before 做 key——长段落搜索 rangeCount=0 的缺口）。片段距段首/段尾
@@ -292,6 +307,17 @@ export function countPendingProposals(proposals: Proposal[]): number {
   return proposals.filter(
     (proposal) => proposal.status === "proposed" || proposal.status === "pending",
   ).length;
+}
+
+export function proposalsToReinjectAfterSave(
+  proposals: Proposal[],
+  markedProposalIds: ReadonlySet<string>,
+  saveSucceeded: boolean,
+): Proposal[] {
+  if (saveSucceeded) return [];
+  return proposals.filter(
+    (proposal) => proposal.status === "proposed" && !markedProposalIds.has(proposal.id),
+  );
 }
 
 /** 保存前确认的文案（window.confirm，确认=保存并关闭提案，取消=中止保存）。 */

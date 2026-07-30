@@ -1,4 +1,5 @@
 import type { Block, Comment, DocumentMeta, Proposal } from "../api";
+import type { SelectionBlockRange } from "@margin/domain";
 
 export type TableCellSelection = {
   row: number;
@@ -10,6 +11,7 @@ export type TableCellSelection = {
 export type CanvasFocusRequest = {
   key: string;
   query: string;
+  proposalId?: string;
   blockId?: string | null;
   tableCell?: TableCellSelection;
 };
@@ -30,6 +32,7 @@ export type CanvasProps = {
   onSelectionChange: (info: {
     blockId: string | null;
     blockIds?: string[];
+    selectionRanges?: SelectionBlockRange[];
     text: string;
     selectionStart?: number;
     tableCell?: TableCellSelection;
@@ -40,6 +43,7 @@ export type CanvasProps = {
     y: number;
     blockId: string | null;
     blockIds?: string[];
+    selectionRanges?: SelectionBlockRange[];
     text: string;
     selectionStart?: number;
     tableCell?: TableCellSelection;

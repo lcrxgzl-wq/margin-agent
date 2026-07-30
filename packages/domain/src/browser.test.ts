@@ -8,6 +8,7 @@ describe("browser contracts", () => {
       blockId: "b1",
       selectionText: "source",
       selectionStart: 12,
+      selectionRanges: [{ blockId: "b1", start: 12, end: 18, before: "source" }],
       instruction: "translate",
       operation: "translate",
       targetLanguage: "zh-CN",
@@ -15,6 +16,7 @@ describe("browser contracts", () => {
     });
     expect(command).toMatchObject({
       selectionStart: 12,
+      selectionRanges: [{ blockId: "b1", start: 12, end: 18, before: "source" }],
       operation: "translate",
       targetLanguage: "zh-CN",
       tableCell: { address: "C2", row: 2, column: 3, before: "source source" },

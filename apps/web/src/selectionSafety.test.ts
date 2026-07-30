@@ -20,21 +20,37 @@ describe("selectionEditUnavailableReason", () => {
     expect(selectionEditUnavailableReason({
       blockId: "p1",
       blockIds: ["p1", "p2"],
-      text: "first\nsecond",
+      selectionRanges: [
+        { blockId: "p1", start: 0, end: 5, before: "first" },
+        { blockId: "p2", start: 0, end: 6, before: "second" },
+      ],
+      text: "firstsecond",
     })).toBeNull();
+    const blockIds = Array.from({ length: 24 }, (_, index) => `p${index + 1}`);
     expect(selectionEditUnavailableReason({
       blockId: "p1",
-      blockIds: ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"],
-      text: "eight paragraphs",
+      blockIds,
+      selectionRanges: blockIds.map((blockId) => ({ blockId, start: 0, end: 1, before: "x" })),
+      text: "x".repeat(24),
     })).toBeNull();
   });
 
-  it("caps cross-paragraph selections at eight blocks", () => {
+  it("caps cross-paragraph selections at 24 blocks", () => {
+    const blockIds = Array.from({ length: 25 }, (_, index) => `p${index + 1}`);
     expect(selectionEditUnavailableReason({
       blockId: "p1",
-      blockIds: ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"],
-      text: "nine paragraphs",
-    })).toMatch(/最多覆盖 8 个段落/);
+      blockIds,
+      selectionRanges: blockIds.map((blockId) => ({ blockId, start: 0, end: 1, before: "x" })),
+      text: "x".repeat(25),
+    })).toMatch(/最多覆盖 24 个段落/);
+  });
+
+  it("does not fabricate cross-block offsets for Markdown selections", () => {
+    expect(selectionEditUnavailableReason({
+      blockId: "p1",
+      blockIds: ["p1", "p2"],
+      text: "first\nsecond",
+    })).toMatch(/无法精确定位跨段选区/);
   });
 
   it("blocks selections spanning multiple table cells with a precise reason", () => {

@@ -78,6 +78,15 @@ describe("harness", () => {
     expect(() => validateAgentProfile(profile)).toThrow(/maxTurns/);
   });
 
+  it("defaults requests to five minutes and accepts up to thirty minutes", () => {
+    expect(getHarness().limits.timeoutMs).toBe(300_000);
+    const profile = structuredClone(getHarness("minimal")) as AgentProfile;
+    profile.limits.timeoutMs = 1_800_000;
+    expect(validateAgentProfile(profile).limits.timeoutMs).toBe(1_800_000);
+    profile.limits.timeoutMs = 1_800_001;
+    expect(() => validateAgentProfile(profile)).toThrow(/timeoutMs/);
+  });
+
   it("composeSystemPrompt is Pi-short: persona + boundary + skills index", () => {
     const session = composeSystemPrompt("social-science-zh", "session");
     expect(session).toContain("文档写作与修订");

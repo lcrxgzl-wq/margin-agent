@@ -93,7 +93,7 @@ export async function runPiBlockScan(
     // Stable, opaque cache/session key: hash of the document id only (never a path or text).
     sessionId: `pi-scan-${createHash("sha256").update(`margin-scan:${ctx.documentId}`).digest("hex").slice(0, 24)}`,
     maxTurns: maxTurns(profile.limits.maxTurns),
-    timeoutMs: timeoutMs(profile.limits.timeoutMs),
+    timeoutMs: ctx.timeoutMs ?? timeoutMs(profile.limits.timeoutMs),
     maxContextMessages: profile.limits.maxContextMessages,
     maxContextChars: profile.limits.maxContextChars,
     allowedToolNames: tools.map((tool) => tool.name),

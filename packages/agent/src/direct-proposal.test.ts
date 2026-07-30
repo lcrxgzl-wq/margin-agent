@@ -10,6 +10,7 @@ const ENV_KEYS = [
   "MARGIN_AUTH_STYLE",
   "MARGIN_BASE_URL",
   "MARGIN_MODEL",
+  "MARGIN_PI_TIMEOUT_MS",
   "MARGIN_PROVIDER",
   "OPENAI_API_KEY",
 ] as const;
@@ -116,6 +117,73 @@ describe("direct proposal completion", () => {
     expect(requestBody).not.toHaveProperty("tool_choice");
     expect(requestBody).not.toHaveProperty("response_format");
     expect(requestBody).not.toHaveProperty("temperature");
+  });
+
+  it("keeps the full Host-approved cross-block selection context", async () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_API_KEY = "test-key";
+    const selectionContext = `${"x".repeat(3_000)}END_OF_SELECTION`;
+    let requestBody: Record<string, unknown> | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (_input, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return Response.json({
+        choices: [{ message: { content: JSON.stringify({
+          blockId: "b1",
+          after: "Revised.",
+          rationale: "Clearer.",
+          risk: "language",
+          evidence: [],
+        }) } }],
+      });
+    }));
+
+    await generateDirectProposal({ block, selectionContext, selectionContextChars: 12_000 });
+
+    const messages = requestBody?.messages as Array<{ content?: string }>;
+    expect(messages[1]?.content).toContain("END_OF_SELECTION");
+  });
+
+  it("rejects selection context above the explicit Host limit instead of slicing it", async () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_API_KEY = "test-key";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(generateDirectProposal({
+      block,
+      selectionContext: "x".repeat(12_001),
+      selectionContextChars: 12_000,
+    })).rejects.toThrow(/exceeds 12000 characters/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("raises output tokens for medium and long targets", async () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_API_KEY = "test-key";
+    const budgets: number[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { max_tokens: number; messages: unknown };
+      budgets.push(body.max_tokens);
+      const target = budgets.length === 1 ? "medium" : "long";
+      return Response.json({
+        choices: [{ message: { content: JSON.stringify({
+          blockId: target,
+          after: "Revised.",
+          rationale: "Clearer.",
+          risk: "language",
+          evidence: [],
+        }) } }],
+      });
+    }));
+
+    await generateDirectProposal({
+      block: { ...block, id: "medium", text: "x".repeat(4_001) },
+    });
+    await generateDirectProposal({
+      block: { ...block, id: "long", text: "x".repeat(12_001) },
+    });
+
+    expect(budgets).toEqual([8_192, 16_384]);
   });
 
   it("sends an OpenAI system message first, policy headers, and records usage", async () => {
@@ -225,6 +293,35 @@ describe("direct proposal completion", () => {
     controller.abort();
 
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("resolves timeout from profile, env, then explicit input", async () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_API_KEY = "test-key";
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      choices: [{ message: { content: JSON.stringify({
+        blockId: "b1",
+        after: "Revised.",
+        rationale: "Clearer.",
+        risk: "language",
+        evidence: [],
+      }) } }],
+    })));
+    const timeoutSpy = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockReturnValue(new AbortController().signal);
+
+    await generateDirectProposal({ block });
+    process.env.MARGIN_PI_TIMEOUT_MS = "45000";
+    await generateDirectProposal({ block });
+    await generateDirectProposal({ block, timeoutMs: 90_000 });
+
+    expect(timeoutSpy.mock.calls.map(([value]) => value)).toEqual([
+      300_000,
+      45_000,
+      90_000,
+    ]);
+    timeoutSpy.mockRestore();
   });
 
   it("uses mock output when no key is configured, even with a base URL", async () => {

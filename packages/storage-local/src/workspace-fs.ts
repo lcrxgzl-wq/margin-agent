@@ -198,6 +198,14 @@ export async function openWorkspace(rootInput: string): Promise<Workspace> {
       reason TEXT,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS proposal_resolution_batches (
+      id TEXT PRIMARY KEY,
+      document_id TEXT NOT NULL,
+      proposal_ids_json TEXT NOT NULL,
+      expected_revision INTEGER NOT NULL,
+      expected_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS apply_events (
       id TEXT PRIMARY KEY,
       document_id TEXT NOT NULL,

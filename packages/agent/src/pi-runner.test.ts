@@ -27,6 +27,7 @@ const ENV_KEYS = [
   "MARGIN_AUTH_STYLE",
   "MARGIN_BASE_URL",
   "MARGIN_MODEL",
+  "MARGIN_PI_TIMEOUT_MS",
   "MARGIN_PROVIDER",
   "OPENAI_API_KEY",
 ] as const;
@@ -87,5 +88,19 @@ describe("runPiBlockScan request policy", () => {
   it("keeps reasoning controls off in auto mode", async () => {
     await runPiBlockScan({ ...ctx, reasoningMode: "auto", reasoningOptIn: true });
     expect(mockPiLoop.calls[0]!.thinkingLevel).toBeUndefined();
+  });
+
+  it("resolves timeout from profile, env, then explicit input", async () => {
+    await runPiBlockScan(ctx);
+    expect(mockPiLoop.calls[0]!.timeoutMs).toBe(300_000);
+
+    mockPiLoop.calls.length = 0;
+    process.env.MARGIN_PI_TIMEOUT_MS = "45000";
+    await runPiBlockScan(ctx);
+    expect(mockPiLoop.calls[0]!.timeoutMs).toBe(45_000);
+
+    mockPiLoop.calls.length = 0;
+    await runPiBlockScan({ ...ctx, timeoutMs: 90_000 });
+    expect(mockPiLoop.calls[0]!.timeoutMs).toBe(90_000);
   });
 });

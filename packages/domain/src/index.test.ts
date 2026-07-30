@@ -26,8 +26,13 @@ describe("SelectionCommandSchema", () => {
       SelectionCommandSchema.parse({
         kind: "rewrite_directed",
         blockId: "b123",
+        blockIds: ["b123", "b124"],
         selectionText: "old wording",
         selectionStart: 4,
+        selectionRanges: [
+          { blockId: "b123", start: 4, end: 7, before: "old" },
+          { blockId: "b124", start: 0, end: 8, before: " wording" },
+        ],
         instruction: "Make this more direct.",
         operation: "rewrite",
       }),
@@ -44,6 +49,11 @@ describe("SelectionCommandSchema", () => {
         instruction: "x".repeat(601),
       }),
     ).toThrow();
+    expect(() => SelectionCommandSchema.parse({
+      kind: "rewrite",
+      blockId: "b1",
+      blockIds: Array.from({ length: 25 }, (_, index) => `b${index}`),
+    })).toThrow();
   });
 
   it("accepts a structured selection translation operation", () => {

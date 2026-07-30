@@ -8,10 +8,12 @@ import {
   listProposals,
   openDocument,
   resolveProposal,
+  resolveProposals,
   resolveMcpApproval,
   saveSessionSources,
   startProposalRun,
   waitRun,
+  type DocumentMeta,
 } from "./api";
 import { buildSelectionCommand } from "./commands";
 import type { PendingMcpApproval } from "./mcpApproval";
@@ -25,9 +27,14 @@ import {
 import type {
   ProposalOperationKind,
   ProposalTargetLanguage,
+  SelectionBlockRange,
   SelectionCommand,
 } from "@margin/domain";
 import { useRef, useState } from "react";
+import {
+  ASYNC_DOCUMENT_CONFLICT_MESSAGE,
+  canApplyDocumentResponse,
+} from "./documentSafety";
 import { useMarginStore } from "./store";
 import { filterEditableBlockIds, selectionEditUnavailableReason } from "./selectionSafety";
 
@@ -40,6 +47,10 @@ function reviewErrorText(error: unknown): string {
   if (/stale/i.test(value)) return "文稿版本已经变化，这条提案不能直接写入。请重新生成。";
   if (/external_change/i.test(value)) return "工作副本已在外部改变。重新打开文稿后再处理这条提案。";
   if (/unsupported/i.test(value)) return "当前内容结构暂不支持安全写回。";
+  if (/conflicting_proposals/i.test(value)) return "多条提案修改了同一处，本次没有写入任何改动。请逐条处理或重新生成。";
+  if (/batch_not_applicable|proposal_(?:already_resolved|resolving)/i.test(value)) {
+    return "部分提案已经失效，本次没有写入任何改动。请刷新后重试。";
+  }
   return value;
 }
 
@@ -55,6 +66,7 @@ export function useWorkspaceActions(options?: {
     blockIds?: string[];
     selectionText: string;
     selectionStart?: number;
+    selectionRanges?: SelectionBlockRange[];
     tableCell?: TableCellSelection;
   }) => void;
 }) {
@@ -68,8 +80,24 @@ export function useWorkspaceActions(options?: {
   const [pendingMcpApproval, setPendingMcpApproval] = useState<PendingMcpApproval | null>(null);
   storeRef.current = store;
   const assertDocumentClean = () => {
-    if (store.documentDirty) {
+    if (storeRef.current.documentDirty) {
       throw new Error("当前文稿有未保存修改，请先保存或撤销后再执行此操作。");
+    }
+  };
+  const assertDocumentResponseCurrent = (
+    requestDocument: DocumentMeta | null,
+    requestGeneration: number,
+    allowDirty = false,
+  ) => {
+    const current = storeRef.current;
+    if (!canApplyDocumentResponse({
+      requestDocument,
+      currentDocument: current.doc,
+      documentDirty: allowDirty ? false : current.documentDirty,
+      requestGeneration,
+      currentGeneration: current.busyGen,
+    })) {
+      throw new Error(ASYNC_DOCUMENT_CONFLICT_MESSAGE);
     }
   };
   const messageError = (error: unknown) =>
@@ -106,8 +134,19 @@ export function useWorkspaceActions(options?: {
       (!allowPreviousRevision || current.revision !== expectedRevision - 1))) return;
     store.setComments(data.comments ?? []);
   };
-  const refreshDocument = async (relativePath: string) => {
-    const reopened = await openDocument(relativePath);
+  const refreshDocument = async (
+    relativePath: string,
+    guard?: { document: DocumentMeta | null; generation: number },
+  ) => {
+    const reopened = await openDocument(
+      relativePath,
+      guard
+        ? guard.document
+          ? { id: guard.document.id, revision: guard.document.revision }
+          : null
+        : undefined,
+    );
+    if (guard) assertDocumentResponseCurrent(guard.document, guard.generation);
     store.setDocBundle(reopened.document, reopened.blocks);
     await refreshProposals(reopened.document.id, reopened.document.revision, true);
     await refreshComments(reopened.document.id, reopened.document.revision, true);
@@ -121,6 +160,7 @@ export function useWorkspaceActions(options?: {
     operation?: ProposalOperationKind,
     targetLanguage?: ProposalTargetLanguage,
     tableCell?: TableCellSelection,
+    selectionRanges?: SelectionBlockRange[],
   ) => {
     if (!store.doc) throw new Error("请先打开文章");
     if (!blockIds.length) throw new Error("请先选中一段文字");
@@ -129,6 +169,9 @@ export function useWorkspaceActions(options?: {
     if (!editableIds.length) {
       throw new Error("请在表格的单个单元格内选择文字后再生成提案。");
     }
+    if (selectionRanges?.length && skippedTables) {
+      throw new Error("跨段选区包含表格，无法安全生成精确提案；请改选连续正文段落。");
+    }
     const document = store.doc;
     if (selectionText && editableIds[0]) {
       options?.onSelectionRunStart?.({
@@ -136,6 +179,7 @@ export function useWorkspaceActions(options?: {
         blockIds: editableIds.length > 1 ? editableIds : undefined,
         selectionText,
         selectionStart,
+        selectionRanges,
         tableCell,
       });
     }
@@ -145,11 +189,12 @@ export function useWorkspaceActions(options?: {
         : `正在生成修订（${editableIds.length} 段）…`,
     );
     try {
-      const { runId } = await startProposalRun(document.id, editableIds.slice(0, 8), {
+      const { runId } = await startProposalRun(document.id, editableIds, {
         harnessId: store.llm?.harnessId,
         instruction,
         selectionText,
         selectionStart,
+        selectionRanges,
         operation,
         targetLanguage,
         tableCell,
@@ -160,7 +205,7 @@ export function useWorkspaceActions(options?: {
       activeProposalRunRef.current = { runId, controller };
       setCanCancel(true);
       store.setStatusLine(instruction ? "正在按指令生成修订…" : "正在生成修订…");
-      const run = await waitRun(runId, 90_000, ({ status, phase }) => {
+      const run = await waitRun(runId, undefined, ({ status, phase }) => {
         if (status === "running") {
           store.setStatusLine(phase || "正在生成修订");
         }
@@ -210,6 +255,7 @@ export function useWorkspaceActions(options?: {
           command.operation ?? "rewrite",
           command.targetLanguage,
           command.tableCell,
+          command.selectionRanges,
         ).catch(messageError);
         return;
       case "rewrite_directed":
@@ -223,12 +269,14 @@ export function useWorkspaceActions(options?: {
             command.operation ?? "rewrite",
             command.targetLanguage,
             command.tableCell,
+            command.selectionRanges,
           ).catch(messageError);
           return;
         }
         store.setRewritePrompt({
           blockId: command.blockId,
           blockIds: command.blockIds,
+          selectionRanges: command.selectionRanges,
           excerpt: command.selectionText?.trim().slice(0, 160) ?? "",
           selectionText: command.selectionText ?? "",
           selectionStart: command.selectionStart,
@@ -242,6 +290,7 @@ export function useWorkspaceActions(options?: {
           anchor: {
             blockId: command.blockId,
             blockIds: command.blockIds,
+            selectionRanges: command.selectionRanges,
             selectionText: command.selectionText ?? "",
             selectionStart: command.selectionStart,
             tableCell: command.tableCell,
@@ -265,10 +314,12 @@ export function useWorkspaceActions(options?: {
     tableCell?: TableCellSelection,
     blockIds?: string[],
     crossTableCells?: boolean,
+    selectionRanges?: SelectionBlockRange[],
   ) => {
     const unavailable = selectionEditUnavailableReason({
       blockId,
       blockIds,
+      selectionRanges,
       text: selectionText,
       tableCell,
       crossTableCells,
@@ -288,6 +339,7 @@ export function useWorkspaceActions(options?: {
         anchor: {
           blockId,
           blockIds,
+          selectionRanges,
           selectionText,
           selectionStart,
           tableCell,
@@ -303,6 +355,7 @@ export function useWorkspaceActions(options?: {
           selection: {
             blockId,
             blockIds,
+            selectionRanges,
             text: selectionText,
             selectionStart,
             tableCell,
@@ -322,6 +375,7 @@ export function useWorkspaceActions(options?: {
       targetLanguage,
       tableCell,
       blockIds,
+      selectionRanges,
     }));
   };
   const onAccept = async (proposalId: string) => {
@@ -333,8 +387,12 @@ export function useWorkspaceActions(options?: {
       assertDocumentClean();
       const result = await resolveProposal(document, proposalId, "Y");
       if (!result.ok) throw new Error(result.reason || "apply failed");
+      assertDocumentResponseCurrent(document, generation);
       if (result.document && result.blocks) store.setDocBundle(result.document, result.blocks);
-      else await refreshDocument(result.document?.relativePath ?? document.relativePath);
+      else await refreshDocument(result.document?.relativePath ?? document.relativePath, {
+        document,
+        generation,
+      });
       await Promise.all([
         refreshProposals(document.id, result.document?.revision, true),
         refreshComments(document.id, result.document?.revision, true),
@@ -358,8 +416,12 @@ export function useWorkspaceActions(options?: {
       assertDocumentClean();
       const result = await resolveProposal(document, proposalId, "E", editedText);
       if (!result.ok) throw new Error(result.reason || "apply failed");
+      assertDocumentResponseCurrent(document, generation);
       if (result.document && result.blocks) store.setDocBundle(result.document, result.blocks);
-      else await refreshDocument(result.document?.relativePath ?? document.relativePath);
+      else await refreshDocument(result.document?.relativePath ?? document.relativePath, {
+        document,
+        generation,
+      });
       await Promise.all([
         refreshProposals(document.id, result.document?.revision, true),
         refreshComments(document.id, result.document?.revision, true),
@@ -402,24 +464,17 @@ export function useWorkspaceActions(options?: {
     if (!store.doc) throw new Error("请先打开文章");
     assertDocumentClean();
     if (!store.proposals.length) throw new Error("没有待确认改动");
-    let document = store.doc;
+    const document = store.doc;
     const count = store.proposals.length;
     const generation = store.beginBusy(`正在接受全部（${count}）…`);
     try {
-      let latestBlocks = store.blocks;
-      for (const proposal of store.proposals) {
-        const result = await resolveProposal(document, proposal.id, "Y");
-        if (!result.ok || !result.document || !result.blocks) {
-          throw new Error(result.reason || "apply failed");
-        }
-        document = result.document;
-        latestBlocks = result.blocks;
-        store.setDocBundle(document, latestBlocks);
-      }
-      store.setDocBundle(document, latestBlocks);
+      store.setReviewError(null);
+      const result = await resolveProposals(document, store.proposals.map((proposal) => proposal.id));
+      assertDocumentResponseCurrent(document, generation);
+      store.setDocBundle(result.document, result.blocks);
       await Promise.all([
-        refreshProposals(document.id, document.revision, true),
-        refreshComments(document.id, document.revision, true),
+        refreshProposals(document.id, result.document.revision, true),
+        refreshComments(document.id, result.document.revision, true),
       ]);
       store.appendMessage({
         id: mid(),
@@ -427,8 +482,10 @@ export function useWorkspaceActions(options?: {
         text: `已接受并写回 ${count} 处改动。`,
       });
     } catch (error) {
-      await refreshDocument(document.relativePath).catch(() => undefined);
-      throw error;
+      await refreshDocument(document.relativePath, { document, generation }).catch(() => undefined);
+      const message = reviewErrorText(error);
+      store.setReviewError(message);
+      throw new Error(message);
     } finally {
       store.endBusy(generation);
     }
@@ -525,16 +582,19 @@ export function useWorkspaceActions(options?: {
   };
   const closeDocument = async () => {
     if (!store.doc) return false;
+    const document = store.doc;
+    const discardDirty = storeRef.current.documentDirty;
     if (
-      store.documentDirty &&
+      discardDirty &&
       !window.confirm("当前文稿有未保存的修改。关闭后这些修改会丢失，仍要关闭吗？")
     ) {
       return false;
     }
-    const title = store.doc.relativePath.replace(/^.*[\\/]/, "");
+    const title = document.relativePath.replace(/^.*[\\/]/, "");
     const generation = store.beginBusy("正在关闭文稿…");
     try {
       await closeDocumentSession();
+      assertDocumentResponseCurrent(document, generation, discardDirty);
       store.clearDocument();
       store.appendMessage({
         id: mid(),
@@ -554,6 +614,7 @@ export function useWorkspaceActions(options?: {
     selection?: {
       blockId: string | null;
       blockIds?: string[];
+      selectionRanges?: SelectionBlockRange[];
       text: string;
       selectionStart?: number;
       tableCell?: TableCellSelection;
@@ -591,6 +652,7 @@ export function useWorkspaceActions(options?: {
           selectedIntent.operation,
           selectedIntent.targetLanguage,
           selectionContext.tableCell,
+          selectionContext.selectionRanges,
         );
         return;
       }
@@ -601,7 +663,7 @@ export function useWorkspaceActions(options?: {
         }
         return;
       }
-      if (store.documentDirty) {
+      if (storeRef.current.documentDirty) {
         store.appendMessage({
           id: mid(),
           role: "assistant",
@@ -636,6 +698,7 @@ export function useWorkspaceActions(options?: {
         return;
       }
 
+      const requestDocument = storeRef.current.doc;
       const generation = store.beginBusy("正在处理…");
       try {
         const assistantId = mid();
@@ -671,7 +734,7 @@ export function useWorkspaceActions(options?: {
             {
               message: text,
               harnessId: store.llm?.harnessId,
-              documentId: store.doc?.id,
+              documentId: requestDocument?.id,
               selectionBlockIds: selectionContext.blockIds?.length
                 ? selectionContext.blockIds
                 : selectionContext.blockId
@@ -681,7 +744,7 @@ export function useWorkspaceActions(options?: {
               selectionStart: selectionContext.selectionStart,
               chatMode,
               cascadeBlockIds: opts?.cascadeBlockIds,
-              sourcePaths: store.doc ? store.sourcePaths : undefined,
+              sourcePaths: requestDocument ? store.sourcePaths : undefined,
               threadId: opts?.threadId,
               selectedSkills: opts?.selectedSkills,
             },
@@ -710,8 +773,11 @@ export function useWorkspaceActions(options?: {
           // Stream ended/errored/cancelled: any unresolved approval is closed by the server.
           setPendingMcpApproval(null);
         }
+        if (done.opened || done.closed) {
+          assertDocumentResponseCurrent(requestDocument, generation);
+        }
         const switchedDocument =
-          !!store.doc && !!done.opened && store.doc.id !== done.opened.document.id;
+          !!requestDocument && !!done.opened && requestDocument.id !== done.opened.document.id;
         if (done.opened) {
           store.setDocBundle(done.opened.document, done.opened.blocks);
           store.clearSelection();
@@ -794,16 +860,24 @@ export function useWorkspaceActions(options?: {
   };
 
   const onToggleSourcePath = async (relativePath: string) => {
+    const requestState = storeRef.current;
+    const requestDocumentId = requestState.doc?.id ?? null;
     const key = relativePath.replace(/\\/g, "/");
-    const attached = store.sourcePaths.some((path) => path.replace(/\\/g, "/") === key);
+    const attached = requestState.sourcePaths.some((path) => path.replace(/\\/g, "/") === key);
     const next = attached
-      ? store.sourcePaths.filter((path) => path.replace(/\\/g, "/") !== key)
-      : [...store.sourcePaths, relativePath];
+      ? requestState.sourcePaths.filter((path) => path.replace(/\\/g, "/") !== key)
+      : [...requestState.sourcePaths, relativePath];
     try {
-      const saved = await saveSessionSources(next);
-      store.setSourcePaths(saved.sourcePaths);
+      const saved = await saveSessionSources(requestDocumentId, next);
+      if ((storeRef.current.doc?.id ?? null) === requestDocumentId) {
+        store.setSourcePaths(saved.sourcePaths);
+      }
     } catch (error) {
-      messageError(error);
+      messageError(
+        error instanceof Error && error.message === "document_mismatch"
+          ? new Error("文稿已切换，资料挂载未改动。")
+          : error,
+      );
     }
   };
 

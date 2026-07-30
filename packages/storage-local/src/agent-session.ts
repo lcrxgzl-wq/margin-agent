@@ -1,20 +1,21 @@
 import { randomUUID } from "node:crypto";
+import type { SelectionBlockRange } from "@margin/domain";
 import type { Workspace } from "./workspace-fs.js";
 
 const SESSION_ROW_ID = "current";
-const MAX_MESSAGES = 80;
-const MAX_CHAT_TURNS = 24;
+const MAX_MESSAGES = 180;
+const MAX_CHAT_TURNS = 80;
 const MAX_CHAT_TEXT_CHARS = 8_000;
 const MAX_REVIEW_THREADS = 24;
-const MAX_THREAD_BLOCK_IDS = 8;
+const MAX_SELECTION_BLOCK_IDS = 24;
 const MAX_THREAD_ID_CHARS = 200;
-const MAX_ANCHOR_TEXT_CHARS = 6_000;
+const MAX_ANCHOR_TEXT_CHARS = 100_000;
 const MAX_TABLE_ADDRESS_CHARS = 32;
 const MAX_SOURCE_PATHS = 50;
 const MAX_SOURCE_PATH_CHARS = 500;
 const MAX_TASK_OBJECTIVE_CHARS = 2_000;
 const MAX_TASK_SOURCE_REFS = 100;
-const MAX_JSON_BYTES = 800_000;
+const MAX_JSON_BYTES = 2 * 1024 * 1024;
 
 export type PersistedChatTurn = {
   role: "user" | "assistant" | "system";
@@ -28,6 +29,7 @@ export type PersistedReviewThread = {
   anchor: {
     blockId: string;
     blockIds?: string[];
+    selectionRanges?: SelectionBlockRange[];
     selectionText: string;
     selectionStart?: number;
     tableCell?: {
@@ -120,6 +122,29 @@ function boundedAnchorText(value: unknown): string | undefined {
   return value.slice(0, MAX_ANCHOR_TEXT_CHARS);
 }
 
+function normalizeSelectionRanges(value: unknown): SelectionBlockRange[] | undefined | null {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || !value.length || value.length > MAX_SELECTION_BLOCK_IDS) return null;
+  const ranges: SelectionBlockRange[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") return null;
+    const candidate = item as Partial<SelectionBlockRange>;
+    const blockId = boundedId(candidate.blockId);
+    const start = Number(candidate.start);
+    const end = Number(candidate.end);
+    const before = candidate.before;
+    if (
+      !blockId ||
+      !Number.isInteger(start) || start < 0 || start > 2_000_000 ||
+      !Number.isInteger(end) || end <= start || end > 2_000_000 ||
+      typeof before !== "string" || !before.length || before.length > MAX_ANCHOR_TEXT_CHARS ||
+      end !== start + before.length
+    ) return null;
+    ranges.push({ blockId, start, end, before });
+  }
+  return ranges;
+}
+
 function normalizeReviewThreads(value: unknown): PersistedReviewThread[] {
   if (!Array.isArray(value)) return [];
   const seen = new Set<string>();
@@ -144,8 +169,18 @@ function normalizeReviewThreads(value: unknown): PersistedReviewThread[] {
       ? [...new Set(anchor.blockIds.map(boundedId).filter((value): value is string => Boolean(value)))]
       : [];
     const blockIds = requestedBlockIds.length
-      ? [blockId, ...requestedBlockIds.filter((value) => value !== blockId)].slice(0, MAX_THREAD_BLOCK_IDS)
+      ? [blockId, ...requestedBlockIds.filter((value) => value !== blockId)].slice(0, MAX_SELECTION_BLOCK_IDS)
       : [];
+    const selectionRanges = normalizeSelectionRanges(anchor.selectionRanges);
+    if (selectionRanges === null) continue;
+    if (selectionRanges) {
+      const targetBlockIds = blockIds.length ? blockIds : [blockId];
+      if (
+        selectionRanges.length !== targetBlockIds.length ||
+        selectionRanges.some((range, index) => range.blockId !== targetBlockIds[index]) ||
+        selectionRanges.map((range) => range.before).join("") !== selectionText
+      ) continue;
+    }
 
     let tableCell: PersistedReviewThread["anchor"]["tableCell"];
     if (anchor.tableCell !== undefined) {
@@ -172,6 +207,7 @@ function normalizeReviewThreads(value: unknown): PersistedReviewThread[] {
       anchor: {
         blockId,
         ...(blockIds.length ? { blockIds } : {}),
+        ...(selectionRanges ? { selectionRanges } : {}),
         selectionText,
         ...(Number.isInteger(selectionStart) && selectionStart >= 0 && selectionStart <= 2_000_000
           ? { selectionStart }
@@ -271,11 +307,11 @@ function normalizeTask(
             ? [...new Set(task.selection.blockIds
                 .filter((item): item is string => typeof item === "string")
                 .map((item) => item.trim())
-                .filter(Boolean))].slice(0, 12)
+                .filter(Boolean))].slice(0, MAX_SELECTION_BLOCK_IDS)
             : [],
           text:
             typeof task.selection.text === "string" && task.selection.text.trim()
-              ? task.selection.text.slice(0, 6_000)
+              ? task.selection.text.slice(0, MAX_ANCHOR_TEXT_CHARS)
               : undefined,
           start:
             Number.isInteger(task.selection.start) && Number(task.selection.start) >= 0

@@ -1,7 +1,7 @@
-/** Agent 请求超时输入换算：UI 用秒（10–600，留空 = 默认 120 秒），API 用毫秒。 */
-export const AGENT_TIMEOUT_DEFAULT_SECONDS = 120;
+/** Agent 请求超时输入换算：UI 用秒（10–1800，留空 = 默认 300 秒），API 用毫秒。 */
+export const AGENT_TIMEOUT_DEFAULT_SECONDS = 300;
 export const AGENT_TIMEOUT_MIN_SECONDS = 10;
-export const AGENT_TIMEOUT_MAX_SECONDS = 600;
+export const AGENT_TIMEOUT_MAX_SECONDS = 1800;
 
 /** Seconds input → ms for the API. Blank clears (null); invalid → undefined. */
 export function agentTimeoutSecondsToMs(raw: string): number | null | undefined {

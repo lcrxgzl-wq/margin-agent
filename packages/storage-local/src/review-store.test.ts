@@ -17,6 +17,7 @@ import {
   recoverDecidedProposals,
   saveDecision,
   saveProposal,
+  saveProposalResolutionBatch,
   type Workspace,
 } from "./index.js";
 
@@ -229,6 +230,68 @@ describe("applyApproved", () => {
     expect(listProposals(reopened, document.id)[0]?.status).toBe("superseded");
   });
 
+  it("recovers an accept-all batch as one document revision after a host stop", async () => {
+    const { root, ws, document, blocks } = await testWorkspace();
+    const proposals = [proposalFor(document, blocks[0]), proposalFor(document, blocks[1])];
+    for (const proposal of proposals) saveProposal(ws, proposal);
+    saveProposalResolutionBatch(
+      ws,
+      document.id,
+      proposals.map((proposal) => proposal.id),
+      document.revision,
+      document.contentHash,
+    );
+
+    workspaces.splice(workspaces.indexOf(ws), 1);
+    ws.db.close();
+    await ws.releaseLock();
+    const reopened = await openWorkspace(root);
+    workspaces.push(reopened);
+
+    await recoverDecidedProposals(reopened);
+
+    expect(getDocument(reopened, document.id).revision).toBe(document.revision + 1);
+    const text = fs.readFileSync(path.join(root, "paper.md"), "utf8");
+    expect(text).toContain(proposals[0]!.after);
+    expect(text).toContain(proposals[1]!.after);
+    expect(listProposals(reopened, document.id).map((proposal) => proposal.status))
+      .toEqual(["superseded", "superseded"]);
+    expect(reopened.db.prepare("SELECT COUNT(*) AS count FROM proposal_resolution_batches").get())
+      .toEqual({ count: 0 });
+  });
+
+  it("reopens every member when a stopped accept-all batch cannot apply in full", async () => {
+    const { root, ws, document, blocks } = await testWorkspace();
+    const proposals = [
+      proposalFor(document, blocks[0]),
+      proposalFor(document, blocks[0], { after: "conflicting revision" }),
+    ];
+    for (const proposal of proposals) saveProposal(ws, proposal);
+    saveProposalResolutionBatch(
+      ws,
+      document.id,
+      proposals.map((proposal) => proposal.id),
+      document.revision,
+      document.contentHash,
+    );
+    const before = fs.readFileSync(path.join(root, "paper.md"), "utf8");
+
+    workspaces.splice(workspaces.indexOf(ws), 1);
+    ws.db.close();
+    await ws.releaseLock();
+    const reopened = await openWorkspace(root);
+    workspaces.push(reopened);
+
+    await recoverDecidedProposals(reopened);
+
+    expect(getDocument(reopened, document.id)).toEqual(document);
+    expect(fs.readFileSync(path.join(root, "paper.md"), "utf8")).toBe(before);
+    expect(listProposals(reopened, document.id).map((proposal) => proposal.status))
+      .toEqual(["proposed", "proposed"]);
+    expect(reopened.db.prepare("SELECT COUNT(*) AS count FROM proposal_resolution_batches").get())
+      .toEqual({ count: 0 });
+  });
+
   it("recovers a decision committed before the host stopped", async () => {
     const { root, ws, document, blocks } = await testWorkspace();
     const proposal = proposalFor(document, blocks[0]);
@@ -429,6 +492,88 @@ describe("applyApproved", () => {
       /FROM decisions\b/i.test(String(sql)),
     );
     expect(decisionQueries).toHaveLength(1);
+  });
+
+  it("applies a strict valid batch in one document revision", async () => {
+    const { root, ws, document, blocks } = await testWorkspace();
+    const first = proposalFor(document, blocks[0]);
+    const second = proposalFor(document, blocks[1]);
+    saveProposal(ws, first);
+    saveProposal(ws, second);
+    saveDecision(ws, first.id, "Y");
+    saveDecision(ws, second.id, "Y");
+
+    const result = await applyApproved(
+      ws,
+      document.id,
+      document.revision,
+      document.contentHash,
+      [first.id, second.id],
+      { requireAll: true },
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.reason);
+    expect(result.document.revision).toBe(document.revision + 1);
+    const text = fs.readFileSync(path.join(root, "paper.md"), "utf8");
+    expect(text).toContain(first.after);
+    expect(text).toContain(second.after);
+    expect(listProposals(ws, document.id).every((proposal) => proposal.status === "superseded"))
+      .toBe(true);
+  });
+
+  it("leaves the document untouched when any strict batch proposal is invalid", async () => {
+    const { root, ws, document, blocks } = await testWorkspace();
+    const valid = proposalFor(document, blocks[0]);
+    const missing = proposalFor(document, blocks[1], {
+      blockId: "missing-block",
+      baseHash: contentHash("missing block"),
+    });
+    saveProposal(ws, valid);
+    saveProposal(ws, missing);
+    saveDecision(ws, valid.id, "Y");
+    saveDecision(ws, missing.id, "Y");
+    const beforeText = fs.readFileSync(path.join(root, "paper.md"), "utf8");
+
+    const result = await applyApproved(
+      ws,
+      document.id,
+      document.revision,
+      document.contentHash,
+      [valid.id, missing.id],
+      { requireAll: true },
+    );
+
+    expect(result).toEqual({ ok: false, reason: "batch_not_applicable" });
+    expect(getDocument(ws, document.id)).toEqual(document);
+    expect(fs.readFileSync(path.join(root, "paper.md"), "utf8")).toBe(beforeText);
+    expect(ws.db.prepare("SELECT * FROM apply_events").all()).toEqual([]);
+    expect(listProposals(ws, document.id).every((proposal) => proposal.status === "decided"))
+      .toBe(true);
+  });
+
+  it("rejects conflicting strict batch targets without writing", async () => {
+    const { root, ws, document, blocks } = await testWorkspace();
+    const first = proposalFor(document, blocks[0]);
+    const second = proposalFor(document, blocks[0], { after: "another revision" });
+    saveProposal(ws, first);
+    saveProposal(ws, second);
+    saveDecision(ws, first.id, "Y");
+    saveDecision(ws, second.id, "Y");
+    const beforeText = fs.readFileSync(path.join(root, "paper.md"), "utf8");
+
+    const result = await applyApproved(
+      ws,
+      document.id,
+      document.revision,
+      document.contentHash,
+      [first.id, second.id],
+      { requireAll: true },
+    );
+
+    expect(result).toEqual({ ok: false, reason: "conflicting_proposals" });
+    expect(getDocument(ws, document.id)).toEqual(document);
+    expect(fs.readFileSync(path.join(root, "paper.md"), "utf8")).toBe(beforeText);
   });
 
   it("persists failed attempts without rewriting or revising when none can land", async () => {

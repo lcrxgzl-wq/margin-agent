@@ -38,6 +38,23 @@ export type BlockSnapshot = z.infer<typeof BlockSnapshotSchema>;
 export const SelectionCommandKindSchema = z.enum(["rewrite", "rewrite_directed", "discuss"]);
 export type SelectionCommandKind = z.infer<typeof SelectionCommandKindSchema>;
 
+export const MAX_SELECTION_BLOCKS = 24;
+
+export const SelectionBlockRangeSchema = z.object({
+  blockId: z.string().min(1),
+  start: z.number().int().nonnegative(),
+  end: z.number().int().positive(),
+  before: z.string().min(1),
+}).superRefine((range, context) => {
+  if (range.end !== range.start + range.before.length) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "selection block range does not match before text",
+    });
+  }
+});
+export type SelectionBlockRange = z.infer<typeof SelectionBlockRangeSchema>;
+
 export const ProposalOperationKindSchema = z.enum(["rewrite", "translate", "polish"]);
 export type ProposalOperationKind = z.infer<typeof ProposalOperationKindSchema>;
 
@@ -138,13 +155,27 @@ export type ProposalOperation = z.infer<typeof ProposalOperationSchema>;
 export const SelectionCommandSchema = z.object({
   kind: SelectionCommandKindSchema,
   blockId: z.string().min(1),
-  blockIds: z.array(z.string().min(1)).max(12).optional(),
+  blockIds: z.array(z.string().min(1)).max(MAX_SELECTION_BLOCKS).optional(),
+  selectionRanges: z.array(SelectionBlockRangeSchema).max(MAX_SELECTION_BLOCKS).optional(),
   selectionText: z.string().optional(),
   selectionStart: z.number().int().nonnegative().optional(),
   instruction: z.string().max(600).optional(),
   operation: ProposalOperationKindSchema.optional(),
   targetLanguage: ProposalTargetLanguageSchema.optional(),
   tableCell: TableCellSelectionSchema.optional(),
+}).superRefine((command, context) => {
+  if (!command.selectionRanges?.length) return;
+  const blockIds = command.blockIds?.length ? command.blockIds : [command.blockId];
+  const rangeIds = command.selectionRanges.map((range) => range.blockId);
+  if (
+    rangeIds.length !== blockIds.length ||
+    rangeIds.some((blockId, index) => blockId !== blockIds[index])
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "selection block ranges must match command block ids in order",
+    });
+  }
 });
 export type SelectionCommand = z.infer<typeof SelectionCommandSchema>;
 

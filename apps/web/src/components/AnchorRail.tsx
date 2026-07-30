@@ -1,12 +1,18 @@
 import { MessageSquareText, PenLine } from "lucide-react";
 import type { Block, Comment, Proposal } from "../api";
 import type { ReviewThread, ThreadAnchor } from "../store";
+import {
+  proposalMatchesSelection,
+  proposalSelectionIdentity,
+  sameSelectionIdentity,
+} from "../selectionIdentity";
 
 type RailItem = {
   key: string;
   blockId: string;
   kind: "pending" | "note";
   excerpt: string;
+  anchor: ThreadAnchor;
   thread?: ReviewThread;
   anchorY?: number;
   active: boolean;
@@ -43,32 +49,38 @@ export function AnchorRail({
   if (!blocks.length) return null;
   const orderById = new Map(blocks.map((block, index) => [block.id, index]));
   const items: RailItem[] = [];
-  const threadedBlocks = new Set(threads.map((thread) => thread.anchor.blockId));
   const proposedBlocks = new Set(proposals.map((proposal) => proposal.blockId));
 
   for (const thread of threads) {
     items.push({
       key: `thread-${thread.id}`,
       blockId: thread.anchor.blockId,
-      kind: proposedBlocks.has(thread.anchor.blockId) ? "pending" : "note",
+      kind: proposals.some((proposal) => proposalMatchesSelection(proposal, thread.anchor))
+        ? "pending"
+        : "note",
       excerpt: thread.anchor.selectionText.slice(0, 60),
+      anchor: thread.anchor,
       thread,
       anchorY: thread.pos?.y,
       active: thread.id === activeThreadId,
     });
   }
-  for (const blockId of proposedBlocks) {
-    if (threadedBlocks.has(blockId)) continue;
-    const proposal = proposals.find((candidate) => candidate.blockId === blockId);
-    if (!proposal) continue;
+  const unthreadedProposalAnchors: ThreadAnchor[] = [];
+  for (const proposal of proposals) {
+    const anchor = proposalSelectionIdentity(proposal);
+    if (threads.some((thread) => proposalMatchesSelection(proposal, thread.anchor))) continue;
+    if (unthreadedProposalAnchors.some((candidate) => sameSelectionIdentity(candidate, anchor))) continue;
+    unthreadedProposalAnchors.push(anchor);
     items.push({
-      key: `proposal-${blockId}`,
-      blockId,
+      key: `proposal-${proposal.id}`,
+      blockId: proposal.blockId,
       kind: "pending",
       excerpt: proposalExcerpt(proposal).slice(0, 60),
+      anchor,
       active: false,
     });
   }
+  const threadedBlocks = new Set(threads.map((thread) => thread.anchor.blockId));
   const notedBlocks = new Set(comments.map((comment) => comment.blockId));
   for (const blockId of notedBlocks) {
     if (threadedBlocks.has(blockId) || proposedBlocks.has(blockId)) continue;
@@ -78,6 +90,7 @@ export function AnchorRail({
       blockId,
       kind: "note",
       excerpt: (block?.text ?? "").slice(0, 60),
+      anchor: { blockId, selectionText: block?.text ?? "" },
       active: false,
     });
   }
@@ -103,7 +116,7 @@ export function AnchorRail({
               if (item.thread) {
                 onOpenThread(item.thread);
               } else {
-                onOpenAnchor({ blockId: item.blockId, selectionText: item.excerpt });
+                onOpenAnchor(item.anchor);
               }
             }}
           >

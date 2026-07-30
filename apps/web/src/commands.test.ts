@@ -10,6 +10,7 @@ describe("buildSelectionCommand", () => {
       "translate",
       {
         selectionStart: 10,
+        selectionRanges: [{ blockId: "table-1", start: 10, end: 14, before: "same" }],
         operation: "translate",
         targetLanguage: "zh-CN",
         tableCell: {
@@ -22,6 +23,7 @@ describe("buildSelectionCommand", () => {
     )).toMatchObject({
       blockId: "table-1",
       selectionStart: 10,
+      selectionRanges: [{ blockId: "table-1", start: 10, end: 14, before: "same" }],
       tableCell: {
         address: "C2",
         row: 2,
