@@ -7,6 +7,7 @@ const KEYS = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "MARGIN_API_FORMAT",
+  "MARGIN_AUTH_STYLE",
   "MARGIN_BASE_URL",
   "MARGIN_MODEL",
 ] as const;
@@ -79,6 +80,32 @@ describe("resolveRuntimeApiKey", () => {
     expect(resolved.model.compat).toBeUndefined();
     expect(resolved.model.maxTokens).toBeLessThanOrEqual(8_192);
     expect(resolved.authStyle).toBe("apikey");
+  });
+
+  it("passes the OpenAI key through under Bearer auth (pi requires options.apiKey)", () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_AUTH_STYLE = "bearer";
+    process.env.MARGIN_BASE_URL = "https://provider.test/v1";
+    process.env.MARGIN_MODEL = "custom-model";
+    process.env.MARGIN_API_KEY = "sk-proxy";
+
+    const resolved = resolveRuntimeModel();
+    expect(resolved.authStyle).toBe("bearer");
+    expect(resolved.apiKey).toBe("sk-proxy");
+    expect(resolved.model.headers?.Authorization).toBe("Bearer sk-proxy");
+  });
+
+  it("keeps Anthropic Bearer header-owned so x-api-key is not sent", () => {
+    process.env.MARGIN_API_FORMAT = "anthropic";
+    process.env.MARGIN_AUTH_STYLE = "bearer";
+    process.env.MARGIN_BASE_URL = "https://provider.test";
+    process.env.MARGIN_MODEL = "claude-proxy";
+    process.env.MARGIN_API_KEY = "proxy-token";
+
+    const resolved = resolveRuntimeModel();
+    expect(resolved.authStyle).toBe("bearer");
+    expect(resolved.apiKey).toBeUndefined();
+    expect(resolved.model.headers?.Authorization).toBe("Bearer proxy-token");
   });
 });
 

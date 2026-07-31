@@ -269,11 +269,26 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
   const usageRequestId = randomUUID();
   const usageTotal: ModelUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   // Shared request policy: margin identity headers on every provider request.
-  const streamFn: StreamFn = (model, context, options) =>
-    streamSimple(model, context, {
+  // Also forward model.headers (Bearer Authorization) into options.headers —
+  // pi-ai's auth gate only inspects options.apiKey / options.headers.
+  const streamFn: StreamFn = (model, context, options) => {
+    const modelHeaders =
+      model &&
+      typeof model === "object" &&
+      "headers" in model &&
+      model.headers &&
+      typeof model.headers === "object"
+        ? (model.headers as Record<string, string>)
+        : {};
+    return streamSimple(model, context, {
       ...options,
-      headers: { ...(options?.headers ?? {}), ...marginRequestHeaders() },
+      headers: {
+        ...modelHeaders,
+        ...(options?.headers ?? {}),
+        ...marginRequestHeaders(),
+      },
     });
+  };
   const contextMessageLimit = opts.maxContextMessages ?? DEFAULT_MAX_CONTEXT_MESSAGES;
   const contextCharLimit = opts.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS;
   const forwardAbort = () => {
@@ -325,12 +340,20 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
   // growth is bounded by compaction itself. Eco / compactionAuto=false keep
   // the documented degraded path of trimming state directly.
   const fullTranscriptState = compactionAuto && contextTier !== "eco";
+  const modelAuthHeaders =
+    opts.model &&
+    typeof opts.model === "object" &&
+    "headers" in opts.model &&
+    opts.model.headers &&
+    typeof opts.model.headers === "object"
+      ? (opts.model.headers as Record<string, string>)
+      : {};
   const summarizer =
     opts.summarizer ??
     createPiSummarizer({
       model: opts.model as never,
       apiKey: opts.apiKey,
-      headers: marginRequestHeaders(),
+      headers: { ...modelAuthHeaders, ...marginRequestHeaders() },
     });
   const reportCompaction = (
     reason: CompactionEvent["reason"],

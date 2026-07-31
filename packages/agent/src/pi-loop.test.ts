@@ -530,6 +530,28 @@ describe("Pi request policy", () => {
       .not.toBe(options.headers["X-Client-Request-Id"]);
   });
 
+  it("forwards model Authorization headers so Bearer auth clears pi's apiKey gate", async () => {
+    configureRequestPolicy({ version: "0.2.0-test" });
+    await runToCompletion();
+    const streamFn = mockAgent.options?.streamFn as (
+      model: unknown,
+      context: unknown,
+      options?: Record<string, unknown>,
+    ) => unknown;
+
+    streamFn(
+      { headers: { Authorization: "Bearer proxy-token" } },
+      {},
+      { headers: { "X-Custom": "keep" } },
+    );
+    const options = mockCompat.streamSimpleCalls.at(-1)!.options as {
+      headers: Record<string, string>;
+    };
+    expect(options.headers.Authorization).toBe("Bearer proxy-token");
+    expect(options.headers["X-Custom"]).toBe("keep");
+    expect(options.headers["User-Agent"]).toBe("margin-agent/0.2.0-test");
+  });
+
   it("aggregates assistant usage per loop and reports it best-effort", async () => {
     const recorded: unknown[] = [];
     configureRequestPolicy({ onUsage: (entry: unknown) => recorded.push(entry) });

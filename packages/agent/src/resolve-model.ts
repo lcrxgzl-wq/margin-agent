@@ -29,7 +29,11 @@ type AnyModel = {
 export type ResolvedRuntimeModel = {
   provider: string;
   model: AnyModel;
-  /** Passed to Agent getApiKey; undefined when auth is header-owned (Bearer). */
+  /**
+   * Passed to Agent getApiKey. OpenAI always needs this (SDK auth).
+   * Anthropic bearer leaves it undefined so only Authorization is sent
+   * (avoids a conflicting x-api-key); streamFn must forward model.headers.
+   */
   apiKey?: string;
   authStyle: "bearer" | "apikey";
   baseURL?: string;
@@ -146,7 +150,9 @@ export function resolveRuntimeModel(modelOverride?: string): ResolvedRuntimeMode
       provider: format,
       model,
       isBuiltin: !!builtin,
-      apiKey: undefined,
+      // pi-ai checks options.apiKey / options.headers, not model.headers alone.
+      // OpenAI: pass the key. Anthropic bearer: header-only (no x-api-key).
+      apiKey: format === "openai" ? key : undefined,
       authStyle: style,
       baseURL,
     };
