@@ -213,6 +213,32 @@ try {
   }
 
   const workspace = path.join(tmp, "ws");
+  // Seed the exact failure mode from spviolence: remote DeepSeek URL under a
+  // cc-switch profile with no persisted API key.
+  fs.mkdirSync(path.join(workspace, ".margin"), { recursive: true });
+  fs.writeFileSync(
+    path.join(workspace, ".margin", "llm-settings.json"),
+    `${JSON.stringify(
+      {
+        activeId: "cc-switch-codex",
+        providers: [
+          {
+            id: "cc-switch-codex",
+            name: "CC Switch 本地代理（Codex）",
+            apiFormat: "anthropic",
+            baseURL: "https://api.deepseek.com/anthropic",
+            model: "deepseek-v4-flash",
+            authStyle: "bearer",
+            source: "cc-switch",
+            reasoningOptIn: true,
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
   child = spawn(process.execPath, [path.join(pkgDir, "dist", "index.js"), workspace], {
     env: { ...process.env, MARGIN_NO_OPEN: "1", MARGIN_PORT: String(port), MARGIN_ENGINE: "pi" },
     stdio: ["ignore", "pipe", "pipe"],
@@ -279,6 +305,31 @@ try {
     throw new Error("installed llm-settings save did not write .margin/llm-settings.json");
   }
 
+  // Seeded remote cc-switch-without-key must not boot pi with an empty key.
+  fs.writeFileSync(path.join(workspace, "note.md"), "# hi\n\nhello\n");
+  await fetch(`${url.origin}/api/v1/documents/open`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ relativePath: "note.md" }),
+  });
+  const missingKeyChat = await fetch(`${url.origin}/api/v1/chat`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ message: "nihao", chatMode: "direct" }),
+  });
+  const missingKeyText = await missingKeyChat.text();
+  if (/No API key for provider/i.test(missingKeyText)) {
+    throw new Error(`seeded remote cc-switch still hit pi empty-key error: ${missingKeyText}`);
+  }
+  // Without a key, Margin must stay offline / refuse — not call the provider empty-handed.
+
+  // Saving a key onto that active remote profile must persist and chat.
   // Live Bearer chat against local mocks — catches "No API key for provider".
   await assertBearerChat({
     origin: url.origin,

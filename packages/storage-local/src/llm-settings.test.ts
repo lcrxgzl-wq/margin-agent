@@ -303,6 +303,7 @@ describe("reasoning settings", () => {
         baseURL: "https://provider.test/v1",
         model: "model-a",
         authStyle: "bearer",
+        apiKey: "sk-reasoning",
         reasoningOptIn: true,
       },
     });
@@ -616,21 +617,42 @@ describe("cc-switch profiles", () => {
     expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
   });
 
-  it("refuses the placeholder when a cc-switch profile points off-loopback", async () => {
+  it("refuses remote cc-switch saves without an API key", async () => {
+    await expect(
+      saveLlmSettings(root, {
+        provider: {
+          id: "cc-switch-claude",
+          name: "CC Switch 本地代理（Claude）",
+          apiFormat: "anthropic",
+          baseURL: "https://api.deepseek.com/anthropic",
+          model: "deepseek-v4-flash",
+          authStyle: "bearer",
+          source: "cc-switch",
+        },
+      }),
+    ).rejects.toThrow(/远程 API 地址必须填写并保存 API Key/);
+  });
+
+  it("persists a key when a cc-switch profile is retargeted to a remote URL", async () => {
     await saveLlmSettings(root, {
       provider: {
-        id: "cc-switch-claude",
-        name: "CC Switch 本地代理（Claude）",
+        id: "cc-switch-codex",
+        name: "CC Switch 本地代理（Codex）",
         apiFormat: "anthropic",
-        baseURL: "https://evil.example.com",
-        model: "claude-sonnet-4-6",
+        baseURL: "https://api.deepseek.com/anthropic",
+        model: "deepseek-v4-flash",
         authStyle: "bearer",
         source: "cc-switch",
+        apiKey: "sk-deepseek-secret",
       },
     });
 
-    expect(process.env.MARGIN_API_KEY).toBeUndefined();
-    expect(process.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    const store = readLlmSettingsStore(root);
+    const active = store.providers.find((p) => p.id === "cc-switch-codex");
+    expect(active?.source).toBe("local");
+    expect(active?.apiKey).toBe("sk-deepseek-secret");
+    expect(process.env.MARGIN_API_KEY).toBe("sk-deepseek-secret");
+    expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe("sk-deepseek-secret");
     expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
   });
 
@@ -652,10 +674,21 @@ describe("cc-switch profiles", () => {
     expect(pub.provider?.apiKeyHint).toBe("由 CC Switch 代理管理");
     expect(JSON.stringify(pub)).not.toContain("PROXY_MANAGED");
 
+    await expect(
+      saveLlmSettings(root, {
+        provider: { id: "cc-switch-claude", baseURL: "https://evil.example.com" },
+      }),
+    ).rejects.toThrow(/远程 API 地址必须填写并保存 API Key/);
+
     await saveLlmSettings(root, {
-      provider: { id: "cc-switch-claude", baseURL: "https://evil.example.com" },
+      provider: {
+        id: "cc-switch-claude",
+        baseURL: "https://evil.example.com",
+        apiKey: "",
+      },
     });
     const offLoopback = publicLlmSettings(readLlmSettingsStore(root));
+    expect(offLoopback.provider?.source).not.toBe("cc-switch");
     expect(offLoopback.provider?.apiKeySet).toBe(false);
     expect(offLoopback.provider?.apiKeyHint).toBe("");
   });

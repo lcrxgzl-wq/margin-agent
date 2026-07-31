@@ -289,7 +289,7 @@ export async function runPiSessionTurn(
   const thinkingLevel = effectiveThinkingLevel(input.reasoningMode, runtime, input.reasoningOptIn);
   if (!hasRuntimeCredentials()) {
     throw new Error(
-      "session agent requires API key or Base URL (configure in Settings / CC Switch)",
+      "当前服务未配置 API Key。请在设置 → 模型里填写 Key 后点「保存并使用」。远程地址不会使用 CC Switch 占位密钥。",
     );
   }
 

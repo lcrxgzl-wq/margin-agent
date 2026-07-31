@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { effectiveThinkingLevel, resolveRuntimeApiKey, resolveRuntimeModel } from "./resolve-model.js";
+import { effectiveThinkingLevel, hasRuntimeCredentials, resolveRuntimeApiKey, resolveRuntimeModel } from "./resolve-model.js";
 
 const KEYS = [
   "MARGIN_API_KEY",
@@ -106,6 +106,26 @@ describe("resolveRuntimeApiKey", () => {
     expect(resolved.authStyle).toBe("bearer");
     expect(resolved.apiKey).toBeUndefined();
     expect(resolved.model.headers?.Authorization).toBe("Bearer proxy-token");
+  });
+});
+
+describe("hasRuntimeCredentials", () => {
+  it("does not treat a remote Base URL alone as credentials", () => {
+    process.env.MARGIN_API_FORMAT = "anthropic";
+    process.env.MARGIN_BASE_URL = "https://api.deepseek.com/anthropic";
+    expect(hasRuntimeCredentials()).toBe(false);
+  });
+
+  it("accepts loopback Base URL without a key (local proxy)", () => {
+    process.env.MARGIN_BASE_URL = "http://127.0.0.1:15721";
+    expect(hasRuntimeCredentials()).toBe(true);
+  });
+
+  it("accepts a configured API key", () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_BASE_URL = "https://api.deepseek.com/v1";
+    process.env.MARGIN_API_KEY = "sk-test";
+    expect(hasRuntimeCredentials()).toBe(true);
   });
 });
 

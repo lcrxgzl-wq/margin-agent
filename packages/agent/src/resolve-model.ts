@@ -168,12 +168,21 @@ export function resolveRuntimeModel(modelOverride?: string): ResolvedRuntimeMode
   };
 }
 
+function isLoopbackBaseURL(value: string): boolean {
+  try {
+    const host = new URL(value.trim()).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    if (host === "localhost" || host === "::1") return true;
+    return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+  } catch {
+    return false;
+  }
+}
+
 export function hasRuntimeCredentials(): boolean {
-  return !!(
-    resolveRuntimeApiKey(apiFormat()) ||
-    process.env.ANTHROPIC_AUTH_TOKEN ||
-    process.env.MARGIN_BASE_URL
-  );
+  if (resolveRuntimeApiKey(apiFormat())) return true;
+  // Remote Base URLs alone are not credentials (would boot pi with an empty key).
+  const base = process.env.MARGIN_BASE_URL?.trim();
+  return !!(base && isLoopbackBaseURL(base));
 }
 
 

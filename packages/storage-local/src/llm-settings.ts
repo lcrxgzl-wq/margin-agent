@@ -157,13 +157,17 @@ function maskKey(key: string): string {
 }
 
 function hasRuntimeKey(): boolean {
-  return !!(
+  if (
     process.env.OPENAI_API_KEY ||
     process.env.ANTHROPIC_API_KEY ||
     process.env.ANTHROPIC_AUTH_TOKEN ||
-    process.env.MARGIN_API_KEY ||
-    process.env.MARGIN_BASE_URL
-  );
+    process.env.MARGIN_API_KEY
+  ) {
+    return true;
+  }
+  // Remote Base URLs alone are not credentials. Loopback may use a proxy placeholder.
+  const base = process.env.MARGIN_BASE_URL?.trim();
+  return !!(base && isLoopbackBaseURL(base));
 }
 
 function defaultStore(): LlmSettingsStore {
@@ -223,22 +227,29 @@ function migrateFlat(raw: Record<string, unknown>): LlmSettingsStore | null {
 
 function normalizeProfile(p: Partial<LlmProviderProfile>, i: number): LlmProviderProfile {
   const apiFormat: ApiFormat = p.apiFormat === "anthropic" ? "anthropic" : "openai";
+  const baseURL = (p.baseURL || "").trim();
+  // CC Switch placeholder semantics are loopback-only. A remote URL means the
+  // user is talking to a real provider and must keep a persisted API key.
+  const source =
+    p.source === "cc-switch" && baseURL && !isLoopbackBaseURL(baseURL)
+      ? "local"
+      : p.source;
   return {
     id: (p.id || `p-${i}`).trim(),
     name: (p.name || p.id || `Provider ${i + 1}`).trim(),
     apiFormat,
-    baseURL: (p.baseURL || "").trim(),
+    baseURL,
     model: (p.model || (apiFormat === "anthropic" ? "claude-sonnet-4-6" : "gpt-4o-mini")).trim(),
-    // CC Switch routes never persist key material; the placeholder is memory-only.
+    // Loopback CC Switch routes never persist key material; placeholder is memory-only.
     apiKey:
-      p.source === "cc-switch"
+      source === "cc-switch"
         ? undefined
         : typeof p.apiKey === "string"
           ? p.apiKey
           : undefined,
     authStyle:
       apiFormat === "openai" || p.authStyle === "bearer" ? "bearer" : "apikey",
-    source: p.source,
+    source,
     websiteUrl: p.websiteUrl,
     currentInCcSwitch: p.currentInCcSwitch,
     reasoningOptIn: p.reasoningOptIn === true ? true : undefined,
@@ -433,7 +444,10 @@ export function publicLlmSettings(
   ccSwitch?: LlmSettingsPublic["ccSwitch"],
 ): LlmSettingsPublic {
   const active = activeProfile(store);
-  const keySet = !!active.apiKey?.trim() || !!active.baseURL.trim() || hasRuntimeKey();
+  const keySet =
+    !!active.apiKey?.trim() ||
+    (active.source === "cc-switch" && isLoopbackBaseURL(active.baseURL)) ||
+    hasRuntimeKey();
   return {
     activeId: store.activeId,
     provider: profilePublic(active),
@@ -568,6 +582,16 @@ export async function saveLlmSettings(
       },
       idx >= 0 ? idx : store.providers.length,
     );
+    if (
+      next.baseURL &&
+      !isLoopbackBaseURL(next.baseURL) &&
+      !next.apiKey?.trim()
+    ) {
+      const explicitlyCleared = input.clearApiKey === true || patch.apiKey === "";
+      if (!explicitlyCleared) {
+        throw new Error("远程 API 地址必须填写并保存 API Key。CC Switch 占位密钥仅用于本机 127.0.0.1 代理。");
+      }
+    }
 
     if (idx >= 0) store.providers[idx] = next;
     else store.providers.push(next);
