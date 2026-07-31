@@ -103,6 +103,45 @@ export function proposalSelectionIdentity(proposal: Proposal): SelectionIdentity
   };
 }
 
+/** True when an open review thread already owns this exact selection (bubble should hide). */
+export function selectionOwnedByOpenThread(
+  thread: SelectionIdentity | null | undefined,
+  selection: {
+    blockId: string | null;
+    text: string;
+    selectionStart?: number;
+    selectionRanges?: SelectionIdentity["selectionRanges"];
+    tableCell?: SelectionIdentity["tableCell"];
+  },
+): boolean {
+  if (!thread || !selection.blockId || !selection.text.trim()) return false;
+  return sameSelectionIdentity(thread, {
+    blockId: selection.blockId,
+    selectionText: selection.text,
+    selectionStart: selection.selectionStart,
+    selectionRanges: selection.selectionRanges,
+    tableCell: selection.tableCell,
+  });
+}
+
+/** True when the live selection is a different span than the open thread (ignore precise-start drift). */
+export function selectionClearlyDivergedFromThread(
+  thread: SelectionIdentity | null | undefined,
+  selection: {
+    blockId: string | null;
+    text: string;
+    tableCell?: SelectionIdentity["tableCell"];
+  },
+): boolean {
+  if (!thread || !selection.blockId || !selection.text.trim()) return false;
+  const threadAddress = thread.tableCell?.address ?? null;
+  const selectionAddress = selection.tableCell?.address ?? null;
+  if (threadAddress || selectionAddress) {
+    return thread.blockId !== selection.blockId || threadAddress !== selectionAddress;
+  }
+  return thread.blockId !== selection.blockId || thread.selectionText !== selection.text;
+}
+
 export function proposalMatchesSelection(
   proposal: Proposal,
   selection: SelectionIdentity,

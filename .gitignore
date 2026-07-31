@@ -26,3 +26,5 @@ docs/FABLE_ADVISORY_BRIEF.md
 docs/review-pi-prompts.md
 docs/review-pi-router.md
 docs/review-pi-shell.md
+
+apps/cli/.package.json.release-backup

@@ -3,8 +3,19 @@ import type { DocumentMeta } from "./api";
 export const UNSAVED_DOCUMENT_REPLACEMENT_MESSAGE =
   "当前文稿有未保存的修改。继续打开文稿后这些修改会丢失，仍要继续吗？";
 
+export const UNSAVED_DOCUMENT_CONTINUE_MESSAGE =
+  "当前文稿有未保存修改。保存后继续？取消则保留画布修改，不发送本次请求。";
+
 export const ASYNC_DOCUMENT_CONFLICT_MESSAGE =
   "请求期间文稿已被编辑、保存或切换。为避免覆盖，已保留当前画布；请先保存或另存当前修改，再重新打开文稿同步结果。";
+
+/** Ask to save before a backend-backed action while the canvas is dirty. */
+export function confirmSaveBeforeContinue(
+  documentDirty: boolean,
+  confirm: (message: string) => boolean = (message) => window.confirm(message),
+): boolean {
+  return !documentDirty || confirm(UNSAVED_DOCUMENT_CONTINUE_MESSAGE);
+}
 
 function workspacePathKey(relativePath: string): string {
   return relativePath.replace(/\\/g, "/");

@@ -196,13 +196,15 @@ async function main() {
 
     const workspace = path.join(extractionRoot, "用户文稿 工作区");
     fs.mkdirSync(workspace, { recursive: true });
-    const requireFromBundle = createRequire(appManifestPath);
-    const { Document, Packer, Paragraph } = requireFromBundle("docx");
+    // Create the fixture DOCX from the monorepo — the published package is a
+    // single-file bundle with empty dependencies (no nested node_modules/docx).
+    const requireFromCli = createRequire(path.join(root, "apps", "cli", "package.json"));
+    const { Document, Packer, Paragraph } = requireFromCli("docx");
     const docxText = "Portable DOCX evidence survives restart.";
-    const docx = await Packer.toBuffer(new Document({
+    const docxBuffer = await Packer.toBuffer(new Document({
       sections: [{ children: [new Paragraph(docxText)] }],
     }));
-    fs.writeFileSync(path.join(workspace, "论文 样本.docx"), docx);
+    fs.writeFileSync(path.join(workspace, "论文 样本.docx"), docxBuffer);
     const pdfText = "Portable PDF evidence from the bundled parser.";
     fs.writeFileSync(path.join(workspace, "资料 样本.pdf"), simplePdf(pdfText));
 

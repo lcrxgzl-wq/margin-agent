@@ -15,6 +15,8 @@ function CanvasView(props: CanvasProps) {
     : <MarkdownCanvas {...props} />;
 }
 
+// Data-only comparator: callback props must stay stable or be read via refs inside
+// OfficeCanvas. Otherwise a memo cache hit keeps stale host handlers after upgrades.
 export const Canvas = memo(
   CanvasView,
   (previous, next) =>

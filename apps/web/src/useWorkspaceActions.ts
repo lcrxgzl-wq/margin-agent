@@ -35,6 +35,7 @@ import {
   ASYNC_DOCUMENT_CONFLICT_MESSAGE,
   canApplyDocumentResponse,
   confirmDocumentReplacement,
+  confirmSaveBeforeContinue,
   isDocumentReplacementChatIntent,
   isWorkspaceListChatIntent,
 } from "./documentSafety";
@@ -72,6 +73,8 @@ export function useWorkspaceActions(options?: {
     selectionRanges?: SelectionBlockRange[];
     tableCell?: TableCellSelection;
   }) => void;
+  /** Canvas save(); used to save-and-continue when the open document is dirty. */
+  saveDocument?: () => Promise<boolean>;
 }) {
   const store = useMarginStore();
   const storeRef = useRef(store);
@@ -82,9 +85,14 @@ export function useWorkspaceActions(options?: {
   const [canCancel, setCanCancel] = useState(false);
   const [pendingMcpApproval, setPendingMcpApproval] = useState<PendingMcpApproval | null>(null);
   storeRef.current = store;
-  const assertDocumentClean = () => {
-    if (storeRef.current.documentDirty) {
-      throw new Error("当前文稿有未保存修改，请先保存或撤销后再执行此操作。");
+  const assertDocumentClean = async () => {
+    if (!storeRef.current.documentDirty) return;
+    if (!confirmSaveBeforeContinue(true)) {
+      throw new Error("已取消；请先保存或撤销画布修改。");
+    }
+    const saved = await options?.saveDocument?.();
+    if (!saved || storeRef.current.documentDirty) {
+      throw new Error("保存未完成；请先在画布工具栏保存成功后再试。");
     }
   };
   const assertDocumentResponseCurrent = (
@@ -167,7 +175,7 @@ export function useWorkspaceActions(options?: {
   ) => {
     if (!store.doc) throw new Error("请先打开文章");
     if (!blockIds.length) throw new Error("请先选中一段文字");
-    assertDocumentClean();
+    await assertDocumentClean();
     const { editableIds, skippedTables } = filterEditableBlockIds(blockIds, store.blocks, tableCell);
     if (!editableIds.length) {
       throw new Error("请在表格的单个单元格内选择文字后再生成提案。");
@@ -383,11 +391,11 @@ export function useWorkspaceActions(options?: {
   };
   const onAccept = async (proposalId: string) => {
     if (!store.doc) return;
+    await assertDocumentClean();
     const document = store.doc;
     const generation = store.beginBusy("正在写入接受…");
     try {
       store.setReviewError(null);
-      assertDocumentClean();
       const result = await resolveProposal(document, proposalId, "Y");
       if (!result.ok) throw new Error(result.reason || "apply failed");
       assertDocumentResponseCurrent(document, generation);
@@ -412,11 +420,11 @@ export function useWorkspaceActions(options?: {
   };
   const onEdit = async (proposalId: string, editedText: string) => {
     if (!store.doc) return;
+    await assertDocumentClean();
     const document = store.doc;
     const generation = store.beginBusy("正在写入编辑后接受…");
     try {
       store.setReviewError(null);
-      assertDocumentClean();
       const result = await resolveProposal(document, proposalId, "E", editedText);
       if (!result.ok) throw new Error(result.reason || "apply failed");
       assertDocumentResponseCurrent(document, generation);
@@ -441,11 +449,11 @@ export function useWorkspaceActions(options?: {
   };
   const onUndo = async (proposalId: string) => {
     if (!store.doc) return;
+    await assertDocumentClean();
     const document = store.doc;
     const generation = store.beginBusy("正在拒绝…");
     try {
       store.setReviewError(null);
-      assertDocumentClean();
       await resolveProposal(document, proposalId, "N");
       await refreshProposals(document.id);
       store.clearSelection();
@@ -465,7 +473,7 @@ export function useWorkspaceActions(options?: {
   };
   const acceptAll = async () => {
     if (!store.doc) throw new Error("请先打开文章");
-    assertDocumentClean();
+    await assertDocumentClean();
     if (!store.proposals.length) throw new Error("没有待确认改动");
     const document = store.doc;
     const count = store.proposals.length;
@@ -495,7 +503,7 @@ export function useWorkspaceActions(options?: {
   };
   const undoAll = async () => {
     if (!store.doc) throw new Error("请先打开文章");
-    assertDocumentClean();
+    await assertDocumentClean();
     if (!store.proposals.length) throw new Error("没有待确认改动");
     const document = store.doc;
     const count = store.proposals.length;
@@ -566,7 +574,7 @@ export function useWorkspaceActions(options?: {
   };
   const exportWord = async () => {
     if (!store.doc) throw new Error("请先打开文章");
-    assertDocumentClean();
+    await assertDocumentClean();
     const generation = store.beginBusy("正在导出 Word…");
     try {
       const result = await exportDocumentDocx(store.doc.id);
@@ -633,6 +641,32 @@ export function useWorkspaceActions(options?: {
       chatMode = "direct";
       store.setChatMode("direct");
     }
+    let allowOpenWhileDirty = false;
+    try {
+      if (storeRef.current.documentDirty) {
+        if (isWorkspaceListChatIntent(text)) {
+          // Listing materials does not replace the open document.
+        } else if (isDocumentReplacementChatIntent(text)) {
+          if (!confirmDocumentReplacement(true)) {
+            store.appendMessage({
+              id: mid(),
+              role: "assistant",
+              text: "已取消打开；未保存修改仍保留在当前画布。",
+            });
+            return;
+          }
+          // Keep dirty until a successful open replaces the canvas.
+          allowOpenWhileDirty = true;
+        } else {
+          // Resolve dirty canvas before the user turn is recorded, so cancel/fail
+          // does not leave an orphan "你" bubble with no follow-through.
+          await assertDocumentClean();
+        }
+      }
+    } catch (error) {
+      messageError(error);
+      return;
+    }
     store.appendMessage({ id: mid(), role: "user", text, threadId: opts?.threadId });
     try {
       const selectedIntent = selectionContext.text.trim()
@@ -666,31 +700,7 @@ export function useWorkspaceActions(options?: {
         }
         return;
       }
-      let allowOpenWhileDirty = false;
-      if (storeRef.current.documentDirty) {
-        if (isWorkspaceListChatIntent(text)) {
-          // Listing materials does not replace the open document.
-        } else if (isDocumentReplacementChatIntent(text)) {
-          if (!confirmDocumentReplacement(true)) {
-            store.appendMessage({
-              id: mid(),
-              role: "assistant",
-              text: "已取消打开；未保存修改仍保留在当前画布。",
-            });
-            return;
-          }
-          // Keep dirty until a successful open replaces the canvas.
-          allowOpenWhileDirty = true;
-        } else {
-          store.appendMessage({
-            id: mid(),
-            role: "assistant",
-            text: "当前文稿有未保存修改，请先保存或撤销；我不会基于后端旧版本继续操作。",
-          });
-          return;
-        }
-      }
-      if (/接受全部|全部接受|accept\s*all/i.test(text)) return await acceptAll();
+            if (/接受全部|全部接受|accept\s*all/i.test(text)) return await acceptAll();
       if (/撤回全部|全部撤回|undo\s*all|拒绝全部/i.test(text)) return await undoAll();
       if (/导出\s*(word|docx|Word|WORD)|导出为?\s*word|word\s*导出/i.test(text)) {
         return await exportWord();

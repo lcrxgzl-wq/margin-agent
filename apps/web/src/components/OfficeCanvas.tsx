@@ -108,6 +108,7 @@ type Props = {
   }) => void;
   onDirtyChange: (dirty: boolean) => void;
   onDocumentSaved: (document: DocumentMeta, blocks: Block[]) => void;
+  onSaveHandlerChange?: (save: (() => Promise<boolean>) | null) => void;
   onReadyChange?: (ready: boolean) => void;
   /** 篡改检测强制还原修订标记后给出提示（App 侧 appendMessage）。 */
   onMarkNotice?: (text: string) => void;
@@ -403,6 +404,9 @@ export function OfficeCanvas(props: Props) {
   const loadedRevisionRef = useRef<number | null>(null);
   const onSelectionChangeRef = useRef(props.onSelectionChange);
   const onDirtyChangeRef = useRef(props.onDirtyChange);
+  const onDocumentSavedRef = useRef(props.onDocumentSaved);
+  const onSaveHandlerChangeRef = useRef(props.onSaveHandlerChange);
+  const onContextMenuRef = useRef(props.onContextMenu);
   const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
   const manualSaveWarningAcceptedRef = useRef(false);
   const pageScaleRef = useRef(1);
@@ -450,6 +454,9 @@ export function OfficeCanvas(props: Props) {
   onMarkNoticeRef.current = props.onMarkNotice;
   onSelectionChangeRef.current = props.onSelectionChange;
   onDirtyChangeRef.current = props.onDirtyChange;
+  onDocumentSavedRef.current = props.onDocumentSaved;
+  onSaveHandlerChangeRef.current = props.onSaveHandlerChange;
+  onContextMenuRef.current = props.onContextMenu;
   editorShouldReadOnlyRef.current = officeEditorReadOnly(mode, props.busy, saving);
 
   const setCanvasDirty = useCallback((nextDirty: boolean) => {
@@ -1318,13 +1325,14 @@ export function OfficeCanvas(props: Props) {
     command((editor) => editor.command.executeMode(next === "edit" ? EditorMode.EDIT : EditorMode.READONLY));
   };
 
-  const save = async () => {
+  const save = async (): Promise<boolean> => {
     const editor = editorRef.current;
-    if (!editor || loading || saving || props.busy || !dirty) return;
+    if (!editor || loading || saving || props.busy) return false;
+    if (!dirty) return true;
     // 保存前确认（Task 2）：手动保存会 supersede 全部待审提案。确认必须
     // 发生在下面"还原→导出→重注入"兜底之前，取消时标记与提案保持原样。
     const pendingCount = countPendingProposals(proposalsRef.current);
-    if (pendingCount > 0 && !window.confirm(buildSaveConfirmMessage(pendingCount))) return;
+    if (pendingCount > 0 && !window.confirm(buildSaveConfirmMessage(pendingCount))) return false;
     setSaving(true);
     editorShouldReadOnlyRef.current = true;
     editor.command.executeMode(EditorMode.READONLY);
@@ -1364,7 +1372,7 @@ export function OfficeCanvas(props: Props) {
         );
       } catch (reason) {
         if (!(reason instanceof NativeDocxRebuildRequiredError)) throw reason;
-        if (!confirmRebuild(reason.message)) return;
+        if (!confirmRebuild(reason.message)) return false;
         result = await saveNativeDocx(props.document, content, "rebuild", [...changedBlockIdsRef.current]);
       }
       loadedRevisionRef.current = result.document.revision;
@@ -1372,7 +1380,7 @@ export function OfficeCanvas(props: Props) {
       changedBlockIdsRef.current.clear();
       setCanvasDirty(false);
       saveSucceeded = true;
-      props.onDocumentSaved(result.document, result.blocks);
+      onDocumentSavedRef.current(result.document, result.blocks);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -1393,7 +1401,17 @@ export function OfficeCanvas(props: Props) {
       );
       setSaving(false);
     }
+    return saveSucceeded;
   };
+
+  const saveRef = useRef(save);
+  saveRef.current = save;
+  // Register once; read handlers via refs so Canvas memo cache hits cannot drop save-and-continue.
+  useEffect(() => {
+    const handler = () => saveRef.current();
+    onSaveHandlerChangeRef.current?.(handler);
+    return () => onSaveHandlerChangeRef.current?.(null);
+  }, []);
 
   const handleContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
     const editor = editorRef.current;
@@ -1472,7 +1490,7 @@ export function OfficeCanvas(props: Props) {
     const canonicalSelectionText = selectionRanges?.map((range) => range.before).join("") ?? text;
     const canonicalSelectionStart = selectionRanges?.[0]?.start ?? selectionStart;
     event.preventDefault();
-    props.onContextMenu({
+    onContextMenuRef.current({
       x: event.clientX,
       y: event.clientY,
       blockId,

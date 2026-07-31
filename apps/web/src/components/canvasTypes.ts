@@ -50,6 +50,8 @@ export type CanvasProps = {
   }) => void;
   onDirtyChange: (dirty: boolean) => void;
   onDocumentSaved: (document: DocumentMeta, blocks: Block[]) => void;
+  /** Registers the canvas save() so chat/agent actions can save-and-continue when dirty. */
+  onSaveHandlerChange?: (save: (() => Promise<boolean>) | null) => void;
   onReadyChange?: (ready: boolean) => void;
   /** Office 修订标记被手动改动并强制还原后给出提示（仅 OfficeCanvas 触发）。 */
   onMarkNotice?: (text: string) => void;

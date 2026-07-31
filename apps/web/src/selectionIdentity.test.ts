@@ -5,6 +5,8 @@ import {
   proposalSelectionIdentity,
   sameSelectionIdentity,
   selectionAnchorAlive,
+  selectionOwnedByOpenThread,
+  selectionClearlyDivergedFromThread,
 } from "./selectionIdentity";
 
 function selectionProposal(overrides: Partial<Proposal> = {}): Proposal {
@@ -199,5 +201,44 @@ describe("selection identity", () => {
       blockId: "block-1",
       selectionText: "重复文字",
     }, blocks)).toBe(true);
+  });
+
+  it("treats precise-start drift as the same span when collapsing threads", () => {
+    const thread = {
+      blockId: "block-1",
+      selectionText: "重复文字",
+      selectionStart: 1,
+    };
+    expect(selectionClearlyDivergedFromThread(thread, {
+      blockId: "block-1",
+      text: "重复文字",
+    })).toBe(false);
+    expect(selectionClearlyDivergedFromThread(thread, {
+      blockId: "block-1",
+      text: "另一段",
+    })).toBe(true);
+  });
+
+  it("hides the selection bubble only while the open thread owns that exact span", () => {
+    const thread = {
+      blockId: "block-1",
+      selectionText: "重复文字",
+      selectionStart: 1,
+    };
+    expect(selectionOwnedByOpenThread(thread, {
+      blockId: "block-1",
+      text: "重复文字",
+      selectionStart: 1,
+    })).toBe(true);
+    expect(selectionOwnedByOpenThread(thread, {
+      blockId: "block-1",
+      text: "另一段",
+      selectionStart: 0,
+    })).toBe(false);
+    expect(selectionOwnedByOpenThread(thread, {
+      blockId: null,
+      text: "重复文字",
+      selectionStart: 1,
+    })).toBe(false);
   });
 });

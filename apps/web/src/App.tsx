@@ -1,6 +1,7 @@
 import {
   lazy,
   Suspense,
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -41,7 +42,13 @@ import {
   sameDocumentIdentity,
   shouldPreserveDirtyDocumentOnImport,
 } from "./documentSafety";
-import { proposalMatchesSelection, sameSelectionIdentity, selectionAnchorAlive } from "./selectionIdentity";
+import {
+  proposalMatchesSelection,
+  sameSelectionIdentity,
+  selectionAnchorAlive,
+  selectionOwnedByOpenThread,
+  selectionClearlyDivergedFromThread,
+} from "./selectionIdentity";
 
 const Canvas = lazy(() =>
   import("./components/Canvas").then((module) => ({ default: module.Canvas })),
@@ -100,6 +107,7 @@ function Workspace() {
     }
     return defaultFloatRect(viewport);
   });
+  const saveDocumentRef = useRef<(() => Promise<boolean>) | null>(null);
   const actions = useWorkspaceActions({
     onSelectionRunStart: (anchor) => {
       storeRef.current.openThread({
@@ -110,6 +118,7 @@ function Workspace() {
         createdAt: new Date().toISOString(),
       });
     },
+    saveDocument: () => saveDocumentRef.current?.() ?? Promise.resolve(false),
   });
   const [themeMode, setThemeMode] = useState<"light" | "dark" | "system">(() => {
     const saved = localStorage.getItem("margin_theme");
@@ -479,10 +488,25 @@ function Workspace() {
     }
   };
   const threadAnchorAlive = !activeThread || selectionAnchorAlive(activeThread.anchor, store.blocks);
-  const onCanvasSelectionChange = (selection: SelectionInput) => {
-    store.setSelection(selection);
+  // Stable handler: Canvas memo can cache-hit across App renders; only storeRef is fresh.
+  const onCanvasSelectionChange = useCallback((selection: SelectionInput) => {
+    const current = storeRef.current;
+    current.setSelection(selection);
+    const openThread = current.activeThreadId
+      ? current.threads.find((candidate) => candidate.id === current.activeThreadId)
+      : null;
+    // Selecting a different span while a thread is open should return the floating
+    // tools — otherwise the bubble stays hidden behind popoverOpen forever.
+    // Compare block+text only so precise-start probes do not collapse the thread.
+    if (
+      openThread &&
+      !openThread.collapsed &&
+      selectionClearlyDivergedFromThread(openThread.anchor, selection)
+    ) {
+      current.collapseThread(openThread.id);
+    }
     if (!selection.anchor || !selection.blockId) return;
-    const thread = storeRef.current.threads.find((candidate) =>
+    const thread = current.threads.find((candidate) =>
       sameSelectionIdentity(candidate.anchor, {
         blockId: selection.blockId!,
         selectionRanges: selection.selectionRanges,
@@ -491,8 +515,38 @@ function Workspace() {
         tableCell: selection.tableCell,
       }),
     );
-    if (thread) store.updateThreadPosition(thread.id, selection.anchor);
-  };
+    if (thread) current.updateThreadPosition(thread.id, selection.anchor);
+  }, []);
+
+  const onSaveHandlerChange = useCallback((save: (() => Promise<boolean>) | null) => {
+    saveDocumentRef.current = save;
+  }, []);
+
+  const onMarkNotice = useCallback((textNotice: string) => {
+    storeRef.current.appendMessage({ id: crypto.randomUUID(), role: "assistant", text: textNotice });
+  }, []);
+
+  const onDocumentSaved = useCallback((document: DocumentMeta, blocks: Block[]) => {
+    const current = storeRef.current;
+    current.setDocBundle(document, blocks);
+    // A successful native save supersedes every pending proposal on
+    // the server. Clear stale cards immediately; the refresh below
+    // remains authoritative for comments and any future statuses.
+    current.setProposals([]);
+    void Promise.all([listProposals(document.id), listComments(document.id)])
+      .then(([proposals, comments]) => {
+        if (storeRef.current.doc?.id !== document.id || storeRef.current.doc.revision !== document.revision) return;
+        storeRef.current.setProposals(proposals.proposals);
+        storeRef.current.setComments(comments.comments ?? []);
+      })
+      .catch((error) => {
+        storeRef.current.appendMessage({
+          id: crypto.randomUUID(),
+          role: "assistant",
+          text: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }, []);
 
   return (
     <div className={`app ${landing ? "chat-only" : `with-doc layout-${layoutMode}`}`} style={workspaceStyle}>
@@ -565,30 +619,16 @@ function Workspace() {
               onAccept={actions.onAccept}
               onEdit={actions.onEdit}
               onUndo={actions.onUndo}
-              onMarkNotice={(text) =>
-                storeRef.current.appendMessage({ id: crypto.randomUUID(), role: "assistant", text })
-              }
+              onMarkNotice={onMarkNotice}
               onRewrite={(proposalId, blockId) =>
                 void actions.onRewriteProposal(proposalId, blockId).catch(actions.messageError)
               }
               onSelectionChange={onCanvasSelectionChange}
               onContextMenu={store.setMenu}
               onDirtyChange={store.setDocumentDirty}
+              onSaveHandlerChange={onSaveHandlerChange}
               clearSelectionSignal={selectionClearToken}
-              onDocumentSaved={(document, blocks) => {
-                store.setDocBundle(document, blocks);
-                // A successful native save supersedes every pending proposal on
-                // the server. Clear stale cards immediately; the refresh below
-                // remains authoritative for comments and any future statuses.
-                store.setProposals([]);
-                void Promise.all([listProposals(document.id), listComments(document.id)])
-                  .then(([proposals, comments]) => {
-                    if (storeRef.current.doc?.id !== document.id || storeRef.current.doc.revision !== document.revision) return;
-                    store.setProposals(proposals.proposals);
-                    store.setComments(comments.comments ?? []);
-                  })
-                  .catch(actions.messageError);
-              }}
+              onDocumentSaved={onDocumentSaved}
               onReadyChange={setOfficeReady}
             />
           </Suspense>
@@ -840,7 +880,7 @@ function Workspace() {
           !store.menu &&
           !store.busy &&
           !store.rewritePrompt &&
-          !popoverOpen
+          !(popoverOpen && selectionOwnedByOpenThread(activeThread?.anchor, store.selection))
         }
         x={store.selection.anchor?.x ?? 0}
         y={store.selection.anchor?.y ?? 0}

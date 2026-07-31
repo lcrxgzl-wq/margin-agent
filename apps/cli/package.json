@@ -1,6 +1,6 @@
 {
   "name": "margin-agent",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "本地运行的文档修订 Agent：模型对指定段落提出修改提案，作者逐条裁决后写入文稿，全过程留档。",
   "license": "MIT",
   "engines": {
@@ -24,7 +24,8 @@
     "dev": "tsx src/index.ts ../..",
     "build": "tsc -p tsconfig.json",
     "build:release": "pnpm --dir ../.. build && node ../../scripts/build-cli-release.mjs",
-    "prepack": "pnpm run build:release",
+    "prepack": "pnpm run build:release && node ../../scripts/release-strip-deps.mjs",
+    "postpack": "node ../../scripts/release-restore-deps.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/index.js ../..",
     "test": "vitest run --pool=threads"

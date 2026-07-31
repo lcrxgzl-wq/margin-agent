@@ -14,7 +14,16 @@ await build({
   format: "esm",
   target: "node22",
   sourcemap: true,
-  packages: "external",
+  // Bundle npm deps so `npm i -g` does not re-resolve broken transitive ranges
+  // (e.g. @aws-sdk/core@^3.977.4 before that version exists on the registry).
+  // Fastify/avvio still emit CJS dynamic require("node:*"); provide createRequire.
+  // pdf-parse stays external: it needs @napi-rs/canvas's native DOMMatrix polyfill.
+  external: ["pdf-parse"],
+  banner: {
+    js: `import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+`,
+  },
   alias: {
     "@margin/agent": path.join(root, "packages", "agent", "src", "index.ts"),
     "@margin/domain": path.join(root, "packages", "domain", "src", "index.ts"),
@@ -23,6 +32,23 @@ await build({
     "@margin/storage-local": path.join(root, "packages", "storage-local", "src", "index.ts"),
   },
 });
+
+// Keep a single shebang + createRequire shim at the top (entry shebang must not remain).
+const outfile = path.join(cli, "dist", "index.js");
+let bundled = fs.readFileSync(outfile, "utf8");
+bundled = bundled.replace(/^(?:#!\/usr\/bin\/env node\r?\n)+/, "");
+bundled = bundled.replace(
+  /^(?:import \{ createRequire \} from "node:module";\r?\nconst require = createRequire\(import\.meta\.url\);\r?\n)+/,
+  "",
+);
+fs.writeFileSync(
+  outfile,
+  `#!/usr/bin/env node
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+
+${bundled}`,
+);
 
 const copyDirectory = (source, destination) => {
   fs.rmSync(destination, { recursive: true, force: true });

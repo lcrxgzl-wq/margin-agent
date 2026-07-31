@@ -2127,6 +2127,12 @@ async function main() {
   await app.register(fastifyStatic, {
     root: staticRoot,
     wildcard: false,
+    setHeaders(reply, filePath) {
+      // Hashed assets may be cached; HTML must not, or upgrades keep serving old UI ("缓存命中").
+      if (String(filePath).endsWith(".html")) {
+        reply.header("Cache-Control", "no-store");
+      }
+    },
   });
   // Legacy batch UI (deprecated)
   app.get("/legacy", async (_req, reply) => {
@@ -2138,7 +2144,7 @@ async function main() {
     if (req.url.startsWith("/api/")) {
       return reply.code(404).send({ error: "not found" });
     }
-    return reply.sendFile("index.html", staticRoot);
+    return reply.header("Cache-Control", "no-store").sendFile("index.html", staticRoot);
   });
 
   let shuttingDown = false;

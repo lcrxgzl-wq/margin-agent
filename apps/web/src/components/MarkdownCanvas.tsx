@@ -20,6 +20,7 @@ function MarkdownCanvasView({
   onSelectionChange,
   onContextMenu,
   onDirtyChange,
+  onSaveHandlerChange,
 }: CanvasProps) {
   const byBlock = useMemo(() => {
     const m = new Map<string, Proposal[]>();
@@ -110,6 +111,11 @@ function MarkdownCanvasView({
   }, [onDirtyChange]);
 
   useEffect(() => {
+    onSaveHandlerChange?.(async () => true);
+    return () => onSaveHandlerChange?.(null);
+  }, [onSaveHandlerChange]);
+
+  useEffect(() => {
     if (!editor) return;
     const proposalIdsByBlock = new Map<string, string>();
     for (const [blockId, list] of byBlock) {
@@ -146,12 +152,6 @@ function MarkdownCanvasView({
   );
 }
 
-export const MarkdownCanvas = memo(
-  MarkdownCanvasView,
-  (previous, next) =>
-    previous.blocks === next.blocks &&
-    previous.proposals === next.proposals &&
-    previous.comments === next.comments &&
-    previous.busy === next.busy &&
-    previous.statusLine === next.statusLine,
-);
+// Default shallow memo only. A custom data-only comparator cache-hit left Accept/Edit
+// callbacks stale after host actions changed (e.g. dirty save-and-continue).
+export const MarkdownCanvas = memo(MarkdownCanvasView);

@@ -3,10 +3,12 @@ import {
   canApplyDocumentImportResponse,
   canApplyDocumentResponse,
   confirmDocumentReplacement,
+  confirmSaveBeforeContinue,
   isDocumentReplacementChatIntent,
   isWorkspaceListChatIntent,
   sameDocumentIdentity,
   shouldPreserveDirtyDocumentOnImport,
+  UNSAVED_DOCUMENT_CONTINUE_MESSAGE,
   UNSAVED_DOCUMENT_REPLACEMENT_MESSAGE,
 } from "./documentSafety";
 
@@ -32,6 +34,15 @@ describe("document replacement safety", () => {
 
   it("allows a dirty document replacement when the author confirms", () => {
     expect(confirmDocumentReplacement(true, () => true)).toBe(true);
+  });
+
+  it("asks to save-and-continue only when the canvas is dirty", () => {
+    const confirm = vi.fn(() => true);
+    expect(confirmSaveBeforeContinue(false, confirm)).toBe(true);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(confirmSaveBeforeContinue(true, confirm)).toBe(true);
+    expect(confirm).toHaveBeenCalledWith(UNSAVED_DOCUMENT_CONTINUE_MESSAGE);
+    expect(confirmSaveBeforeContinue(true, () => false)).toBe(false);
   });
 
   it("rejects an import response after the visible document state changes", () => {
