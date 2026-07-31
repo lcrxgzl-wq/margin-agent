@@ -396,9 +396,12 @@ export function applyProfile(profile: LlmProviderProfile): void {
   if (key) {
     process.env.MARGIN_API_KEY = key;
     if (profile.apiFormat === "anthropic") {
-      process.env.ANTHROPIC_API_KEY = key;
+      // Bearer proxies authenticate via Authorization only. Setting
+      // ANTHROPIC_API_KEY would make the SDK also emit x-api-key.
       if (profile.authStyle === "bearer") {
         process.env.ANTHROPIC_AUTH_TOKEN = key;
+      } else {
+        process.env.ANTHROPIC_API_KEY = key;
       }
     } else {
       process.env.OPENAI_API_KEY = key;

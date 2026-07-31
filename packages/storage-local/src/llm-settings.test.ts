@@ -597,7 +597,23 @@ describe("cc-switch profiles", () => {
 
     expect(process.env.MARGIN_API_KEY).toBe("PROXY_MANAGED");
     expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe("PROXY_MANAGED");
+    expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(process.env.MARGIN_BASE_URL).toBe("http://127.0.0.1:15721");
+  });
+
+  it("does not set ANTHROPIC_API_KEY for Anthropic Bearer profiles", async () => {
+    await saveLlmSettings(root, {
+      provider: {
+        apiFormat: "anthropic",
+        authStyle: "bearer",
+        baseURL: "https://provider.test",
+        model: "claude-proxy",
+        apiKey: "proxy-token",
+      },
+    });
+    expect(process.env.MARGIN_API_KEY).toBe("proxy-token");
+    expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe("proxy-token");
+    expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
   });
 
   it("refuses the placeholder when a cc-switch profile points off-loopback", async () => {

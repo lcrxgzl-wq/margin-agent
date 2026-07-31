@@ -51,9 +51,10 @@ function hydrateKeyFromWorkspaceSettings() {
     if (key) {
       process.env.MARGIN_API_KEY = key;
       if (format === "anthropic") {
-        process.env.ANTHROPIC_API_KEY = key;
         if (process.env.MARGIN_AUTH_STYLE === "bearer") {
           process.env.ANTHROPIC_AUTH_TOKEN = key;
+        } else {
+          process.env.ANTHROPIC_API_KEY = key;
         }
       } else {
         process.env.OPENAI_API_KEY = key;
