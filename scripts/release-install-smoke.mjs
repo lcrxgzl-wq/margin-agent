@@ -84,6 +84,33 @@ try {
     );
   }
 
+  // Exercises write-file-atomic via llm-settings save (needs __filename in ESM bundle).
+  const saveSettings = await fetch(`${url.origin}/api/v1/settings/llm`, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      provider: {
+        apiFormat: "openai",
+        authStyle: "bearer",
+        baseURL: "https://example.com/v1",
+        model: "install-smoke-model",
+        apiKey: "sk-install-smoke",
+      },
+      reasoningOptIn: true,
+    }),
+  });
+  if (!saveSettings.ok) {
+    throw new Error(
+      `installed llm-settings save returned ${saveSettings.status}: ${await saveSettings.text()}\n${serverLog}`,
+    );
+  }
+  if (!fs.existsSync(path.join(workspace, ".margin", "llm-settings.json"))) {
+    throw new Error("installed llm-settings save did not write .margin/llm-settings.json");
+  }
+
   console.log(`RELEASE_INSTALL_SMOKE_OK port=${port} tarball=${tarball}`);
 } finally {
   if (child) {

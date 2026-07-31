@@ -6,6 +6,14 @@ import { build } from "esbuild";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cli = path.join(root, "apps", "cli");
 
+const ESM_SHIM = `import { createRequire } from "node:module";
+import { fileURLToPath as __marginFileURLToPath } from "node:url";
+import { dirname as __marginDirname } from "node:path";
+const require = createRequire(import.meta.url);
+const __filename = __marginFileURLToPath(import.meta.url);
+const __dirname = __marginDirname(__filename);
+`;
+
 await build({
   entryPoints: [path.join(cli, "src", "index.ts")],
   outfile: path.join(cli, "dist", "index.js"),
@@ -17,13 +25,10 @@ await build({
   // Bundle npm deps so `npm i -g` does not re-resolve broken transitive ranges
   // (e.g. @aws-sdk/core@^3.977.4 before that version exists on the registry).
   // Fastify/avvio still emit CJS dynamic require("node:*"); provide createRequire.
+  // write-file-atomic (llm-settings save) needs __filename/__dirname in ESM.
   // pdf-parse stays external: it needs @napi-rs/canvas's native DOMMatrix polyfill.
   external: ["pdf-parse"],
-  banner: {
-    js: `import { createRequire } from "node:module";
-const require = createRequire(import.meta.url);
-`,
-  },
+  banner: { js: ESM_SHIM },
   alias: {
     "@margin/agent": path.join(root, "packages", "agent", "src", "index.ts"),
     "@margin/domain": path.join(root, "packages", "domain", "src", "index.ts"),
@@ -33,22 +38,15 @@ const require = createRequire(import.meta.url);
   },
 });
 
-// Keep a single shebang + createRequire shim at the top (entry shebang must not remain).
+// Keep a single shebang + ESM shims at the top (entry shebang must not remain).
 const outfile = path.join(cli, "dist", "index.js");
 let bundled = fs.readFileSync(outfile, "utf8");
 bundled = bundled.replace(/^(?:#!\/usr\/bin\/env node\r?\n)+/, "");
 bundled = bundled.replace(
-  /^(?:import \{ createRequire \} from "node:module";\r?\nconst require = createRequire\(import\.meta\.url\);\r?\n)+/,
+  /^(?:import \{ createRequire \} from "node:module";\r?\n(?:import \{ fileURLToPath as __marginFileURLToPath \} from "node:url";\r?\n)?(?:import \{ dirname as __marginDirname \} from "node:path";\r?\n)?const require = createRequire\(import\.meta\.url\);\r?\n(?:const __filename = __marginFileURLToPath\(import\.meta\.url\);\r?\n)?(?:const __dirname = __marginDirname\(__filename\);\r?\n)?)+/,
   "",
 );
-fs.writeFileSync(
-  outfile,
-  `#!/usr/bin/env node
-import { createRequire } from "node:module";
-const require = createRequire(import.meta.url);
-
-${bundled}`,
-);
+fs.writeFileSync(outfile, `#!/usr/bin/env node\n${ESM_SHIM}\n${bundled}`);
 
 const copyDirectory = (source, destination) => {
   fs.rmSync(destination, { recursive: true, force: true });

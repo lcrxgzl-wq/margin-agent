@@ -85,6 +85,9 @@ if (leakedWorkspaceDependency) {
 const bundle = fs.readFileSync(path.join(cli, "dist", "index.js"), "utf8");
 if (!bundle.startsWith("#!/usr/bin/env node\n")) throw new Error("release CLI is missing its shebang");
 if (bundle.slice(22).startsWith("#!/usr/bin/env node")) throw new Error("release CLI has duplicate shebangs");
+if (!bundle.includes("const __filename = __marginFileURLToPath(import.meta.url)")) {
+  throw new Error("release CLI is missing __filename ESM shim (write-file-atomic / llm-settings save)");
+}
 if (/from\s+["']@margin\//.test(bundle)) throw new Error("release bundle contains @margin runtime imports");
 
 console.log(`RELEASE_PACKAGE_GATE_OK files=${entries.length} bytes=${fs.statSync(tarballPath).size}`);
