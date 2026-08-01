@@ -499,18 +499,40 @@ function Workspace() {
   };
   const threadAnchorAlive = !activeThread || selectionAnchorAlive(activeThread.anchor, store.blocks);
   // Stable handler: Canvas memo can cache-hit across App renders; only storeRef is fresh.
-  const onCanvasSelectionChange = useCallback((event: SelectionInput & { programmaticThreadId?: string }) => {
+  const onCanvasSelectionChange = useCallback((event: SelectionInput & {
+    programmaticThreadId?: string;
+    userInitiated?: boolean;
+  }) => {
     const current = storeRef.current;
-    const { programmaticThreadId, ...selection } = event;
-    translationRequestRef.current += 1;
-    setTranslation(null);
+    const { programmaticThreadId, userInitiated = false, ...selection } = event;
+    const sameSelection = Boolean(
+      current.selection.blockId &&
+      selection.blockId &&
+      sameSelectionIdentity({
+        blockId: current.selection.blockId,
+        selectionText: current.selection.text,
+        selectionStart: current.selection.selectionStart,
+        selectionRanges: current.selection.selectionRanges,
+        tableCell: current.selection.tableCell,
+      }, {
+        blockId: selection.blockId,
+        selectionText: selection.text,
+        selectionStart: selection.selectionStart,
+        selectionRanges: selection.selectionRanges,
+        tableCell: selection.tableCell,
+      }),
+    );
+    if (!sameSelection && (userInitiated || !selection.anchor || !selection.text.trim())) {
+      translationRequestRef.current += 1;
+      setTranslation(null);
+    }
     const openThread = current.activeThreadId
       ? current.threads.find((candidate) => candidate.id === current.activeThreadId)
       : null;
     if (
-      programmaticThreadId &&
-      openThread?.id === programmaticThreadId &&
-      !openThread.collapsed
+      openThread &&
+      !openThread.collapsed &&
+      (programmaticThreadId === openThread.id || !userInitiated)
     ) {
       current.setSelection({
         blockId: openThread.anchor.blockId,

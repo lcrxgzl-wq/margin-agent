@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { generateProposal, streamDiscuss } from "./index.js";
+import { generateProposal, streamDiscuss, translateSelection } from "./index.js";
 import { configureRequestPolicy, type ModelUsageEntry } from "./request-policy.js";
 
 const ENV_KEYS = [
@@ -99,6 +99,29 @@ describe("bounded completion adapter", () => {
       blockId: "b1",
       after: "Revised paragraph.",
     });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("returns a single-shot translation without proposal or tool instructions", async () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_BASE_URL = "https://provider.test/v1";
+    process.env.MARGIN_API_KEY = "secret";
+    process.env.MARGIN_MODEL = "model-a";
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        messages: Array<{ role: string; content: string }>;
+      };
+      expect(body.messages[0]?.content).toContain("只输出译文");
+      expect(body.messages[1]?.content).toContain("规范的学术英语");
+      expect(body.messages[1]?.content).toContain("选区：原文");
+      expect(body).not.toHaveProperty("tools");
+      expect(body).not.toHaveProperty("response_format");
+      return Response.json({ choices: [{ message: { content: "  Translated text.  " } }] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(translateSelection({ text: "原文", targetLanguage: "en" }))
+      .resolves.toBe("Translated text.");
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 

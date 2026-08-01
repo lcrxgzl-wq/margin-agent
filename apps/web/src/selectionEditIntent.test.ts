@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { inferTranslationTarget, selectionEditIntent, translateAssistInstruction } from "./selectionEditIntent";
+import { inferTranslationTarget, selectionEditIntent } from "./selectionEditIntent";
 
 describe("selectionEditIntent", () => {
   it("routes concise translation and polishing commands to direct edits", () => {
@@ -16,17 +16,5 @@ describe("selectionEditIntent", () => {
   it("infers the opposite working language", () => {
     expect(inferTranslationTarget("This is an English sentence.")).toBe("zh-CN");
     expect(inferTranslationTarget("这是一段中文。" )).toBe("en");
-  });
-
-  it("keeps the assist-translate instruction inert to edit triggers", () => {
-    expect(translateAssistInstruction("en")).toContain("学术英语");
-    expect(translateAssistInstruction("zh-CN")).toContain("简体中文");
-    for (const text of [translateAssistInstruction("en"), translateAssistInstruction("zh-CN")]) {
-      expect(text).toContain("不写入正文");
-      // Must not re-trigger selectionEditIntent (→ rewrite proposal) or the
-      // offline planner's 重写|润色|改写|修订 branch (→ mock proposals).
-      expect(selectionEditIntent(text, "选区文本")).toBeNull();
-      expect(/重写|润色|改写|修订/.test(text)).toBe(false);
-    }
   });
 });

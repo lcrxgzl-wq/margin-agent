@@ -40,6 +40,7 @@ export type CanvasProps = {
     tableCell?: TableCellSelection;
     anchor?: { x: number; y: number } | null;
     programmaticThreadId?: string;
+    userInitiated?: boolean;
   }) => void;
   onContextMenu: (info: {
     x: number;

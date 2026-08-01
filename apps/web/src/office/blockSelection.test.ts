@@ -126,6 +126,21 @@ describe("precise Office selection ranges", () => {
     { id: "c", kind: "paragraph", text: "tail kept", order: 2, contentHash: "c" },
   ] as Block[];
 
+  it("ignores a phantom trailing paragraph when a paragraph-start selection has one fragment", () => {
+    const indexed = [
+      { id: "ooxml-p-3-heading", kind: "paragraph", text: "Abstract", order: 0, contentHash: "h" },
+      { id: "ooxml-p-4-body", kind: "paragraph", text: "Paragraph starts here and continues.", order: 1, contentHash: "b" },
+      { id: "ooxml-p-5-keywords", kind: "paragraph", text: "Keywords", order: 2, contentHash: "k" },
+    ] as Block[];
+    expect(resolveOfficeBlocksForRange(
+      createOfficeBlockResolver(indexed),
+      { startParagraphNo: 4, endParagraphNo: 5 },
+      "Paragraph starts here",
+      "Paragraph starts here and continues.",
+      ["Paragraph starts here and continues."],
+    )).toEqual({ blockId: "ooxml-p-4-body", blockIds: undefined });
+  });
+
   it("splits cross-paragraph canvas elements at paragraph sentinels", () => {
     expect(splitOfficeSelectionParagraphs([
       { value: "same" },

@@ -40,8 +40,9 @@ export function resolveOfficeBlocksForRange(
   ) {
     const fragment = paragraphSelections[index];
     // Empty OOXML paragraphs are intentionally absent from the immutable block
-    // list. Resolving them by ordinal aliases a later, non-empty block.
-    if (!fragment.trim()) continue;
+    // list. Canvas-editor can also report a phantom trailing paragraph without
+    // a fragment. Resolving either by ordinal aliases a later, non-empty block.
+    if (!fragment?.trim()) continue;
     const id = resolve({
       paragraphNo,
       isTable: context.isTable,

@@ -1,6 +1,6 @@
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
-import { memo, useEffect, useMemo } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import type { Block, Comment, Proposal } from "../api";
 import { MarginBlock } from "../extensions/MarginBlock";
 import { blocksToDocJson, findBlockIdNearSelection, findBlockIdsInSelection } from "../doc";
@@ -22,6 +22,7 @@ function MarkdownCanvasView({
   onDirtyChange,
   onSaveHandlerChange,
 }: CanvasProps) {
+  const userSelectionInputRef = useRef(false);
   const byBlock = useMemo(() => {
     const m = new Map<string, Proposal[]>();
     for (const p of proposals) {
@@ -60,6 +61,22 @@ function MarkdownCanvasView({
     editorProps: {
       attributes: { class: "prose-canvas" },
       handleDOMEvents: {
+        pointerdown: () => {
+          userSelectionInputRef.current = true;
+          return false;
+        },
+        pointerup: () => {
+          window.setTimeout(() => { userSelectionInputRef.current = false; }, 0);
+          return false;
+        },
+        keydown: () => {
+          userSelectionInputRef.current = true;
+          return false;
+        },
+        keyup: () => {
+          userSelectionInputRef.current = false;
+          return false;
+        },
         contextmenu: (view, event) => {
           event.preventDefault();
           const { from, to } = view.state.selection;
@@ -77,7 +94,7 @@ function MarkdownCanvasView({
         },
       },
     },
-    onSelectionUpdate: ({ editor: ed }) => {
+    onSelectionUpdate: ({ editor: ed, transaction }) => {
       const { from, to, empty } = ed.state.selection;
       const text = empty ? "" : ed.state.doc.textBetween(from, to, "\n");
       const blockId = findBlockIdNearSelection(ed.state.doc, from, to);
@@ -103,9 +120,26 @@ function MarkdownCanvasView({
         text,
         rawText: text,
         anchor,
+        userInitiated: userSelectionInputRef.current || transaction.getMeta("pointer") === true,
       });
     },
   });
+
+  useEffect(() => {
+    const resetUserSelectionInput = () => {
+      window.setTimeout(() => { userSelectionInputRef.current = false; }, 0);
+    };
+    window.addEventListener("pointerup", resetUserSelectionInput);
+    window.addEventListener("pointercancel", resetUserSelectionInput);
+    window.addEventListener("keyup", resetUserSelectionInput);
+    window.addEventListener("blur", resetUserSelectionInput);
+    return () => {
+      window.removeEventListener("pointerup", resetUserSelectionInput);
+      window.removeEventListener("pointercancel", resetUserSelectionInput);
+      window.removeEventListener("keyup", resetUserSelectionInput);
+      window.removeEventListener("blur", resetUserSelectionInput);
+    };
+  }, []);
 
   useEffect(() => {
     if (!editor) return;

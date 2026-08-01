@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent } from "react";
 import type { Comment, Proposal } from "../api";
 import { submitEnterFrom } from "../ime";
+import { defaultThreadFloatRect } from "../layoutGeometry";
 import { proposalChange } from "../proposalChange";
 import type { ReviewThread } from "../store";
 import type { ChatMessage } from "./Chat";
@@ -153,6 +154,10 @@ export function ThreadPopover({
   const [draft, setDraft] = useState("");
   const [drag, setDrag] = useState<{ dx: number; dy: number } | null>(null);
   const [size, setSize] = useState<{ width: number; height: number } | null>(null);
+  const [viewport, setViewport] = useState(() => ({
+    width: window.innerWidth,
+    height: window.innerHeight,
+  }));
   const dragRef = useRef<{ pointerId: number; startX: number; startY: number; baseLeft: number; baseTop: number } | null>(null);
   const resizeRef = useRef<{ pointerId: number; startX: number; startY: number; baseWidth: number; baseHeight: number } | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -160,20 +165,14 @@ export function ThreadPopover({
   const excerpt = thread.anchor.tableCell?.before ?? thread.anchor.selectionText;
 
   const position = useMemo(() => {
-    const viewport = { width: window.innerWidth, height: window.innerHeight };
-    const anchor = thread.pos;
-    const left = anchor
-      ? Math.min(Math.max(12, anchor.x - POPOVER_WIDTH / 2), Math.max(12, viewport.width - POPOVER_WIDTH - 12))
-      : Math.max(12, viewport.width - POPOVER_WIDTH - 56);
-    const preferredTop = anchor ? anchor.y + 18 : 96;
-    const top = Math.min(preferredTop, Math.max(12, viewport.height - 160));
-    const maxHeight = Math.max(220, viewport.height - top - 16);
-    return { left, top, maxHeight };
-  }, [thread.pos]);
+    return defaultThreadFloatRect(thread.pos, viewport);
+  }, [thread.pos, viewport]);
 
   const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), Math.max(min, max));
-  const left = clamp(position.left + (drag?.dx ?? 0), 8, window.innerWidth - 96);
-  const top = clamp(position.top + (drag?.dy ?? 0), 8, window.innerHeight - 96);
+  const activeWidth = Math.min(size?.width ?? position.width, Math.max(0, viewport.width - 16));
+  const activeHeight = Math.min(size?.height ?? position.height, Math.max(0, viewport.height - 16));
+  const left = clamp(position.x + (drag?.dx ?? 0), 8, viewport.width - activeWidth - 8);
+  const top = clamp(position.y + (drag?.dy ?? 0), 8, viewport.height - activeHeight - 8);
 
   const onHeadPointerDown = (event: PointerEvent<HTMLElement>) => {
     if (event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
@@ -184,8 +183,8 @@ export function ThreadPopover({
     const active = dragRef.current;
     if (!active || active.pointerId !== event.pointerId) return;
     setDrag({
-      dx: active.baseLeft + (event.clientX - active.startX) - position.left,
-      dy: active.baseTop + (event.clientY - active.startY) - position.top,
+      dx: active.baseLeft + (event.clientX - active.startX) - position.x,
+      dy: active.baseTop + (event.clientY - active.startY) - position.y,
     });
   };
   const onHeadPointerEnd = (event: PointerEvent<HTMLElement>) => {
@@ -209,8 +208,16 @@ export function ThreadPopover({
     const active = resizeRef.current;
     if (!active || active.pointerId !== event.pointerId) return;
     setSize({
-      width: clamp(active.baseWidth + (event.clientX - active.startX), MIN_SIZE.width, window.innerWidth - 24),
-      height: clamp(active.baseHeight + (event.clientY - active.startY), MIN_SIZE.height, window.innerHeight - 24),
+      width: clamp(
+        active.baseWidth + (event.clientX - active.startX),
+        Math.min(MIN_SIZE.width, viewport.width - left - 8),
+        viewport.width - left - 8,
+      ),
+      height: clamp(
+        active.baseHeight + (event.clientY - active.startY),
+        Math.min(MIN_SIZE.height, viewport.height - top - 8),
+        viewport.height - top - 8,
+      ),
     });
   };
   const onResizePointerEnd = (event: PointerEvent<HTMLDivElement>) => {
@@ -221,6 +228,15 @@ export function ThreadPopover({
     setDrag(null);
     setSize(null);
   }, [thread.id]);
+
+  useEffect(() => {
+    const updateViewport = () => setViewport({
+      width: window.innerWidth,
+      height: window.innerHeight,
+    });
+    window.addEventListener("resize", updateViewport);
+    return () => window.removeEventListener("resize", updateViewport);
+  }, []);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -256,9 +272,8 @@ export function ThreadPopover({
         style={{
           left,
           top,
-          maxHeight: size ? undefined : position.maxHeight,
-          width: size?.width,
-          height: size?.height,
+          width: activeWidth,
+          height: activeHeight,
         }}
       >
         <header

@@ -210,6 +210,12 @@ async function main() {
     await inboxThread.waitFor({ state: "visible", timeout: 10_000 });
     await inboxThread.click();
     await secondPage.locator(".thread-popover").waitFor({ state: "visible", timeout: 10_000 });
+    const restoredCanvasState = await secondPage.locator(".office-editor").evaluate((element) =>
+      Reflect.get(element, "__marginOfficeDiagnostics")?.() ?? null);
+    invariant(
+      restoredCanvasState && restoredCanvasState.dirty === false,
+      `restoring pending marks dirtied the canvas: ${JSON.stringify(restoredCanvasState)}`,
+    );
 
     invariant(
       await secondPage.locator('.thread-popover .thread-message[data-role="user"]', { hasText: question }).count() === 1,
@@ -230,14 +236,49 @@ async function main() {
     const restoredComposer = secondPage.locator(".thread-popover .thread-composer textarea");
     const assistantCount = await secondPage.locator('.thread-popover .thread-message[data-role="assistant"]').count();
     await restoredComposer.fill(continuedQuestion);
-    await secondPage.locator(".thread-popover .thread-send").click();
-    await secondPage.waitForFunction((count) => {
-      const input = document.querySelector(".thread-popover .thread-composer textarea");
-      return Boolean(input && !input.disabled &&
-        document.querySelectorAll('.thread-popover .thread-message[data-role="assistant"]').length > count);
-    }, assistantCount, { timeout: 30_000 });
+    const restoredSend = secondPage.locator(".thread-popover .thread-send");
+    invariant(!(await restoredSend.isDisabled()), "restored thread send button stayed disabled after input");
+    const preSendCanvasState = await secondPage.locator(".office-editor").evaluate((element) =>
+      Reflect.get(element, "__marginOfficeDiagnostics")?.() ?? null);
+    invariant(
+      preSendCanvasState && preSendCanvasState.dirty === false,
+      `restored canvas became dirty before thread send: ${JSON.stringify(preSendCanvasState)}`,
+    );
+    const dialogs = [];
+    const onDialog = async (dialog) => {
+      dialogs.push(dialog.message());
+      await dialog.dismiss();
+    };
+    secondPage.on("dialog", onDialog);
+    await restoredSend.click();
+    try {
+      await secondPage.locator('.thread-popover .thread-message[data-role="user"]', { hasText: continuedQuestion })
+        .waitFor({ state: "visible", timeout: 5_000 });
+      await secondPage.waitForFunction((count) => {
+        const input = document.querySelector(".thread-popover .thread-composer textarea");
+        return Boolean(input && !input.disabled &&
+          document.querySelectorAll('.thread-popover .thread-message[data-role="assistant"]').length > count);
+      }, assistantCount, { timeout: 30_000 });
+    } catch (error) {
+      const popoverPresent = await secondPage.locator(".thread-popover").count() > 0;
+      const diagnostics = {
+        popoverPresent,
+        composerDisabled: popoverPresent ? await restoredComposer.isDisabled() : null,
+        threadText: await secondPage.locator(".thread-popover").textContent().catch(() => null),
+        globalLast: await secondPage.locator(".chat-activity .bubble.assistant").last().textContent().catch(() => null),
+        railDots: await secondPage.locator(".anchor-rail .anchor-dot").count(),
+        inboxThreads: await secondPage.locator(".review-thread-item").count(),
+        dialogs,
+        canvas: await secondPage.locator(".office-editor").evaluate((element) =>
+          Reflect.get(element, "__marginOfficeDiagnostics")?.() ?? null).catch(() => null),
+        cli: server.output(),
+      };
+      throw new Error(`continued thread reply timed out: ${JSON.stringify(diagnostics)}`, { cause: error });
+    } finally {
+      secondPage.off("dialog", onDialog);
+    }
 
-    await secondPage.locator(".thread-popover .review-actions button").filter({ hasText: "N 撤回" }).click();
+    await secondPage.locator(".thread-popover .review-actions button").filter({ hasText: "N 拒绝" }).click();
     await secondPage.locator(".thread-popover").waitFor({ state: "detached", timeout: 30_000 });
     await waitFor(async () => {
       const pending = await secondApi.request(

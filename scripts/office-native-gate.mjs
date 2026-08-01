@@ -499,21 +499,13 @@ async function main() {
         bubbleLabels.some((label) => /^译[中英]$/.test(label)),
       `selection bubble did not converge to anchored-thread actions: ${JSON.stringify(bubbleLabels)}`,
     );
-    // Translation is a writing aid shown inside the thread window — it must
-    // never enter the proposal pipeline or touch the document.
+    // Translation is a single-shot writing aid. It must stay outside the Agent
+    // thread/proposal pipeline and must not touch the document.
     await page.locator(".sel-bubble button").filter({ hasText: /^译[中英]$/ }).click();
-    await page.locator(".thread-popover").waitFor({ state: "visible", timeout: 10_000 });
-    await page.locator('.thread-popover .thread-message[data-role="user"]').filter({ hasText: "译成" })
-      .waitFor({ state: "visible", timeout: 5_000 });
-    await page.waitForFunction(() => {
-      const composer = document.querySelector(".thread-popover .thread-composer textarea");
-      const replies = [...document.querySelectorAll('.thread-popover .thread-message[data-role="assistant"]')];
-      const reply = replies.at(-1);
-      return Boolean(
-        composer && !composer.disabled && reply?.textContent &&
-          reply.textContent.trim().length > 2 && reply.textContent.trim() !== "…",
-      );
-    }, undefined, { timeout: 30_000 });
+    const translationPopover = page.locator(".translation-popover");
+    await translationPopover.waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator(".translation-body p").waitFor({ state: "visible", timeout: 30_000 });
+    invariant(await page.locator(".thread-popover").count() === 0, "single-shot translation created an Agent thread");
     const proposalsAfterTranslate = await apiJson(baseUrl, token, `/api/v1/documents/${chat.opened.document.id}/proposals?status=proposed`);
     invariant(
       !proposalsAfterTranslate.proposals.some((proposal) => proposal.operation?.kind === "translate"),
@@ -524,8 +516,8 @@ async function main() {
       blocksAfterTranslate.blocks.find((block) => block.id === translationBlock.id)?.text === translationBlock.text,
       "assist translation changed the document",
     );
-    await page.locator(".thread-backdrop").click({ position: { x: 8, y: 8 } });
-    await page.locator(".thread-popover").waitFor({ state: "detached", timeout: 5_000 });
+    await page.getByRole("button", { name: "关闭翻译" }).click();
+    await translationPopover.waitFor({ state: "detached", timeout: 5_000 });
     // Rewrite keeps the structured-proposal path: accept + idempotent replay coverage stays.
     const rewriteRange = await page.locator(".office-editor").evaluate((element, selection) => {
       return Reflect.get(element, "__marginOfficeTestSelect")?.(selection, 0) ?? null;

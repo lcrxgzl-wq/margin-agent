@@ -82,6 +82,7 @@ type SelectionInfo = {
   crossTableCells?: boolean;
   anchor?: { x: number; y: number } | null;
   programmaticThreadId?: string;
+  userInitiated?: boolean;
 };
 
 type Props = {
@@ -486,13 +487,13 @@ export function OfficeCanvas(props: Props) {
     editor.command.executePageScale(scale);
   }, []);
 
-  const emitSelection = useCallback((programmaticThreadId?: string) => {
+  const emitSelection = useCallback((programmaticThreadId?: string, userInitiated = false) => {
     if (programmaticRevealRef.current) return;
     const editor = editorRef.current;
     if (!editor) return;
     const context = editor.command.getRangeContext();
     if (!context) {
-      onSelectionChangeRef.current({ blockId: null, text: "", anchor: null });
+      onSelectionChangeRef.current({ blockId: null, text: "", anchor: null, userInitiated });
       return;
     }
     const text = context.selectionText ?? editor.command.getRangeText() ?? "";
@@ -582,6 +583,7 @@ export function OfficeCanvas(props: Props) {
       crossTableCells,
       anchor: text.trim() ? rangeAnchor ?? lastPointerRef.current : null,
       programmaticThreadId,
+      userInitiated,
     });
   }, []);
 
@@ -723,7 +725,7 @@ export function OfficeCanvas(props: Props) {
       return { marks, text: editor.command.getText().main };
     });
     editorRef.current = editor;
-    const onHostMouseUp = () => window.setTimeout(emitSelection, 0);
+    const onHostMouseUp = () => window.setTimeout(() => emitSelection(undefined, true), 0);
     host.addEventListener("mouseup", onHostMouseUp);
     editor.listener.contentChange = () => {
       contentChangeCountRef.current += 1;
@@ -1603,9 +1605,9 @@ export function OfficeCanvas(props: Props) {
           className="office-canvas-scroll"
           onPointerUp={(event) => {
             lastPointerRef.current = { x: event.clientX, y: event.clientY };
-            window.setTimeout(emitSelection, 0);
+            window.setTimeout(() => emitSelection(undefined, true), 0);
           }}
-          onKeyUp={() => window.setTimeout(emitSelection, 0)}
+          onKeyUp={() => window.setTimeout(() => emitSelection(undefined, true), 0)}
           onScroll={() => window.requestAnimationFrame(() => emitSelection())}
           onContextMenu={handleContextMenu}
         >

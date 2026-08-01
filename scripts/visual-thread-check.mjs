@@ -86,9 +86,13 @@ try {
     body: JSON.stringify({ message: `"${path.join(workspace, path.basename(sourceDocx))}"` }),
   });
   const block = chat.opened.blocks.find((candidate) =>
+    candidate.kind !== "table" && candidate.text.startsWith("Urban project scopes"),
+  ) ?? chat.opened.blocks.find((candidate) =>
     candidate.kind !== "table" && /[A-Za-z]{4}/.test(candidate.text) && candidate.text.length > 32,
   );
-  const selection = /[A-Za-z][A-Za-z\s,.'()\-]{24,72}/.exec(block.text)[0].trim();
+  // Keep this anchored at offset 0: canvas-editor can report a phantom extra
+  // paragraph for selections that begin at the first character.
+  const selection = block.text.slice(0, 72).trimEnd();
 
   browser = await chromium.launch({ executablePath: edgePath, headless: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, deviceScaleFactor: 2 });
@@ -100,9 +104,33 @@ try {
   const selectText = (query) => page.locator(".office-editor").evaluate((element, target) => {
     return Reflect.get(element, "__marginOfficeTestSelect")?.(target, 0) ?? null;
   }, query);
+  const assertViewportContained = async (locator, label) => {
+    const box = await locator.boundingBox();
+    const viewport = page.viewportSize();
+    if (
+      !box
+      || !viewport
+      || box.x < -1
+      || box.y < -1
+      || box.x + box.width > viewport.width + 1
+      || box.y + box.height > viewport.height + 1
+    ) {
+      throw new Error(
+        `${label} must remain fully inside the viewport: `
+        + `box=${JSON.stringify(box)}, viewport=${JSON.stringify(viewport)}`,
+      );
+    }
+  };
 
   // 1. Selection bubble
   await selectText(selection);
+  const selectionY = await page.locator(".office-editor").evaluate((element) => {
+    return Reflect.get(element, "__marginOfficeDiagnostics")?.().context?.rangeRects?.[0]?.y ?? 0;
+  });
+  await page.locator(".office-canvas-scroll").evaluate((element, targetY) => {
+    element.scrollTop = Math.max(0, targetY - element.clientHeight / 3);
+  }, selectionY);
+  await page.waitForTimeout(200);
   await page.locator(".sel-bubble").waitFor({ state: "visible", timeout: 10_000 });
   const bubbleBox = await page.locator(".sel-bubble").boundingBox();
   if (!bubbleBox) throw new Error("Selection bubble has no measurable position.");
@@ -110,9 +138,80 @@ try {
   await page.waitForTimeout(300);
   await page.screenshot({ path: path.join(outDir, "01-bubble.png") });
 
-  // 2. Discussion thread popover
+  // 2. Single-shot translation keeps the draggable/resizable floating-window workflow.
+  await page.getByRole("button", { name: /^译[英中]$/ }).click();
+  const translationPopover = page.locator(".translation-popover");
+  await translationPopover.waitFor({ state: "visible", timeout: 10_000 });
+  await page.locator(".translation-body p").waitFor({ state: "visible", timeout: 10_000 });
+  if (await page.locator(".thread-popover").count()) {
+    throw new Error("Single-shot translation must not create an Agent thread.");
+  }
+  const initialTranslationBox = await translationPopover.boundingBox();
+  const translationHeadBox = await page.locator(".translation-heading").boundingBox();
+  if (!initialTranslationBox || !translationHeadBox) {
+    throw new Error("Translation popover has no measurable position.");
+  }
+  const dragX = initialTranslationBox.x > 400 ? -80 : 80;
+  const dragY = initialTranslationBox.y > 400 ? -60 : 60;
+  await page.mouse.move(translationHeadBox.x + 48, translationHeadBox.y + translationHeadBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(translationHeadBox.x + 48 + dragX, translationHeadBox.y + translationHeadBox.height / 2 + dragY, { steps: 6 });
+  await page.mouse.up();
+  const draggedTranslationBox = await translationPopover.boundingBox();
+  if (!draggedTranslationBox || Math.abs(draggedTranslationBox.x - initialTranslationBox.x) < 30) {
+    throw new Error("Translation popover must move when its header is dragged.");
+  }
+  const resizeBox = await page.locator(".translation-resize").boundingBox();
+  if (!resizeBox) throw new Error("Translation popover resize handle is missing.");
+  await page.mouse.move(resizeBox.x + resizeBox.width / 2, resizeBox.y + resizeBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(resizeBox.x + resizeBox.width / 2 - 60, resizeBox.y + resizeBox.height / 2 - 10, { steps: 6 });
+  await page.mouse.up();
+  const resizedTranslationBox = await translationPopover.boundingBox();
+  if (!resizedTranslationBox || initialTranslationBox.width - resizedTranslationBox.width < 30) {
+    throw new Error("Translation popover must resize from its lower-right handle.");
+  }
+  await page.waitForTimeout(200);
+  await page.screenshot({ path: path.join(outDir, "02-translation-floating.png") });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(200);
+  await assertViewportContained(translationPopover, "Translation popover after viewport resize");
+  await page.screenshot({ path: path.join(outDir, "02-translation-mobile.png") });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.waitForTimeout(200);
+  await page.getByRole("button", { name: "关闭翻译" }).click();
+  await translationPopover.waitFor({ state: "detached", timeout: 5_000 });
+  await page.locator(".sel-bubble").waitFor({ state: "visible", timeout: 5_000 });
+
+  // 3. Discussion thread popover
   await page.locator(".sel-bubble button").filter({ hasText: "讨论" }).click();
-  await page.locator(".thread-popover").waitFor({ state: "visible", timeout: 10_000 });
+  const threadPopover = page.locator(".thread-popover");
+  await threadPopover.waitFor({ state: "visible", timeout: 10_000 });
+  const initialThreadBox = await threadPopover.boundingBox();
+  const threadHeadBox = await page.locator(".thread-head").boundingBox();
+  if (!initialThreadBox || !threadHeadBox) {
+    throw new Error("Thread popover has no measurable position.");
+  }
+  const threadDragX = initialThreadBox.x > 400 ? -60 : 60;
+  const threadDragY = initialThreadBox.y > 400 ? -40 : 40;
+  await page.mouse.move(threadHeadBox.x + 80, threadHeadBox.y + threadHeadBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(threadHeadBox.x + 80 + threadDragX, threadHeadBox.y + threadHeadBox.height / 2 + threadDragY, { steps: 6 });
+  await page.mouse.up();
+  const draggedThreadBox = await threadPopover.boundingBox();
+  if (!draggedThreadBox || Math.abs(draggedThreadBox.x - initialThreadBox.x) < 30) {
+    throw new Error("Thread popover must move when its header is dragged.");
+  }
+  const threadResizeBox = await page.locator(".thread-resize").boundingBox();
+  if (!threadResizeBox) throw new Error("Thread popover resize handle is missing.");
+  await page.mouse.move(threadResizeBox.x + threadResizeBox.width / 2, threadResizeBox.y + threadResizeBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(threadResizeBox.x + threadResizeBox.width / 2 - 50, threadResizeBox.y + threadResizeBox.height / 2 - 30, { steps: 6 });
+  await page.mouse.up();
+  const resizedThreadBox = await threadPopover.boundingBox();
+  if (!resizedThreadBox || initialThreadBox.width - resizedThreadBox.width < 25) {
+    throw new Error("Thread popover must resize from its lower-right handle.");
+  }
   const composer = page.locator(".thread-popover .thread-composer textarea");
   await composer.fill("这段的论证风险是什么？");
   await page.locator(".thread-popover .thread-send").click();
@@ -128,6 +227,12 @@ try {
   }
   await page.waitForTimeout(300);
   await page.screenshot({ path: path.join(outDir, "02-thread-discussion.png") });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(200);
+  await assertViewportContained(threadPopover, "Thread popover after viewport resize");
+  await page.screenshot({ path: path.join(outDir, "02-thread-mobile.png") });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.waitForTimeout(200);
 
   // 3. Proposal card inside the same thread
   await composer.fill("译成英文");
@@ -156,8 +261,9 @@ try {
     throw new Error("Collapsed thread anchor must remain beside its original selection.");
   }
   const scrolledBy = await page.locator(".office-canvas-scroll").evaluate((element) => {
-    element.scrollTop = 120;
-    return element.scrollTop;
+    const before = element.scrollTop;
+    element.scrollTop = before + 120;
+    return element.scrollTop - before;
   });
   await page.waitForTimeout(120);
   const scrolledAnchorDotBox = await anchorDot.boundingBox();
