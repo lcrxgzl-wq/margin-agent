@@ -19,7 +19,15 @@ import {
   X,
 } from "lucide-react";
 import { ATTENTION_COPY, attentionMode } from "../attention";
-import { listSkills, type AgentTask, type Comment, type Proposal, type SkillSummary } from "../api";
+import type { ReviewChecklistItem } from "@margin/domain";
+import {
+  listSkills,
+  type AgentTask,
+  type Comment,
+  type Proposal,
+  type ReviewChecklistBundle,
+  type SkillSummary,
+} from "../api";
 import type { CascadeCandidate, ReviewThread } from "../store";
 import { CascadeCard } from "./CascadeCard";
 import { hasMarkdown, Markdown } from "./Markdown";
@@ -29,6 +37,7 @@ import { SourcePicker } from "./SourcePicker";
 import { mentionableSkills } from "../extensionsModel";
 import { submitEnterFrom } from "../ime";
 import { formatElapsedTime } from "../sessionTime";
+import { checklistOpenCount } from "../reviewChecklists";
 
 export type ChatMessage = {
   id: string;
@@ -71,6 +80,7 @@ type Props = {
   onActivityChange?: (activity: "chat" | "review") => void;
   proposals?: Proposal[];
   comments?: Comment[];
+  checklists?: ReviewChecklistBundle[];
   documentDirty?: boolean;
   reviewError?: string | null;
   reviewBusy?: boolean;
@@ -82,6 +92,12 @@ type Props = {
   threads?: ReviewThread[];
   activeThreadId?: string | null;
   onOpenThread?: (thread: ReviewThread) => void;
+  onChecklistDecision?: (
+    runId: string,
+    itemIds: string[],
+    kind: "resolve" | "dismiss",
+  ) => Promise<void>;
+  onLocateChecklistItem?: (item: ReviewChecklistItem) => void;
   onHeaderPointerDown?: (event: React.PointerEvent<HTMLElement>) => void;
   themeMode?: "light" | "dark" | "system";
   onThemeModeChange?: (mode: "light" | "dark" | "system") => void;
@@ -118,6 +134,7 @@ export function Chat({
   onActivityChange,
   proposals = [],
   comments = [],
+  checklists = [],
   documentDirty = false,
   reviewError,
   reviewBusy = false,
@@ -129,6 +146,8 @@ export function Chat({
   threads = [],
   activeThreadId,
   onOpenThread,
+  onChecklistDecision,
+  onLocateChecklistItem,
   onHeaderPointerDown,
   themeMode,
   onThemeModeChange,
@@ -150,6 +169,7 @@ export function Chat({
   });
   const AttentionIcon = attention === "global" ? Globe : attention === "mixed" ? Layers : Crosshair;
   const attentionHint = ATTENTION_COPY[attention].hint;
+  const reviewCount = proposals.length + checklistOpenCount(checklists);
 
   useEffect(() => {
     if (followTail.current || messages.at(-1)?.role === "user") {
@@ -343,7 +363,7 @@ export function Chat({
       {!landing && onActivityChange ? (
         <div className="activity-tabs" role="tablist" aria-label="工作区侧栏">
           <button type="button" role="tab" aria-selected={activity === "chat"} className={activity === "chat" ? "active" : ""} onClick={() => onActivityChange("chat")}><MessageSquare />对话</button>
-          <button type="button" role="tab" aria-selected={activity === "review"} className={activity === "review" ? "active" : ""} onClick={() => onActivityChange("review")}><ListChecks />审阅{proposals.length ? <b>{proposals.length}</b> : null}</button>
+          <button type="button" role="tab" aria-selected={activity === "review"} className={activity === "review" ? "active" : ""} onClick={() => onActivityChange("review")}><ListChecks />审阅{reviewCount ? <b>{reviewCount}</b> : null}</button>
         </div>
       ) : null}
 
@@ -390,6 +410,7 @@ export function Chat({
             <ReviewPanel
               proposals={proposals}
               comments={comments}
+              checklists={checklists}
               documentId={documentId}
               busy={busy || reviewBusy}
               dirty={documentDirty}
@@ -402,6 +423,8 @@ export function Chat({
               threads={threads}
               activeThreadId={activeThreadId}
               onOpenThread={onOpenThread}
+              onChecklistDecision={onChecklistDecision ?? (async () => undefined)}
+              onLocateChecklistItem={onLocateChecklistItem ?? (() => undefined)}
             />
             </div>
           ) : null}

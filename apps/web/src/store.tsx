@@ -1,5 +1,12 @@
 import { createContext, useContext, useMemo, useReducer, useRef, type ReactNode } from "react";
-import type { Block, Comment, DocumentMeta, LlmSettingsPublic, Proposal } from "./api";
+import type {
+  Block,
+  Comment,
+  DocumentMeta,
+  LlmSettingsPublic,
+  Proposal,
+  ReviewChecklistBundle,
+} from "./api";
 import type { SelectionBlockRange } from "@margin/domain";
 import type { ChatMessage } from "./components/Chat";
 import type { TableCellSelection } from "./components/canvasTypes";
@@ -84,6 +91,7 @@ export type MarginState = {
   blocks: Block[];
   proposals: Proposal[];
   comments: Comment[];
+  checklists: ReviewChecklistBundle[];
   llm: LlmSettingsPublic | null;
   selection: Selection;
   menu: ContextMenu | null;
@@ -115,6 +123,7 @@ type Action =
   | { type: "clearDocument" }
   | { type: "setProposals"; proposals: Proposal[] }
   | { type: "setComments"; comments: Comment[] }
+  | { type: "setChecklists"; checklists: ReviewChecklistBundle[] }
   | { type: "appendMessage"; message: ChatMessage }
   | {
       type: "patchMessage";
@@ -153,6 +162,7 @@ export const initialMarginState: MarginState = {
   blocks: [],
   proposals: [],
   comments: [],
+  checklists: [],
   llm: null,
   selection: { blockId: null, text: "", anchor: null },
   menu: null,
@@ -191,6 +201,7 @@ export function marginReducer(state: MarginState, action: Action): MarginState {
         blocks: action.blocks,
         proposals: documentChanged ? [] : state.proposals,
         comments: documentChanged ? [] : state.comments,
+        checklists: revisionChanged ? [] : state.checklists,
         threads: documentChanged ? [] : state.threads,
         activeThreadId: documentChanged ? null : state.activeThreadId,
         selection: revisionChanged ? initialMarginState.selection : state.selection,
@@ -218,6 +229,7 @@ export function marginReducer(state: MarginState, action: Action): MarginState {
         blocks: [],
         proposals: [],
         comments: [],
+        checklists: [],
         selection: initialMarginState.selection,
         menu: null,
         rewritePrompt: null,
@@ -234,6 +246,8 @@ export function marginReducer(state: MarginState, action: Action): MarginState {
       return { ...state, proposals: action.proposals };
     case "setComments":
       return { ...state, comments: action.comments };
+    case "setChecklists":
+      return { ...state, checklists: action.checklists };
     case "appendMessage":
       return {
         ...state,
@@ -400,6 +414,7 @@ type MarginStore = MarginState & {
   clearDocument: () => void;
   setProposals: (proposals: Proposal[]) => void;
   setComments: (comments: Comment[]) => void;
+  setChecklists: (checklists: ReviewChecklistBundle[]) => void;
   appendMessage: (message: ChatMessage) => void;
   patchMessage: (
     id: string,
@@ -451,6 +466,7 @@ export function MarginStoreProvider({ children }: { children: ReactNode }) {
       clearDocument: () => dispatch({ type: "clearDocument" }),
       setProposals: (proposals) => dispatch({ type: "setProposals", proposals }),
       setComments: (comments) => dispatch({ type: "setComments", comments }),
+      setChecklists: (checklists) => dispatch({ type: "setChecklists", checklists }),
       appendMessage: (message) => dispatch({ type: "appendMessage", message }),
       patchMessage: (id, patch) => dispatch({ type: "patchMessage", id, patch }),
       setMessages: (messages) => dispatch({ type: "setMessages", messages }),

@@ -32,7 +32,9 @@ describe("harness", () => {
   it("defaults to social-science-zh", () => {
     expect(getHarness().id).toBe("social-science-zh");
     expect(getHarness().instructions).toContain("文档写作与修订");
+    expect(getHarness().instructions).toContain("通读策略");
     expect(getHarness().instructions).toContain("证据底线");
+    expect(getHarness().limits.maxTurns).toBe(40);
     expect(getHarness().capabilities).toContain("review.academic");
     expect(getHarness().capabilities).toContain("analysis.tabular");
   });

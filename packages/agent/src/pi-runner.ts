@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Proposal } from "@margin/domain";
 import { composeSystemPrompt, getAgentProfile } from "@margin/harness";
-import { getHeuristicComments } from "./packs/registry.js";
+import { createReviewChecklistRuns } from "./academic.js";
 import { runPiAgentLoop } from "./pi-loop.js";
 import { assertPiLoopCompleted } from "./pi-outcome.js";
 import { createPaperTools } from "./pi-tools.js";
@@ -107,22 +107,15 @@ export async function runPiBlockScan(
     notes.push("pi finished with zero proposals");
   }
 
-  const merged = [...comments];
-  const heuristicComments = getHeuristicComments(undefined, ctx.harnessId);
-  if (heuristicComments && merged.length < 3) {
-    for (const h of heuristicComments(selected, { max: 8 })) {
-      if (merged.length >= 12) break;
-      if (merged.some((c) => c.blockId === h.blockId && c.text === h.text)) continue;
-      merged.push(h);
-    }
-  }
+  const reviewChecklists = createReviewChecklistRuns(ctx.documentId, selected);
 
   emit(drafts.length ? `完成（${drafts.length} 处提案）` : "完成（无提案）");
 
   return {
     engine: "pi",
     proposals: drafts,
-    comments: merged,
+    comments,
+    reviewChecklists,
     notes: notes.length ? notes : undefined,
     steps,
     toolAudit: result.toolAudit,

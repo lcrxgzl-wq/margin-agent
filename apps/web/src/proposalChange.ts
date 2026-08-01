@@ -11,6 +11,7 @@ export type ProposalChange = {
   contextStartsMidway: boolean;
   contextEndsMidway: boolean;
   editValue: string;
+  granularityLabel?: "短语 patch" | "句级 patch";
   composeEditedText: (edited: string) => string;
 };
 
@@ -23,6 +24,10 @@ function compactContext(text: string, start: number, end: number, radius = 42) {
     contextStartsMidway: contextStart > 0,
     contextEndsMidway: contextEnd < text.length,
   };
+}
+
+export function textPatchGranularity(text: string): "短语 patch" | "句级 patch" {
+  return text.length <= 24 && !/[。！？!?；;\n]/.test(text) ? "短语 patch" : "句级 patch";
 }
 
 function changedRange(before: string, after: string) {
@@ -78,6 +83,7 @@ export function proposalChange(proposal: Proposal): ProposalChange {
       afterFragment: selection.after,
       ...compactContext(proposal.before, selection.start, selection.end),
       editValue: selection.after,
+      granularityLabel: textPatchGranularity(selection.before),
       composeEditedText: (edited) =>
         `${proposal.before.slice(0, selection.start)}${edited}${proposal.before.slice(selection.end)}`,
     };

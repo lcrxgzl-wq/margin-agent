@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import writeFileAtomic from "write-file-atomic";
 import { applyDocxParagraphEdits, applyDocxTableCellEdit, docxContentHash } from "./office-docx.js";
+import { supersedeActiveReviewChecklists } from "./checklist-store.js";
 
 export function saveProposal(ws: Workspace, proposal: Proposal): void {
   const validated = ProposalSchema.parse(proposal);
@@ -564,6 +565,7 @@ function finalizeApplyJournal(ws: Workspace, journal: ApplyJournal): void {
     }
     const supersede = ws.db.prepare(`UPDATE proposals SET status='superseded' WHERE id=?`);
     for (const proposalId of journal.proposalIds) supersede.run(proposalId);
+    supersedeActiveReviewChecklists(ws, journal.documentId);
     const insertEvent = ws.db.prepare(
       `INSERT INTO apply_events (
         id, document_id, proposal_id, decision_id, ok, reason,

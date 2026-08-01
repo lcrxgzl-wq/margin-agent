@@ -80,6 +80,7 @@ type SelectionInfo = {
   /** True when the range spans more than one table cell. */
   crossTableCells?: boolean;
   anchor?: { x: number; y: number } | null;
+  programmaticThreadId?: string;
 };
 
 type Props = {
@@ -484,7 +485,7 @@ export function OfficeCanvas(props: Props) {
     editor.command.executePageScale(scale);
   }, []);
 
-  const emitSelection = useCallback(() => {
+  const emitSelection = useCallback((programmaticThreadId?: string) => {
     if (programmaticRevealRef.current) return;
     const editor = editorRef.current;
     if (!editor) return;
@@ -538,7 +539,7 @@ export function OfficeCanvas(props: Props) {
           if (programmaticRevealGenerationRef.current !== revealGeneration) return;
           programmaticRevealRef.current = false;
           if (editorRef.current !== editor) return;
-          if (canvasRangeKey(editor.command.getRange()) !== stableRangeKey) emitSelection();
+          if (canvasRangeKey(editor.command.getRange()) !== stableRangeKey) emitSelection(programmaticThreadId);
         }));
       }
     }
@@ -578,6 +579,7 @@ export function OfficeCanvas(props: Props) {
       tableCell,
       crossTableCells,
       anchor: text.trim() ? rangeAnchor ?? lastPointerRef.current : null,
+      programmaticThreadId,
     });
   }, []);
 
@@ -993,7 +995,7 @@ export function OfficeCanvas(props: Props) {
         ) return;
         programmaticRevealRef.current = false;
         suppressDirtyRef.current = false;
-        emitSelection();
+        emitSelection(request.threadId);
       });
     });
   }, [loading, props.focusRequest, props.blocks, props.proposals, locateProposalFocusRange]);
@@ -1599,7 +1601,7 @@ export function OfficeCanvas(props: Props) {
             window.setTimeout(emitSelection, 0);
           }}
           onKeyUp={() => window.setTimeout(emitSelection, 0)}
-          onScroll={() => window.requestAnimationFrame(emitSelection)}
+          onScroll={() => window.requestAnimationFrame(() => emitSelection())}
           onContextMenu={handleContextMenu}
         >
           {loading ? <div className="office-loading">正在解析 DOCX 与分页…</div> : null}

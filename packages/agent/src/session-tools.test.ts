@@ -48,6 +48,68 @@ describe("open_document", () => {
     expect(bag.relativePath).toBe("paper.docx");
     expect(bag.blocks).toHaveLength(1);
   });
+
+  it("invalidates a prior source read for the same path after opening it", async () => {
+    const bag: SessionDocBag = { revision: 0, blocks: [] };
+    let text = "old";
+    let reads = 0;
+    const tools = createSessionTools(
+      {
+        listSourceFiles: () => ["paper.md"],
+        readText: async (relativePath) => {
+          reads += 1;
+          return {
+            relativePath,
+            text,
+            bytes: text.length,
+            versionHash: text === "new" ? "b".repeat(64) : "a".repeat(64),
+          };
+        },
+        writeText: async () => ({ relativePath: "", bytes: 0, created: false }),
+        openDocument: async (relativePath) => {
+          text = "new";
+          return {
+            document: {
+              id: "doc-2",
+              relativePath,
+              revision: 1,
+              contentHash: "hash-2",
+              updatedAt: "2026-08-01T00:00:00.000Z",
+            },
+            blocks: [{
+              id: "b1",
+              kind: "paragraph",
+              text: "new",
+              order: 0,
+              contentHash: "hash-b1",
+            }],
+          };
+        },
+      },
+      bag,
+      [],
+      [],
+      {},
+    );
+    const read = tools.find((t) => t.name === "read_workspace_file")!;
+    const open = tools.find((t) => t.name === "open_document")!;
+
+    const first = await read.execute("read-1", {
+      relativePath: "paper.md",
+      offset: 0,
+      limit: 3,
+    });
+    expect(JSON.parse((first.content[0] as { text: string }).text).text).toBe("old");
+
+    await open.execute("open-1", { relativePath: "paper.md" });
+    const second = await read.execute("read-2", {
+      relativePath: "paper.md",
+      offset: 0,
+      limit: 3,
+    });
+    expect(JSON.parse((second.content[0] as { text: string }).text).text).toBe("new");
+    expect(reads).toBe(2);
+  });
 });
 
 describe("write_workspace_file canonical guard", () => {
@@ -119,6 +181,77 @@ describe("write_workspace_file canonical guard", () => {
     });
     expect(result.content[0]).toMatchObject({ type: "text" });
   });
+
+  it("invalidates the read cache and evidence refs after writing the same path", async () => {
+    const bag: SessionDocBag = {
+      revision: 0,
+      blocks: [],
+      relativePath: "fixtures/agent-chapter.md",
+    };
+    let text = "old";
+    let persisted: import("@margin/domain").EvidenceCacheEntry[] = [{
+      sourceRef: "notes/scratch.md#sha256=0123456789abcdef&chars=0-3",
+      relativePath: "notes/scratch.md",
+      start: 0,
+      end: 3,
+      extractedHash: "0123456789abcdef",
+      versionHash: "a".repeat(64),
+      preview: "old",
+      readAt: "2026-08-01T00:00:00.000Z",
+    }];
+    const tools = createSessionTools(
+      {
+        listSourceFiles: () => ["notes/scratch.md"],
+        readText: async (relativePath) => ({
+          relativePath,
+          text,
+          bytes: text.length,
+          versionHash: text === "new" ? "b".repeat(64) : "a".repeat(64),
+        }),
+        writeText: async (relativePath, content) => {
+          text = content;
+          return { relativePath, bytes: content.length, created: false };
+        },
+        openDocument: () => {
+          throw new Error("unused");
+        },
+        listProtectedDocumentPaths: () => ["fixtures/agent-chapter.md"],
+      },
+      bag,
+      [],
+      [],
+      {},
+      {
+        sourcePaths: ["notes/scratch.md"],
+        evidenceCache: persisted,
+        onEvidenceCacheChange: (entries) => { persisted = entries; },
+      },
+    );
+    const read = tools.find((t) => t.name === "read_workspace_file")!;
+    const write = tools.find((t) => t.name === "write_workspace_file")!;
+
+    const first = await read.execute("read-1", {
+      relativePath: "notes/scratch.md",
+      offset: 0,
+      limit: 3,
+    });
+    expect(JSON.parse((first.content[0] as { text: string }).text).text).toBe("old");
+
+    await write.execute("write-1", {
+      relativePath: "notes/scratch.md",
+      content: "new",
+    });
+    expect(persisted).toEqual([]);
+
+    const second = await read.execute("read-2", {
+      relativePath: "notes/scratch.md",
+      offset: 0,
+      limit: 3,
+    });
+    expect(JSON.parse((second.content[0] as { text: string }).text).text).toBe("new");
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]?.versionHash).toBe("b".repeat(64));
+  });
 });
 
 describe("attached source tools", () => {
@@ -134,6 +267,7 @@ describe("attached source tools", () => {
             relativePath,
             text: "甲乙丙丁戊己庚辛",
             bytes: 24,
+            versionHash: "a".repeat(64),
           };
         },
         writeText: async () => {
@@ -251,11 +385,12 @@ describe("profile capability boundary", () => {
     const names = tools.map((tool) => tool.name);
     expect(names).toContain("get_block");
     expect(names).toContain("propose_block_edit");
+    expect(names).toContain("propose_text_patch");
     expect(names).toContain("finish_turn");
     expect(names).not.toContain("list_workspace_files");
     expect(names).not.toContain("write_workspace_file");
     expect(names).not.toContain("load_skill");
-    expect(names.length).toBeLessThanOrEqual(5);
+    expect(names.length).toBeLessThanOrEqual(6);
   });
 
   it("limits an approved write to the exact path named by the user", async () => {

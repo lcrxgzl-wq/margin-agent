@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { DocumentMeta, TableCellProposalDraft } from "@margin/domain";
+import type { DocumentMeta, EvidenceCacheEntry, TableCellProposalDraft } from "@margin/domain";
 import { composeSystemPromptDetailed, getAgentProfile, getHarness } from "@margin/harness";
 import {
   emitTextChunks,
@@ -7,9 +7,9 @@ import {
   streamDiscuss,
   type ChatHistoryTurn,
 } from "@margin/llm";
-import { getHeuristicComments } from "./packs/registry.js";
 import { runPiAgentLoop, type ToolAuditEvent } from "./pi-loop.js";
 import type { CompactionEvent } from "./compaction.js";
+import { buildEvidenceCacheDirectory } from "./evidence-cache.js";
 import { assertPiLoopCompleted } from "./pi-outcome.js";
 import { decideRoute } from "./policy/router.js";
 import { parseOpenIntent, parseReadIntent, resolveOpenPath } from "./policy/open-intent-rule.js";
@@ -169,6 +169,10 @@ export type SessionTurnInput = {
   clarificationRound?: number;
   /** Read-only materials attached by the host for this turn. */
   sourcePaths?: string[];
+  /** Host-owned evidence refs read earlier in this session. */
+  evidenceCache?: EvidenceCacheEntry[];
+  /** Receives bounded cache updates after a source read or stale-ref eviction. */
+  onEvidenceCacheChange?: (entries: EvidenceCacheEntry[]) => void;
   /** Persistent off-set from the workspace skill store (auto = absent). */
   disabledSkills?: string[];
   /** Explicit one-turn Skills (structured ids), inlined into the system prompt. */
@@ -184,6 +188,7 @@ export type SessionTurnResult = {
   proposals: Draft[];
   tableCellProposals?: TableCellProposalDraft[];
   comments: AgentComment[];
+  reviewChecklists?: import("@margin/domain").ReviewChecklistRunDraft[];
   steps: string[];
   opened?: { document: DocumentMeta; blocks: SessionDocBag["blocks"] };
   written?: { relativePath: string; created: boolean };
@@ -309,6 +314,8 @@ export async function runPiSessionTurn(
     enforceCascadeGate: selectionIds.length > 0 || cascadeIds.length > 0,
     cascadeUnlocked: cascadeIds.length > 0,
     sourcePaths: input.sourcePaths,
+    evidenceCache: input.evidenceCache,
+    onEvidenceCacheChange: input.onEvidenceCacheChange,
     remoteMcp: input.remoteMcp,
     disabledSkills: input.disabledSkills,
   });
@@ -366,9 +373,18 @@ export async function runPiSessionTurn(
       ? `可 load_skill("source-grounded-writing").`
       : "";
   const sourceHint = sourcePaths.length
-    ? `\n\n[已挂资料，只读] ${sourcePaths.join("、")}。涉及资料的事实/引语须先 read_workspace_file 实际读取再起草；提案 evidence 用 read_workspace_file 返回的 sourceRef 填写。${sourceSkillHint}`
+    ? `\n\n[已挂资料，只读] ${sourcePaths.join("、")}。涉及资料的事实/引语须先 read_workspace_file 实际读取再起草；propose_block_edit / propose_text_patch 的 evidence 用 read_workspace_file 返回的 sourceRef 填写。${sourceSkillHint}`
     : "";
-  const prompt = `${input.message}${docHint}${outlineHint}${proposalHint}${selection}${adjacentContext}${modeHint}${cascadeHint}${sourceHint}`;
+  const evidenceDirectory = buildEvidenceCacheDirectory(
+    input.evidenceCache ?? [],
+    sourcePaths,
+  );
+  const readthroughHint =
+    input.bag.blocks.length > 0 &&
+    /通读|通篇|从头到尾|全文阅读|结构分析|读一遍|读完整/.test(input.message)
+      ? "\n\n[通读策略] 先用 get_document_outline 建结构，再从 cursor 0:0 连续调用 read_document_blocks，并逐次使用 nextCursor，直到 hasMore=false；不得把抽样说成通读。不要用 read_workspace_file 按 offset 扫已打开文稿。输出清理后按 blockId/cursor 定点续读，完成覆盖后写可见结论并 finish_turn。"
+      : "";
+  const prompt = `${input.message}${docHint}${outlineHint}${proposalHint}${selection}${adjacentContext}${modeHint}${cascadeHint}${sourceHint}${evidenceDirectory ? `\n\n${evidenceDirectory}` : ""}${readthroughHint}`;
   // Pi budgets the serialized message, where quotes and control characters
   // are escaped. Size that representation so an accepted current request is
   // never compacted merely because its raw string length looked smaller.
@@ -415,12 +431,24 @@ export async function runPiSessionTurn(
     onDelta: input.onDelta,
     signal: input.signal,
   });
-  assertPiLoopCompleted(result, "pi session");
+  const recoverableLoopStop =
+    result.outcome === "aborted" &&
+    result.notes.some((note) => /stopped after (?:\d+ turns|repeated non-progress read)/.test(note));
+  if (!recoverableLoopStop) {
+    assertPiLoopCompleted(result, "pi session");
+  }
 
   const spoken = stripLiteralThinkingBlocks(
     extractAssistantText(result.messages) || result.streamedText,
   );
   let reply = composeVisibleReply(spoken, effects.finishSummary);
+  if (recoverableLoopStop) {
+    const suffix =
+      "\n\n（本轮工具读取已停止。若要继续通读/分析，请直接回复「继续」；我会从已记录的 block/cursor 续接，不再整文重扫。）";
+    reply = reply.trim()
+      ? reply.trim() + suffix
+      : "本轮工具轮次已用尽，尚未写出结论。请回复「继续」，我会基于已读内容归纳。";
+  }
   if (!reply) {
     if (effects.opened) {
       reply = `已打开《${effects.opened.document.relativePath.replace(/^.*\//, "")}》（${effects.opened.blocks.length} 段）。`;
@@ -445,14 +473,6 @@ export async function runPiSessionTurn(
     }
   }
 
-  const heuristicComments = getHeuristicComments(undefined, input.harnessId);
-  if (heuristicComments && drafts.length && comments.length < 2 && input.bag.blocks.length) {
-    for (const h of heuristicComments(input.bag.blocks.slice(0, 8), { max: 6 })) {
-      if (comments.length >= 10) break;
-      comments.push(h);
-    }
-  }
-
   return {
     engine: "pi",
     reply,
@@ -460,6 +480,7 @@ export async function runPiSessionTurn(
     proposals: drafts,
     tableCellProposals: effects.tableCellProposals,
     comments,
+    reviewChecklists: effects.reviewChecklists,
     steps,
     opened: effects.opened,
     written: effects.written,
@@ -490,6 +511,8 @@ export async function runOfflineSessionTurn(
     enforceCascadeGate: selectionIds.length > 0 || cascadeIds.length > 0,
     cascadeUnlocked: cascadeIds.length > 0,
     sourcePaths: input.sourcePaths,
+    evidenceCache: input.evidenceCache,
+    onEvidenceCacheChange: input.onEvidenceCacheChange,
   });
   const byName = new Map(tools.map((t) => [t.name, t]));
   const steps: string[] = [];
@@ -650,6 +673,41 @@ export async function runOfflineSessionTurn(
     });
   }
 
+  const wantsCiteCheck = /cite_check|(?:引用|引文|文献).{0,8}(?:检查|核对|扫描)|(?:检查|核对|扫描).{0,8}(?:引用|引文|文献)/i.test(msg);
+  const wantsStyleCheck = /style_lint|(?:风格|语体|套话).{0,8}(?:检查|核对|扫描)|(?:检查|核对|扫描).{0,8}(?:风格|语体|套话)/i.test(msg);
+  const wantsBothChecks = /检查清单|学术检查|cite_check.{0,20}style_lint|style_lint.{0,20}cite_check/i.test(msg);
+  const requestedCheckers = [
+    ...(wantsCiteCheck || wantsBothChecks ? ["cite_check" as const] : []),
+    ...(wantsStyleCheck || wantsBothChecks ? ["style_lint" as const] : []),
+  ];
+  if (requestedCheckers.length) {
+    if (!input.bag.documentId || !input.bag.blocks.length) {
+      return finish({
+        reply: "请先打开文稿，再运行检查清单。",
+        proposals: [],
+        comments: [],
+      });
+    }
+    const targets = selectionIds.length ? selectionIds : [undefined];
+    let findingCount = 0;
+    for (const checker of requestedCheckers) {
+      for (const blockId of targets) {
+        const result = await call(checker, blockId ? { blockId } : {});
+        const text = result.content[0] && "text" in result.content[0]
+          ? result.content[0].text
+          : "{}";
+        const parsed = JSON.parse(text) as { findings?: unknown[] };
+        findingCount += parsed.findings?.length ?? 0;
+      }
+    }
+    return finish({
+      reply: `已生成检查清单：${requestedCheckers.length} 类检查，${findingCount} 条发现。请到审阅 → 检查中处理。`,
+      proposals: [],
+      comments: [],
+      reviewChecklists: effects.reviewChecklists,
+    });
+  }
+
   if (/重写|润色|改写|修订/i.test(msg)) {
     if (!input.bag.documentId || !input.bag.blocks.length) {
       await call("open_document", { relativePath: "fixtures/agent-chapter.md" });
@@ -685,10 +743,7 @@ export async function runOfflineSessionTurn(
         : "没有生成提案。换一段再试。",
       proposals: drafts,
       tableCellProposals: effects.tableCellProposals,
-      comments: getHeuristicComments(undefined, input.harnessId)?.(
-        input.bag.blocks.slice(0, 6),
-        { max: 6 },
-      ) ?? [],
+      comments: [],
       opened: effects.opened,
     });
   }

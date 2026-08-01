@@ -1,10 +1,23 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import { citeCheck, heuristicComments, styleLint } from "../academic.js";
+import {
+  citeCheck,
+  createReviewChecklistRun,
+  heuristicComments,
+  styleLint,
+} from "../academic.js";
 import { resolveBlockSnapshot } from "../pi-tools.js";
 import type { MarginPack } from "./types.js";
 
-export { citeCheck, heuristicComments, styleLint } from "../academic.js";
+export {
+  CITE_CHECK_DISCLAIMER,
+  STYLE_LINT_DISCLAIMER,
+  citeCheck,
+  createReviewChecklistRun,
+  createReviewChecklistRuns,
+  heuristicComments,
+  styleLint,
+} from "../academic.js";
 
 export const academicPack: MarginPack = {
   id: "academic",
@@ -34,9 +47,11 @@ export const academicPack: MarginPack = {
           ? [resolveBlockSnapshot(blocks, String(params.blockId)).block]
           : blocks;
         const result = citeCheck(subset);
+        const checklist = createReviewChecklistRun("cite_check", ctx.getDocumentId(), subset);
+        ctx.onReviewChecklistRun?.(checklist);
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],
-          details: { count: result.findings.length },
+          details: { count: result.findings.length, runId: checklist.run.id },
         };
       },
     };
@@ -56,9 +71,11 @@ export const academicPack: MarginPack = {
           ? [resolveBlockSnapshot(blocks, String(params.blockId)).block]
           : blocks;
         const result = styleLint(subset);
+        const checklist = createReviewChecklistRun("style_lint", ctx.getDocumentId(), subset);
+        ctx.onReviewChecklistRun?.(checklist);
         return {
           content: [{ type: "text", text: JSON.stringify(result) }],
-          details: { count: result.findings.length },
+          details: { count: result.findings.length, runId: checklist.run.id },
         };
       },
     };

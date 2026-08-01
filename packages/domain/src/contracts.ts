@@ -35,6 +35,24 @@ export const BlockSnapshotSchema = z.object({
 });
 export type BlockSnapshot = z.infer<typeof BlockSnapshotSchema>;
 
+export const EvidenceCacheEntrySchema = z.object({
+  sourceRef: z.string().min(1).max(800),
+  relativePath: z.string().min(1).max(500),
+  start: z.number().int().nonnegative(),
+  end: z.number().int().positive(),
+  extractedHash: z.string().regex(/^[a-f0-9]{16,64}$/),
+  versionHash: z.string().regex(/^[a-f0-9]{64}$/),
+  preview: z.string().max(800),
+  readAt: z.string().datetime(),
+}).superRefine((entry, context) => {
+  const match = /^(.+)#sha256=([a-f0-9]{16,64})&chars=(\d+)-(\d+)$/i.exec(entry.sourceRef);
+  if (!match || match[1] !== entry.relativePath || match[2].toLowerCase() !== entry.extractedHash ||
+      Number(match[3]) !== entry.start || Number(match[4]) !== entry.end || entry.end <= entry.start) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "evidence cache entry does not match sourceRef" });
+  }
+});
+export type EvidenceCacheEntry = z.infer<typeof EvidenceCacheEntrySchema>;
+
 export const SelectionCommandKindSchema = z.enum(["rewrite", "rewrite_directed", "discuss"]);
 export type SelectionCommandKind = z.infer<typeof SelectionCommandKindSchema>;
 
@@ -60,6 +78,21 @@ export type ProposalOperationKind = z.infer<typeof ProposalOperationKindSchema>;
 
 export const ProposalTargetLanguageSchema = z.enum(["zh-CN", "en"]);
 export type ProposalTargetLanguage = z.infer<typeof ProposalTargetLanguageSchema>;
+
+export const TextPatchSchema = z.object({
+  start: z.number().int().nonnegative(),
+  end: z.number().int().nonnegative(),
+  before: z.string().min(1),
+  after: z.string().min(1),
+}).superRefine((patch, context) => {
+  if (patch.end !== patch.start + patch.before.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "text patch range does not match before text" });
+  }
+  if (patch.after === patch.before) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "text patch must change the selected text" });
+  }
+});
+export type TextPatch = z.infer<typeof TextPatchSchema>;
 
 function tableColumnAddress(column: number): string {
   let value = column;
@@ -127,12 +160,7 @@ export const ProposalOperationSchema = z.object({
   kind: ProposalOperationKindSchema,
   scope: z.enum(["selection", "block"]),
   targetLanguage: ProposalTargetLanguageSchema.optional(),
-  selection: z.object({
-    start: z.number().int().nonnegative(),
-    end: z.number().int().nonnegative(),
-    before: z.string().min(1),
-    after: z.string().min(1),
-  }).optional(),
+  selection: TextPatchSchema.optional(),
 }).superRefine((operation, context) => {
   if (operation.kind === "translate" && !operation.targetLanguage) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: "translation requires targetLanguage" });
@@ -229,6 +257,80 @@ export const DecisionSchema = z.object({
   createdAt: z.string().datetime(),
 });
 export type Decision = z.infer<typeof DecisionSchema>;
+
+export const ReviewChecklistCheckerSchema = z.enum(["cite_check", "style_lint"]);
+export type ReviewChecklistChecker = z.infer<typeof ReviewChecklistCheckerSchema>;
+
+export const ReviewChecklistRunStatusSchema = z.enum(["active", "superseded"]);
+export const ReviewChecklistItemStatusSchema = z.enum(["open", "resolved", "dismissed"]);
+export const ReviewChecklistDecisionKindSchema = z.enum(["resolve", "dismiss"]);
+
+export const ReviewChecklistRunSchema = z.object({
+  schemaVersion: z.literal(SCHEMA_VERSION),
+  id: z.string().min(1),
+  documentId: z.string().min(1),
+  checker: ReviewChecklistCheckerSchema,
+  disclaimer: z.string().min(1),
+  status: ReviewChecklistRunStatusSchema,
+  createdAt: z.string().datetime(),
+});
+export type ReviewChecklistRun = z.infer<typeof ReviewChecklistRunSchema>;
+
+export const ReviewChecklistItemSchema = z.object({
+  schemaVersion: z.literal(SCHEMA_VERSION),
+  id: z.string().min(1),
+  runId: z.string().min(1),
+  documentId: z.string().min(1),
+  blockId: z.string().min(1),
+  issueType: z.string().regex(/^[a-z][a-z0-9_.-]{1,63}$/),
+  label: z.string().min(1).max(200),
+  excerpt: z.string().max(500),
+  detail: z.string().min(1).max(1_000),
+  severity: z.enum(["info", "warn"]),
+  status: ReviewChecklistItemStatusSchema,
+  heuristicOnly: z.boolean(),
+  verification: z.enum(["not_verified"]).optional(),
+  createdAt: z.string().datetime(),
+  decidedAt: z.string().datetime().optional(),
+});
+export type ReviewChecklistItem = z.infer<typeof ReviewChecklistItemSchema>;
+
+export const ReviewChecklistDecisionSchema = z.object({
+  schemaVersion: z.literal(SCHEMA_VERSION),
+  id: z.string().min(1),
+  runId: z.string().min(1),
+  itemIds: z.array(z.string().min(1)).min(1).max(500),
+  kind: ReviewChecklistDecisionKindSchema,
+  createdAt: z.string().datetime(),
+}).superRefine((decision, context) => {
+  if (new Set(decision.itemIds).size !== decision.itemIds.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "checklist decision item ids must be unique" });
+  }
+});
+export type ReviewChecklistDecision = z.infer<typeof ReviewChecklistDecisionSchema>;
+
+export const ReviewChecklistRunDraftSchema = z.object({
+  run: ReviewChecklistRunSchema,
+  items: z.array(ReviewChecklistItemSchema).max(10_000),
+}).superRefine((draft, context) => {
+  if (draft.run.status !== "active") {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "checklist draft run must be active" });
+  }
+  const itemIds = new Set<string>();
+  for (const item of draft.items) {
+    if (itemIds.has(item.id)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "checklist draft item ids must be unique" });
+    }
+    itemIds.add(item.id);
+    if (item.runId !== draft.run.id || item.documentId !== draft.run.documentId) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "checklist draft item scope mismatch" });
+    }
+    if (item.status !== "open" || item.decidedAt) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "checklist draft items must be open" });
+    }
+  }
+});
+export type ReviewChecklistRunDraft = z.infer<typeof ReviewChecklistRunDraftSchema>;
 
 export const ApplyEventSchema = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),

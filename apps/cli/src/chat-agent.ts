@@ -5,6 +5,7 @@ import {
   getHarness,
   hasRuntimeCredentials,
   nextClarificationRound,
+  normalizeAttachedEvidenceCache,
   orchestrateCompaction,
   resolveRuntimeModel,
   runSessionTurn,
@@ -19,7 +20,7 @@ import {
   type RemoteMcpApprovalFn,
   type RemoteMcpBridge,
 } from "@margin/agent";
-import type { BlockSnapshot, DocumentMeta } from "@margin/domain";
+import type { BlockSnapshot, DocumentMeta, EvidenceCacheEntry } from "@margin/domain";
 import {
   archiveAgentSession,
   activeProfile,
@@ -34,6 +35,7 @@ import {
   loadAgentSessionEnvelope,
   openDocumentFile,
   readWorkspaceSource,
+  readWorkspaceSourceVersion,
   readLlmSettingsStore,
   readSkillSettings,
   disabledSkillNames,
@@ -42,6 +44,7 @@ import {
   saveAgentCompaction,
   saveAgentSession,
   saveProposal,
+  saveReviewChecklistRun,
   saveAgentTranscript,
   writeWorkspaceText,
   type PersistedAgentSession,
@@ -67,6 +70,7 @@ export type ChatAgentState = {
   /** Clarification turns already used in the current rewrite/edit thread (0..3). */
   clarificationRounds: number;
   sourcePaths: string[];
+  evidenceCache: EvidenceCacheEntry[];
   /** Main document that owns sourcePaths; used to clear attachments on document switch. */
   sourceDocumentId?: string;
   task?: PersistedAgentTask;
@@ -77,6 +81,7 @@ export function createChatAgentState(seed?: {
   agentMessages?: AgentMessage[];
   clarificationRounds?: number;
   sourcePaths?: string[];
+  evidenceCache?: EvidenceCacheEntry[];
   sourceDocumentId?: string;
   task?: PersistedAgentTask;
 }): ChatAgentState {
@@ -86,6 +91,7 @@ export function createChatAgentState(seed?: {
     bag: { revision: 0, blocks: [] },
     clarificationRounds: seed?.clarificationRounds ?? 0,
     sourcePaths: seed?.sourcePaths ?? [],
+    evidenceCache: seed?.evidenceCache ?? [],
     sourceDocumentId: seed?.sourceDocumentId,
     task: seed?.task,
   };
@@ -104,6 +110,7 @@ export function chatAgentStateFromSession(
     agentMessages: saved.messages as AgentMessage[],
     clarificationRounds: saved.clarificationRounds ?? 0,
     sourcePaths: saved.sourcePaths ?? [],
+    evidenceCache: normalizeAttachedEvidenceCache(saved.evidenceCache ?? [], saved.sourcePaths ?? []),
     sourceDocumentId: saved.documentId,
     task: saved.task,
   });
@@ -118,6 +125,7 @@ export function chatAgentStateFromSession(
       };
     } catch {
       state.sourcePaths = [];
+      state.evidenceCache = [];
       state.sourceDocumentId = undefined;
     }
   }
@@ -177,6 +185,7 @@ export function replaceAttachedSources(
     normalizedRequested.length === state.sourcePaths.length &&
     normalizedRequested.every((value, index) => value === state.sourcePaths[index]?.replace(/\\/g, "/"))
   ) {
+    state.evidenceCache = normalizeAttachedEvidenceCache(state.evidenceCache, state.sourcePaths);
     return;
   }
   const available = new Map(
@@ -203,6 +212,7 @@ export function replaceAttachedSources(
     }
   }
   state.sourcePaths = sourcePaths;
+  state.evidenceCache = normalizeAttachedEvidenceCache(state.evidenceCache, sourcePaths);
   state.sourceDocumentId = state.bag.documentId;
 }
 
@@ -212,6 +222,10 @@ export function createWorkspaceBridge(workspace: Workspace): WorkspaceBridge {
     listSourceFiles: () => listWorkspaceSourceFiles(workspace),
     readText: (relativePath) =>
       readWorkspaceSource(workspace, relativePath, {
+        unlimitedRead: process.env.MARGIN_UNLIMITED === "1",
+      }),
+    readVersion: (relativePath) =>
+      readWorkspaceSourceVersion(workspace, relativePath, {
         unlimitedRead: process.env.MARGIN_UNLIMITED === "1",
       }),
     writeText: (relativePath, content) => {
@@ -283,6 +297,7 @@ export function clearChatAgentConversation(state: ChatAgentState): void {
   state.sessionId = randomUUID();
   state.agentMessages = [];
   state.clarificationRounds = 0;
+  state.evidenceCache = [];
   state.task = undefined;
 }
 
@@ -462,6 +477,7 @@ export async function compactChatAgentConversation(opts: {
     clarificationRounds: agentState.clarificationRounds,
     chatTurns: chat.list(),
     sourcePaths: agentState.sourcePaths,
+    evidenceCache: agentState.evidenceCache,
     task: agentState.task,
   });
   return {
@@ -478,6 +494,7 @@ export function closeChatAgentDocument(state: ChatAgentState): void {
   state.bag = { revision: 0, blocks: [] };
   state.clarificationRounds = 0;
   state.sourcePaths = [];
+  state.evidenceCache = [];
   state.sourceDocumentId = undefined;
   state.task = undefined;
 }
@@ -559,6 +576,7 @@ export async function runChatAgentTurn(opts: {
     clarificationRounds: agentState.clarificationRounds,
     chatTurns: chat.list(),
     sourcePaths: agentState.sourcePaths,
+    evidenceCache: agentState.evidenceCache,
     task: agentState.task,
   });
   const clarificationRound = agentState.clarificationRounds ?? 0;
@@ -619,6 +637,10 @@ export async function runChatAgentTurn(opts: {
         selectionBlockIds,
         cascadeBlockIds: opts.cascadeBlockIds,
         sourcePaths: agentState.sourcePaths,
+        evidenceCache: agentState.evidenceCache,
+        onEvidenceCacheChange: (entries) => {
+          agentState.evidenceCache = entries;
+        },
         history: chat.prior(),
         sessionId: agentState.sessionId,
         remoteMcp: opts.remoteMcp,
@@ -649,6 +671,7 @@ export async function runChatAgentTurn(opts: {
       clarificationRounds: agentState.clarificationRounds,
       chatTurns: chat.list(),
       sourcePaths: agentState.sourcePaths,
+      evidenceCache: agentState.evidenceCache,
       task: agentState.task,
     });
     if (error instanceof PiLoopFailure) {
@@ -718,19 +741,25 @@ export async function runChatAgentTurn(opts: {
       saveProposal(workspace, proposal);
       proposalIds.push(proposal.id);
     }
-    if (turn.comments.length) {
-      replaceDocumentComments(
-        workspace,
-        agentState.bag.documentId,
-        turn.comments.map((c) => ({
-          id: c.id,
-          blockId: c.blockId,
-          text: c.text,
-          severity: c.severity,
-          runId,
-          source: c.source,
-        })),
-      );
+  }
+  if (agentState.bag.documentId && turn.comments.length) {
+    replaceDocumentComments(
+      workspace,
+      agentState.bag.documentId,
+      turn.comments.map((c) => ({
+        id: c.id,
+        blockId: c.blockId,
+        text: c.text,
+        severity: c.severity,
+        runId,
+        source: c.source,
+      })),
+    );
+  }
+  if (agentState.bag.documentId && turn.reviewChecklists?.length) {
+    for (const checklist of turn.reviewChecklists) {
+      if (checklist.run.documentId !== agentState.bag.documentId) continue;
+      saveReviewChecklistRun(workspace, checklist);
     }
   }
   if (agentState.bag.documentId && turn.tableCellProposals?.length) {
@@ -786,6 +815,7 @@ export async function runChatAgentTurn(opts: {
     clarificationRounds: agentState.clarificationRounds,
     chatTurns: chat.list(),
     sourcePaths: agentState.sourcePaths,
+    evidenceCache: agentState.evidenceCache,
     task: agentState.task,
   });
   const turnId = randomUUID();

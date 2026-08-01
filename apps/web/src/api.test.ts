@@ -151,6 +151,63 @@ describe("resolveProposals", () => {
   });
 });
 
+describe("review checklist requests", () => {
+  it("loads active runs and posts one batch decision", async () => {
+    vi.stubGlobal("location", { href: "http://127.0.0.1/#token=test-token" });
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => undefined,
+    });
+    const run = {
+      run: {
+        schemaVersion: 1,
+        id: "run-1",
+        documentId: "doc-1",
+        checker: "cite_check",
+        disclaimer: "形态检查边界",
+        status: "active",
+        createdAt: "2026-08-01T00:00:00.000Z",
+      },
+      items: [],
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        statusText: "",
+        json: async () => ({ runs: [run] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        statusText: "",
+        json: async () => ({
+          decision: {
+            schemaVersion: 1,
+            id: "decision-1",
+            runId: "run-1",
+            itemIds: ["item-1", "item-2"],
+            kind: "resolve",
+            createdAt: "2026-08-01T00:01:00.000Z",
+          },
+          run,
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { decideReviewChecklist, listReviewChecklists } = await import("./api");
+    await expect(listReviewChecklists("doc-1")).resolves.toEqual({ runs: [run] });
+    await decideReviewChecklist("run-1", ["item-1", "item-2"], "resolve");
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/documents/doc-1/checklists");
+    const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(url).toBe("/api/v1/checklists/run-1/decisions");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({
+      itemIds: ["item-1", "item-2"],
+      kind: "resolve",
+    });
+  });
+});
+
 describe("document-scoped session requests", () => {
   it("sends explicit document identity for sources and DOCX imports", async () => {
     vi.stubGlobal("location", { href: "http://127.0.0.1/#token=test-token" });

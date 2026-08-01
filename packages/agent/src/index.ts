@@ -8,7 +8,7 @@ import type { BlockSnapshot, SelectionBlockRange } from "@margin/domain";
 import { contentHash, MAX_SELECTION_BLOCKS } from "@margin/domain";
 import { generateProposal } from "@margin/llm";
 import { getHarness } from "@margin/harness";
-import { getHeuristicComments } from "./packs/registry.js";
+import { createReviewChecklistRuns } from "./academic.js";
 import { generateDirectProposal } from "./direct-proposal.js";
 import { runPiBlockScan } from "./pi-runner.js";
 import { hasRuntimeCredentials } from "./resolve-model.js";
@@ -27,7 +27,15 @@ export type {
   AgentWorkReport,
 } from "./types.js";
 export { runPiBlockScan, createPaperTools } from "./pi-runner.js";
-export { citeCheck, styleLint, heuristicComments } from "./packs/academic.js";
+export {
+  CITE_CHECK_DISCLAIMER,
+  STYLE_LINT_DISCLAIMER,
+  citeCheck,
+  createReviewChecklistRun,
+  createReviewChecklistRuns,
+  styleLint,
+  heuristicComments,
+} from "./packs/academic.js";
 export { academicPack } from "./packs/academic.js";
 export { dataAnalysisPack } from "./packs/data-analysis.js";
 export {
@@ -91,6 +99,12 @@ export {
   composeVisibleReply,
 } from "./session-runner.js";
 export { createSessionTools } from "./session-tools.js";
+export {
+  buildEvidenceCacheDirectory,
+  mergeEvidenceCacheEntry,
+  normalizeAttachedEvidenceCache,
+  removeEvidenceCacheRefs,
+} from "./evidence-cache.js";
 export {
   createRemoteMcpTools,
   namespaceRemoteMcpToolNames,
@@ -230,12 +244,12 @@ async function runDirectBlockProposal(
     operation: ctx.tableCell ? undefined : output.operation,
     tableCell: ctx.tableCell ? { ...ctx.tableCell, after: output.after } : undefined,
   };
-  const comments = getHeuristicComments(undefined, ctx.harnessId)?.([block]) ?? [];
+  const reviewChecklists = createReviewChecklistRuns(ctx.documentId, [block]);
   emit("完成（1 处提案）");
   const notes = ctx.selectedSkills?.length && !hasRuntimeCredentials()
     ? [`explicit skills not applied offline (configure a model): ${ctx.selectedSkills.join(", ")}`]
     : undefined;
-  return { engine: "simple", proposals: [proposal], comments, steps, notes };
+  return { engine: "simple", proposals: [proposal], comments: [], reviewChecklists, steps, notes };
 }
 
 function validateSelectionRanges(
@@ -350,12 +364,12 @@ async function runDirectMultiBlockProposal(
       operation: output.operation,
     });
   }
-  const comments = getHeuristicComments(undefined, ctx.harnessId)?.(selected) ?? [];
+  const reviewChecklists = createReviewChecklistRuns(ctx.documentId, selected);
   emit(`完成（${proposals.length} 处提案）`);
   const notes = ctx.selectedSkills?.length && !hasRuntimeCredentials()
     ? [`explicit skills not applied offline (configure a model): ${ctx.selectedSkills.join(", ")}`]
     : undefined;
-  return { engine: "simple", proposals, comments, steps, notes };
+  return { engine: "simple", proposals, comments: [], reviewChecklists, steps, notes };
 }
 
 export async function runSimpleBlockScan(
@@ -410,11 +424,10 @@ export async function runSimpleBlockScan(
     });
   }
 
-  emit("整理侧注");
-  const comments = getHeuristicComments(undefined, ctx.harnessId)?.(selected) ?? [];
+  const reviewChecklists = createReviewChecklistRuns(ctx.documentId, selected);
   emit(`完成（${proposals.length} 处提案）`);
 
-  return { engine: "simple", proposals, comments, steps };
+  return { engine: "simple", proposals, comments: [], reviewChecklists, steps };
 }
 
 export function createPaperAgentAdapter() {

@@ -12,6 +12,7 @@ export type CanvasFocusRequest = {
   key: string;
   query: string;
   proposalId?: string;
+  threadId?: string;
   blockId?: string | null;
   tableCell?: TableCellSelection;
 };
@@ -37,6 +38,7 @@ export type CanvasProps = {
     selectionStart?: number;
     tableCell?: TableCellSelection;
     anchor?: { x: number; y: number } | null;
+    programmaticThreadId?: string;
   }) => void;
   onContextMenu: (info: {
     x: number;

@@ -30,11 +30,18 @@ export function assemblePaperTools(
   opts?: { packId?: string; harnessId?: string; extras?: PackExtras },
 ): AgentTool[] {
   const profile = getHarness(opts?.harnessId);
-  const inspectTools = new Set(["get_document_outline", "list_blocks", "get_block", "search_blocks"]);
+  const inspectTools = new Set([
+    "get_document_outline",
+    "list_blocks",
+    "read_document_blocks",
+    "get_block",
+    "search_blocks",
+  ]);
   const proposeTools = new Set([
     "get_block",
     "offer_cascade",
     "propose_block_edit",
+    "propose_text_patch",
     "propose_table_cell_edit",
     "propose_block_comment",
     "finish_turn",

@@ -273,6 +273,107 @@ describe("Pi runtime boundaries", () => {
     expect(mockAgent.abortCalls).toBe(1);
   });
 
+  it("uses 40 turns by default and stops only when another tool turn would be required", async () => {
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      timeoutMs: 10_000,
+    });
+    for (let turn = 1; turn < 40; turn += 1) {
+      mockAgent.subscriber?.({
+        type: "turn_end",
+        message: { content: [{ type: "toolCall", id: `call-${turn}` }] },
+        toolResults: [{}],
+      });
+      expect(mockAgent.abortCalls).toBe(0);
+    }
+    mockAgent.subscriber?.({
+      type: "turn_end",
+      message: { content: [{ type: "toolCall", id: "call-40" }] },
+      toolResults: [{}],
+    });
+    await expect(running).resolves.toMatchObject({
+      outcome: "aborted",
+      notes: ["stopped after 40 turns"],
+    });
+  });
+
+  it("stops a third identical read as non-progress", async () => {
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [{
+        name: "read_document_blocks",
+        label: "Read document blocks",
+        description: "Read document blocks",
+        parameters: {},
+        execute: async () => ({ content: [], details: {} }),
+      } as never],
+      model: {},
+      timeoutMs: 10_000,
+    });
+    const options = mockAgent.options as {
+      beforeToolCall: (context: { toolCall: { id: string; name: string }; args: unknown }) => Promise<{ block?: boolean }>;
+    };
+    await expect(options.beforeToolCall({
+      toolCall: { id: "read-1", name: "read_document_blocks" },
+      args: { cursor: "0:0" },
+    })).resolves.not.toMatchObject({ block: true });
+    await expect(options.beforeToolCall({
+      toolCall: { id: "read-2", name: "read_document_blocks" },
+      args: { cursor: "0:0" },
+    })).resolves.not.toMatchObject({ block: true });
+    await expect(options.beforeToolCall({
+      toolCall: { id: "read-3", name: "read_document_blocks" },
+      args: { cursor: "0:0" },
+    })).resolves.toMatchObject({ block: true });
+    mockAgent.subscriber?.({
+      type: "turn_end",
+      message: { content: [{ type: "toolCall", id: "read-3" }] },
+      toolResults: [{}],
+    });
+    await expect(running).resolves.toMatchObject({
+      outcome: "aborted",
+      notes: ["stopped after repeated non-progress read: read_document_blocks"],
+    });
+  });
+
+  it("allows alternating reads because only consecutive repeats are non-progress", async () => {
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [{
+        name: "read_document_blocks",
+        label: "Read document blocks",
+        description: "Read document blocks",
+        parameters: {},
+        execute: async () => ({ content: [], details: {} }),
+      } as never],
+      model: {},
+      timeoutMs: 10_000,
+    });
+    const options = mockAgent.options as {
+      beforeToolCall: (context: { toolCall: { id: string; name: string }; args: unknown }) => Promise<{ block?: boolean }>;
+    };
+    for (const [id, cursor] of [
+      ["read-a", "0:0"],
+      ["read-b", "4:0"],
+      ["read-a", "0:0"],
+      ["read-b", "4:0"],
+      ["read-a", "0:0"],
+    ]) {
+      await expect(options.beforeToolCall({
+        toolCall: { id, name: "read_document_blocks" },
+        args: { cursor },
+      })).resolves.not.toMatchObject({ block: true });
+    }
+    mockAgent.resolvePrompt?.();
+    await expect(running).resolves.toMatchObject({ outcome: "completed" });
+    expect(mockAgent.abortCalls).toBe(0);
+  });
+
   it("keeps the run alive when a tool returns an error", async () => {
     const running = runPiAgentLoop({
       prompt: "test",

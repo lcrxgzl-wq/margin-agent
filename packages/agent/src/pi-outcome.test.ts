@@ -106,6 +106,28 @@ describe("Pi loop outcome handling", () => {
     ).rejects.toThrow(/pi session failed.*provider failed/);
   });
 
+  it("soft-lands when the turn budget is exhausted instead of throwing", async () => {
+    mocks.runPiAgentLoop.mockResolvedValue({
+      messages: [{ role: "assistant", content: [{ type: "text", text: "已读完大纲，准备归纳。" }] }],
+      outcome: "aborted",
+      notes: ["stopped after 40 turns"],
+      streamedText: "已读完大纲，准备归纳。",
+      toolAudit: [],
+    });
+
+    const deltas: string[] = [];
+    const turn = await runSessionTurn({
+      message: "通读全文",
+      bridge,
+      bag: { revision: 0, blocks: [{ id: "b1", kind: "paragraph", text: "hello", order: 0, contentHash: "h" }] },
+      onDelta: (chunk) => deltas.push(chunk),
+    });
+    expect(turn.reply).toContain("已读完大纲");
+    expect(turn.reply).toMatch(/工具读取已停止/);
+    expect(turn.reply).toMatch(/继续/);
+    expect(deltas.join("")).toContain("请直接回复「继续」");
+  });
+
   it("propagates caller abort without starting another planner", async () => {
     const controller = new AbortController();
     controller.abort();

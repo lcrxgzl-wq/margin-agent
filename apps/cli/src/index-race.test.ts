@@ -2,12 +2,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { contentHash } from "@margin/domain";
 import {
   listBlocks,
   listComments,
   listProposals,
   openDocument,
   saveProposal,
+  saveReviewChecklistRun,
 } from "@margin/storage-local";
 import { syncBagFromDocument } from "./chat-agent.js";
 
@@ -90,11 +92,111 @@ describe("chat queue serialization (I1)", () => {
       enqueueChat: NonNullable<typeof runtime.enqueueChat>;
     };
 
+    const sourceFile = path.join(root, "source.txt");
+    const originalSource = fs.readFileSync(sourceFile, "utf8");
+    const fixedTime = new Date(Math.floor(Date.now() / 1_000) * 1_000);
+    fs.utimesSync(sourceFile, fixedTime, fixedTime);
+    const originalStat = fs.statSync(sourceFile);
+    const sourceRef = `source.txt#sha256=${contentHash(originalSource)}&chars=0-6`;
+    const warmSource = await app.inject({
+      method: "POST",
+      url: "/api/v1/workspace/source-chunk",
+      headers: { authorization: `Bearer ${state.token}` },
+      payload: { sourceRef },
+    });
+    expect(warmSource.statusCode).toBe(200);
+
+    const replacementSource = "other! material\n";
+    expect(Buffer.byteLength(replacementSource)).toBe(Buffer.byteLength(originalSource));
+    fs.writeFileSync(sourceFile, replacementSource, "utf8");
+    fs.utimesSync(sourceFile, originalStat.atime, originalStat.mtime);
+    expect(fs.statSync(sourceFile).mtimeMs).toBe(originalStat.mtimeMs);
+    const staleSource = await app.inject({
+      method: "POST",
+      url: "/api/v1/workspace/source-chunk",
+      headers: { authorization: `Bearer ${state.token}` },
+      payload: { sourceRef },
+    });
+    expect(staleSource.statusCode).toBe(409);
+
     // Seed a document + proposed proposal the decision route can act on.
     const workspace = state.workspace;
     const document = openDocument(workspace, "paper.md");
     const blocks = listBlocks(workspace, document.id);
     syncBagFromDocument(state.agent, document, blocks);
+
+    const checklistDraft = (runId: string, itemId: string) => ({
+      run: {
+        schemaVersion: 1 as const,
+        id: runId,
+        documentId: document.id,
+        checker: "cite_check" as const,
+        disclaimer: "形态检查边界",
+        status: "active" as const,
+        createdAt: new Date().toISOString(),
+      },
+      items: [{
+        schemaVersion: 1 as const,
+        id: itemId,
+        runId,
+        documentId: document.id,
+        blockId: blocks[0]!.id,
+        issueType: "citation.author_year",
+        label: "作者—年份引用",
+        excerpt: "（张三，2020）",
+        detail: "疑似引用形态",
+        severity: "info" as const,
+        status: "open" as const,
+        heuristicOnly: true,
+        verification: "not_verified" as const,
+        createdAt: new Date().toISOString(),
+      }],
+    });
+    saveReviewChecklistRun(workspace, checklistDraft("check-run-1", "check-item-1"));
+
+    const unauthenticatedChecklists = await app.inject({
+      method: "GET",
+      url: `/api/v1/documents/${document.id}/checklists`,
+    });
+    expect(unauthenticatedChecklists.statusCode).toBe(401);
+
+    const checklistResponse = await app.inject({
+      method: "GET",
+      url: `/api/v1/documents/${document.id}/checklists`,
+      headers: { authorization: `Bearer ${state.token}` },
+    });
+    expect(checklistResponse.statusCode).toBe(200);
+    expect(checklistResponse.json().runs).toMatchObject([{
+      run: { id: "check-run-1", checker: "cite_check" },
+      items: [{ id: "check-item-1", status: "open" }],
+    }]);
+
+    const checklistDecision = await app.inject({
+      method: "POST",
+      url: "/api/v1/checklists/check-run-1/decisions",
+      headers: { authorization: `Bearer ${state.token}` },
+      payload: { itemIds: ["check-item-1"], kind: "resolve" },
+    });
+    expect(checklistDecision.statusCode).toBe(200);
+    expect(checklistDecision.json().run.items[0].status).toBe("resolved");
+
+    saveReviewChecklistRun(workspace, checklistDraft("check-run-2", "check-item-2"));
+    const staleChecklistDecision = await app.inject({
+      method: "POST",
+      url: "/api/v1/checklists/check-run-1/decisions",
+      headers: { authorization: `Bearer ${state.token}` },
+      payload: { itemIds: ["check-item-1"], kind: "dismiss" },
+    });
+    expect(staleChecklistDecision.statusCode).toBe(409);
+
+    const unknownChecklistItem = await app.inject({
+      method: "POST",
+      url: "/api/v1/checklists/check-run-2/decisions",
+      headers: { authorization: `Bearer ${state.token}` },
+      payload: { itemIds: ["missing-item"], kind: "dismiss" },
+    });
+    expect(unknownChecklistItem.statusCode).toBe(404);
+
     saveProposal(workspace, {
       schemaVersion: 1,
       id: "proposal-race",

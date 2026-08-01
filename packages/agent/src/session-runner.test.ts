@@ -223,6 +223,35 @@ describe("runOfflineSessionTurn open intents", () => {
   });
 });
 
+describe("offline academic checklists", () => {
+  it("returns actual checker runs without creating heuristic comments or proposals", async () => {
+    const turn = await runOfflineSessionTurn({
+      message: "检查引用和语体风格",
+      bridge,
+      bag: {
+        documentId: "doc-1",
+        revision: 0,
+        relativePath: "paper.md",
+        blocks: [{
+          id: "b1",
+          kind: "paragraph",
+          text: "新时代背景下（张三，2020）的治理研究具有重要的理论意义。",
+          order: 0,
+          contentHash: "hash-b1",
+        }],
+      },
+    });
+
+    expect(turn.proposals).toEqual([]);
+    expect(turn.comments).toEqual([]);
+    expect(turn.reviewChecklists?.map((entry) => entry.run.checker)).toEqual([
+      "cite_check",
+      "style_lint",
+    ]);
+    expect(turn.reviewChecklists?.flatMap((entry) => entry.items).length).toBeGreaterThan(0);
+  });
+});
+
 describe("runPiSessionTurn proposal status hint", () => {
   it("injects the proposal hint next to docHint when provided", async () => {
     await runPiSessionTurn({
@@ -404,6 +433,48 @@ describe("runPiSessionTurn context tiers", () => {
     });
     expect(lastPrompt()).toContain("x".repeat(48_000));
     expect(lastPrompt()).not.toContain("x".repeat(48_001));
+  });
+
+  it("injects a bounded host-owned evidence directory independently of tool history", async () => {
+    const sourceRef = "notes.txt#sha256=0123456789abcdef&chars=0-8";
+    await runPiSessionTurn({
+      message: "继续依据资料修订",
+      bridge,
+      bag: { revision: 0, blocks: [] },
+      sourcePaths: ["notes.txt"],
+      evidenceCache: [{
+        sourceRef,
+        relativePath: "notes.txt",
+        start: 0,
+        end: 8,
+        extractedHash: "0123456789abcdef",
+        versionHash: "a".repeat(64),
+        preview: "访谈证据摘录",
+        readAt: "2026-08-01T00:00:00.000Z",
+      }],
+      messages: [{
+        role: "user",
+        content: "[旧工具输出已清理]",
+        timestamp: Date.now(),
+      }] as never,
+    });
+    expect(lastPrompt()).toContain("[会话已读证据目录]");
+    expect(lastPrompt()).toContain(sourceRef);
+    expect(lastPrompt()).toContain("宿主会重新校验原文件 SHA-256");
+  });
+
+  it("injects a readthrough strategy hint for open-document 通读", async () => {
+    await runPiSessionTurn({
+      message: "请通读全文并做结构分析",
+      bridge,
+      bag: {
+        revision: 0,
+        blocks: [{ id: "b1", kind: "paragraph", text: "hello", order: 0, contentHash: "h" }],
+      },
+    });
+    expect(lastPrompt()).toContain("[通读策略]");
+    expect(lastPrompt()).toContain("get_document_outline");
+    expect(lastPrompt()).toContain("不要用 read_workspace_file 按 offset 扫已打开文稿");
   });
 
   it("uses the complete standard loop preset when contextTier is unset", async () => {

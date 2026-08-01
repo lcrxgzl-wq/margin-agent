@@ -980,6 +980,16 @@ textarea {
   margin-bottom: 0.25rem;
 }
 
+.pending-rail .patch-context {
+  margin: -0.2rem 0 0.6rem;
+  padding: 0 0.6rem;
+  color: var(--mute);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .pending-rail .actions,
 .pending-card .actions {
   display: flex;
@@ -3328,6 +3338,256 @@ textarea {
   color: var(--warn);
 }
 
+.review-checklists {
+  display: grid;
+  gap: 1.25rem;
+}
+
+.checklist-run {
+  display: grid;
+  gap: 0.7rem;
+  min-width: 0;
+}
+
+.checklist-run + .checklist-run {
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.checklist-run-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.7rem;
+}
+
+.checklist-run-heading > div {
+  display: grid;
+  gap: 0.12rem;
+}
+
+.checklist-run-heading strong {
+  font-size: 0.88rem;
+}
+
+.checklist-run-heading span,
+.checklist-run-heading time {
+  color: var(--mute);
+  font-size: 0.68rem;
+  line-height: 1.4;
+}
+
+.checklist-run-heading time {
+  max-width: 9rem;
+  text-align: right;
+}
+
+.checklist-disclosure {
+  margin: 0;
+  padding: 0.55rem 0.65rem;
+  border-left: 2px solid var(--line);
+  color: var(--mute);
+  background: color-mix(in srgb, var(--paper) 68%, transparent);
+  font-size: 0.72rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.checklist-disclosure.citation {
+  border-left-color: var(--warn);
+  color: color-mix(in srgb, var(--warn) 78%, var(--ink));
+  background: var(--warn-bg);
+}
+
+.checklist-batch {
+  min-height: 38px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.55rem;
+  padding-bottom: 0.55rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.checklist-batch > span {
+  flex: 1 1 9rem;
+  min-width: 0;
+  color: var(--mute);
+  font-size: 0.7rem;
+}
+
+.checklist-batch > div {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+
+.checklist-batch button {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+  background: var(--paper);
+  cursor: pointer;
+  font-size: 0.7rem;
+}
+
+.checklist-batch button:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.checklist-batch svg,
+.checklist-block-heading svg {
+  width: 14px;
+  height: 14px;
+}
+
+.checklist-empty {
+  margin: 0;
+  padding: 1rem 0;
+  color: var(--mute);
+  text-align: center;
+  font-size: 0.74rem;
+}
+
+.checklist-group {
+  min-width: 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.checklist-group > header {
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.55rem;
+  padding: 0.2rem 0;
+}
+
+.checklist-group > header label {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.checklist-group > header strong {
+  overflow-wrap: anywhere;
+  font-size: 0.76rem;
+}
+
+.checklist-group > header span {
+  flex: 0 0 auto;
+  color: var(--mute);
+  font-size: 0.66rem;
+}
+
+.checklist-run input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.checklist-block {
+  min-width: 0;
+  padding: 0.35rem 0 0.45rem 1.45rem;
+  border-top: 1px solid color-mix(in srgb, var(--line) 62%, transparent);
+}
+
+.checklist-block-heading {
+  min-height: 25px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.checklist-block-heading > span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--mute);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.64rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.checklist-block-heading button {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--mute);
+  background: transparent;
+  cursor: pointer;
+}
+
+.checklist-block-heading button:hover {
+  color: var(--ink);
+  background: var(--mist);
+}
+
+.checklist-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 15px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 0.5rem;
+  padding: 0.45rem 0;
+  cursor: pointer;
+}
+
+.checklist-item > span {
+  min-width: 0;
+  display: grid;
+  gap: 0.12rem;
+}
+
+.checklist-item strong {
+  overflow-wrap: anywhere;
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.checklist-item small {
+  color: var(--mute);
+  overflow-wrap: anywhere;
+  font-size: 0.67rem;
+  line-height: 1.45;
+}
+
+.checklist-item i {
+  color: var(--mute);
+  font-size: 0.64rem;
+  font-style: normal;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.checklist-item.status-resolved,
+.checklist-item.status-dismissed {
+  cursor: default;
+  opacity: 0.64;
+}
+
+.checklist-item.status-resolved i {
+  color: var(--accent);
+}
+
 .review-history {
   min-height: 0;
 }
@@ -3715,6 +3975,8 @@ textarea {
 .activity-tabs button:focus-visible,
 .review-sections button:focus-visible,
 .review-actions button:focus-visible,
+.checklist-batch button:focus-visible,
+.checklist-block-heading button:focus-visible,
 .review-nav button:focus-visible,
 .timeline-toggle:focus-visible,
 .doc-pending:focus-visible,

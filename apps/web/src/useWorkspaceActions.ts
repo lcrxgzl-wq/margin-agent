@@ -2,10 +2,12 @@ import {
   api,
   cancelProposalRun,
   chatStream,
+  decideReviewChecklist,
   closeDocumentSession,
   exportDocumentDocx,
   listComments,
   listProposals,
+  listReviewChecklists,
   openDocument,
   resolveProposal,
   resolveProposals,
@@ -41,6 +43,7 @@ import {
 } from "./documentSafety";
 import { useMarginStore } from "./store";
 import { filterEditableBlockIds, selectionEditUnavailableReason } from "./selectionSafety";
+import { replaceChecklistRun } from "./reviewChecklists";
 
 function mid() {
   return crypto.randomUUID();
@@ -80,6 +83,7 @@ export function useWorkspaceActions(options?: {
   const storeRef = useRef(store);
   const proposalsRequestRef = useRef(0);
   const commentsRequestRef = useRef(0);
+  const checklistsRequestRef = useRef(0);
   const activeChatAbortRef = useRef<AbortController | null>(null);
   const activeProposalRunRef = useRef<{ runId: string; controller: AbortController } | null>(null);
   const [canCancel, setCanCancel] = useState(false);
@@ -145,6 +149,20 @@ export function useWorkspaceActions(options?: {
       (!allowPreviousRevision || current.revision !== expectedRevision - 1))) return;
     store.setComments(data.comments ?? []);
   };
+  const refreshChecklists = async (
+    documentId: string,
+    expectedRevision = storeRef.current.doc?.revision,
+    allowPreviousRevision = false,
+  ) => {
+    const requestId = ++checklistsRequestRef.current;
+    const data = await listReviewChecklists(documentId);
+    const current = storeRef.current.doc;
+    if (requestId !== checklistsRequestRef.current) return;
+    if (current?.id !== documentId || (expectedRevision != null &&
+      current.revision !== expectedRevision &&
+      (!allowPreviousRevision || current.revision !== expectedRevision - 1))) return;
+    store.setChecklists(data.runs);
+  };
   const refreshDocument = async (
     relativePath: string,
     guard?: { document: DocumentMeta | null; generation: number },
@@ -161,6 +179,7 @@ export function useWorkspaceActions(options?: {
     store.setDocBundle(reopened.document, reopened.blocks);
     await refreshProposals(reopened.document.id, reopened.document.revision, true);
     await refreshComments(reopened.document.id, reopened.document.revision, true);
+    await refreshChecklists(reopened.document.id, reopened.document.revision, true);
   };
   const runRewrite = async (
     blockIds: string[],
@@ -223,6 +242,7 @@ export function useWorkspaceActions(options?: {
       }, controller.signal);
       await refreshProposals(document.id);
       await refreshComments(document.id);
+      await refreshChecklists(document.id);
       const count = run.proposalIds?.length ?? 0;
       if (!selectionText) {
         const skipped = skippedTables ? `（已跳过 ${skippedTables} 个表格块）` : "";
@@ -407,6 +427,7 @@ export function useWorkspaceActions(options?: {
       await Promise.all([
         refreshProposals(document.id, result.document?.revision, true),
         refreshComments(document.id, result.document?.revision, true),
+        refreshChecklists(document.id, result.document?.revision, true),
       ]);
       store.appendMessage({ id: mid(), role: "assistant", text: "已接受并写回文章。" });
     } catch (error) {
@@ -436,6 +457,7 @@ export function useWorkspaceActions(options?: {
       await Promise.all([
         refreshProposals(document.id, result.document?.revision, true),
         refreshComments(document.id, result.document?.revision, true),
+        refreshChecklists(document.id, result.document?.revision, true),
       ]);
       store.appendMessage({ id: mid(), role: "assistant", text: "已编辑后接受并写回文章。" });
     } catch (error) {
@@ -486,6 +508,7 @@ export function useWorkspaceActions(options?: {
       await Promise.all([
         refreshProposals(document.id, result.document.revision, true),
         refreshComments(document.id, result.document.revision, true),
+        refreshChecklists(document.id, result.document.revision, true),
       ]);
       store.appendMessage({
         id: mid(),
@@ -836,7 +859,11 @@ export function useWorkspaceActions(options?: {
         }
         const activeId = done.opened?.document.id ?? store.doc?.id;
         if (activeId) {
-          await Promise.all([refreshProposals(activeId), refreshComments(activeId)]);
+          await Promise.all([
+            refreshProposals(activeId),
+            refreshComments(activeId),
+            refreshChecklists(activeId),
+          ]);
         }
       } finally {
         store.endBusy(generation);
@@ -888,6 +915,23 @@ export function useWorkspaceActions(options?: {
     );
   };
 
+  const onChecklistDecision = async (
+    runId: string,
+    itemIds: string[],
+    kind: "resolve" | "dismiss",
+  ) => {
+    try {
+      const result = await decideReviewChecklist(runId, itemIds, kind);
+      if (storeRef.current.doc?.id === result.run.run.documentId) {
+        store.setChecklists(replaceChecklistRun(storeRef.current.checklists, result.run));
+      }
+    } catch (error) {
+      const documentId = storeRef.current.doc?.id;
+      if (documentId) await refreshChecklists(documentId).catch(() => undefined);
+      throw error;
+    }
+  };
+
   const onToggleSourcePath = async (relativePath: string) => {
     const requestState = storeRef.current;
     const requestDocumentId = requestState.doc?.id ?? null;
@@ -937,6 +981,7 @@ export function useWorkspaceActions(options?: {
     onAccept,
     onEdit,
     onUndo,
+    onChecklistDecision,
     onRewriteProposal: async (proposalId: string, blockId: string) => {
       const proposal = store.proposals.find((candidate) => candidate.id === proposalId);
       if (proposal?.tableCell) {

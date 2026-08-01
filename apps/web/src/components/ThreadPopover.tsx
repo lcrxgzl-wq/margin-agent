@@ -61,7 +61,7 @@ function ThreadProposalCard({
       <header className="review-heading">
         <div>
           <strong>{operationName[change.kind]}</strong>
-          <span>{change.scope === "selection" ? "仅替换选中文字" : change.scope === "table_cell" ? `单元格 ${change.address}` : "整段提案"}</span>
+          <span>{change.scope === "selection" ? change.granularityLabel : change.scope === "table_cell" ? `单元格 ${change.address}` : "整段提案"}</span>
         </div>
       </header>
       <p className="review-rationale">{proposal.rationale}</p>

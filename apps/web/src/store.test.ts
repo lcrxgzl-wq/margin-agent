@@ -16,6 +16,18 @@ const proposal = {
   risk: "language",
   status: "proposed",
 } satisfies Proposal;
+const checklist = {
+  run: {
+    schemaVersion: 1 as const,
+    id: "run-1",
+    documentId: "a",
+    checker: "cite_check" as const,
+    disclaimer: "形态检查边界",
+    status: "active" as const,
+    createdAt: "2026-08-01T00:00:00.000Z",
+  },
+  items: [],
+};
 
 describe("marginReducer document isolation", () => {
   it("clears document-scoped state when another document opens", () => {
@@ -23,12 +35,14 @@ describe("marginReducer document isolation", () => {
       ...initialMarginState,
       doc: documentA,
       proposals: [proposal],
+      checklists: [checklist],
       selection: { blockId: "b1", text: "before", selectionStart: 0, anchor: { x: 1, y: 1 } },
       reviewError: "old error",
     };
     const next = marginReducer(state, { type: "setDocBundle", doc: documentB, blocks: [] });
 
     expect(next.proposals).toEqual([]);
+    expect(next.checklists).toEqual([]);
     expect(next.selection.blockId).toBeNull();
     expect(next.reviewError).toBeNull();
   });
@@ -37,6 +51,7 @@ describe("marginReducer document isolation", () => {
     const state = {
       ...initialMarginState,
       doc: documentA,
+      checklists: [checklist],
       selection: { blockId: "b1", text: "before", selectionStart: 0, anchor: { x: 1, y: 1 } },
     };
     const next = marginReducer(state, {
@@ -46,6 +61,16 @@ describe("marginReducer document isolation", () => {
     });
 
     expect(next.selection).toEqual(initialMarginState.selection);
+    expect(next.checklists).toEqual([]);
+  });
+
+  it("fills checklist decisions into the document-scoped store", () => {
+    const next = marginReducer(initialMarginState, {
+      type: "setChecklists",
+      checklists: [checklist],
+    });
+
+    expect(next.checklists).toEqual([checklist]);
   });
 
   it("preserves dirty canvas state when a session hydrates the same document", () => {

@@ -39,7 +39,56 @@ export type SummarizerFn = (
   signal?: AbortSignal,
 ) => Promise<string>;
 
-export const PRUNED_TOOL_OUTPUT_PLACEHOLDER = "[旧工具输出已清理，可用工具重新读取]";
+export const PRUNED_TOOL_OUTPUT_PLACEHOLDER =
+  "[旧工具输出已清理属正常。请按 blockId/cursor/sourceRef 按需重读单段/续读；不要因此用 offset 重扫全文]";
+
+function toolNameOf(message: AgentMessage): string {
+  return String((message as { toolName?: unknown }).toolName ?? "");
+}
+
+/** Keep the exact continuation anchor when pruning bounded read tool output. */
+export function prunedToolOutputPlaceholder(
+  message: AgentMessage,
+  originalText: string,
+): string {
+  const toolName = toolNameOf(message);
+  if (toolName === "read_document_blocks") {
+    try {
+      const parsed = JSON.parse(originalText) as {
+        cursor?: unknown;
+        nextCursor?: unknown;
+      };
+      if (typeof parsed.cursor === "string") {
+        const next = parsed.nextCursor == null
+          ? "已读到结尾"
+          : `继续用 nextCursor=${String(parsed.nextCursor)}`;
+        return `[旧工具输出已清理属正常。cursor=${parsed.cursor}；${next}。不要用 offset 重扫全文]`;
+      }
+    } catch {
+      /* fall through to the generic placeholder */
+    }
+  }
+  if (toolName === "read_workspace_file") {
+    try {
+      const parsed = JSON.parse(originalText) as {
+        sourceRef?: unknown;
+        nextOffset?: unknown;
+      };
+      const sourceRef = typeof parsed.sourceRef === "string" ? parsed.sourceRef : "";
+      const nextOffset = typeof parsed.nextOffset === "number" ? String(parsed.nextOffset) : "";
+      if (sourceRef || nextOffset) {
+        const parts = [
+          sourceRef ? `sourceRef=${sourceRef}` : "",
+          nextOffset ? `nextOffset=${nextOffset}` : "",
+        ].filter(Boolean);
+        return `[旧工具输出已清理属正常。${parts.join("；")}。不要重扫全文]`;
+      }
+    } catch {
+      /* fall through to the generic placeholder */
+    }
+  }
+  return PRUNED_TOOL_OUTPUT_PLACEHOLDER;
+}
 
 /** Stage-1 protection window (chars), conservative equivalent of opencode PRUNE_PROTECT. */
 export const PRUNE_PROTECT_CHARS = 40_000;
@@ -159,8 +208,9 @@ export function pruneToolOutputs(
     if (!Array.isArray(message.content)) continue;
     const content = (message.content as Array<Record<string, unknown>>).map((block) => {
       if (block?.type === "text" && typeof block.text === "string") {
-        reclaimed += Math.max(0, block.text.length - PRUNED_TOOL_OUTPUT_PLACEHOLDER.length);
-        return { ...block, text: PRUNED_TOOL_OUTPUT_PLACEHOLDER };
+        const replacement = prunedToolOutputPlaceholder(message as AgentMessage, block.text);
+        reclaimed += Math.max(0, block.text.length - replacement.length);
+        return { ...block, text: replacement };
       }
       return block;
     });

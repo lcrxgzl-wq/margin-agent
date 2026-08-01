@@ -1,4 +1,9 @@
-import type { SelectionBlockRange } from "@margin/domain";
+import type {
+  ReviewChecklistDecision,
+  ReviewChecklistItem,
+  ReviewChecklistRun,
+  SelectionBlockRange,
+} from "@margin/domain";
 
 export type Block = {
   id: string;
@@ -262,6 +267,28 @@ export async function listProposals(documentId: string) {
 export async function listComments(documentId: string) {
   return api<{ comments: Comment[]; citeDisclaimer?: string }>(
     `/api/v1/documents/${documentId}/comments`,
+  );
+}
+
+export type ReviewChecklistBundle = {
+  run: ReviewChecklistRun;
+  items: ReviewChecklistItem[];
+};
+
+export async function listReviewChecklists(documentId: string) {
+  return api<{ runs: ReviewChecklistBundle[] }>(
+    `/api/v1/documents/${documentId}/checklists`,
+  );
+}
+
+export async function decideReviewChecklist(
+  runId: string,
+  itemIds: string[],
+  kind: "resolve" | "dismiss",
+) {
+  return api<{ decision: ReviewChecklistDecision; run: ReviewChecklistBundle }>(
+    `/api/v1/checklists/${encodeURIComponent(runId)}/decisions`,
+    { method: "POST", body: JSON.stringify({ itemIds, kind }) },
   );
 }
 

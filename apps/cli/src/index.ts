@@ -16,6 +16,7 @@ import {
   listWorkspaceSourceFiles,
   readWorkspaceText,
   readWorkspaceSource,
+  readWorkspaceSourceVersion,
   writeWorkspaceText,
   supersedeOpenProposals,
   saveProposal,
@@ -36,6 +37,12 @@ import {
   exportDocumentDocx,
   replaceDocumentComments,
   listComments,
+  listActiveReviewChecklists,
+  saveReviewChecklistRun,
+  decideReviewChecklistItems,
+  ReviewChecklistConflictError,
+  ReviewChecklistNotFoundError,
+  ReviewChecklistValidationError,
   listAgentTranscripts,
   loadAndApplyLlmSettings,
   readLlmSettingsStore,
@@ -60,6 +67,7 @@ import {
   CONTEXT_TIER_PRESETS,
   isUserFacingPhase,
   PiLoopFailure,
+  createReviewChecklistRuns,
   runBlockScan,
   resolveEngine,
   type ToolAuditEvent,
@@ -349,6 +357,7 @@ async function main() {
       chatTurns: state.chat.list(),
       threads: state.reviewThreads,
       sourcePaths: state.agent.sourcePaths,
+      evidenceCache: state.agent.evidenceCache,
       task: state.agent.task,
     });
   /** GET /api/v1/session payload — also returned by session new/switch so the web reuses one hydrate path. */
@@ -394,22 +403,19 @@ async function main() {
   };
 
   const sourceExcerptCache = new Map<string, {
-    mtimeMs: number;
-    size: number;
+    versionHash: string;
     relativePath: string;
     text: string;
     contentHash: string;
   }>();
   const readSourceExcerpt = async (relativePath: string) => {
-    const absolutePath = path.join(workspace.root, relativePath);
-    const stat = fs.statSync(absolutePath);
     const cacheKey = relativePath.replace(/\\/g, "/").toLocaleLowerCase();
+    const version = readWorkspaceSourceVersion(workspace, relativePath);
     const cached = sourceExcerptCache.get(cacheKey);
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached;
+    if (cached?.versionHash === version.versionHash) return cached;
     const source = await readWorkspaceSource(workspace, relativePath);
     const entry = {
-      mtimeMs: stat.mtimeMs,
-      size: stat.size,
+      versionHash: source.versionHash,
       relativePath: source.relativePath.replace(/\\/g, "/"),
       text: source.text,
       contentHash: contentHash(source.text),
@@ -519,6 +525,18 @@ async function main() {
           source: c.source,
         })),
       );
+      const checklistByChecker = new Map(
+        (scan.reviewChecklists ?? []).map((checklist) => [checklist.run.checker, checklist]),
+      );
+      const scannedBlocks = blocks.filter((block) => blockIds.includes(block.id));
+      for (const checklist of createReviewChecklistRuns(documentId, scannedBlocks)) {
+        if (!checklistByChecker.has(checklist.run.checker)) {
+          checklistByChecker.set(checklist.run.checker, checklist);
+        }
+      }
+      for (const checklist of checklistByChecker.values()) {
+        saveReviewChecklistRun(workspace, checklist);
+      }
       patch({
         status: "done",
         proposalIds,
@@ -530,7 +548,7 @@ async function main() {
         steps: scan.steps,
         toolAudit: scan.toolAudit,
         citeDisclaimer:
-          "cite_check 仅检查引用形态，未验证文献存在性、真实性或内容支持关系。",
+          "形态学通过 ≠ 文献真实存在。此检查不验证文献真实性、存在性，也不验证引文是否支持正文主张。",
       });
     } catch (e) {
       if (state.runs.get(runId)?.status === "cancelled") return;
@@ -973,8 +991,54 @@ async function main() {
     return {
       comments: listComments(workspace, req.params.id),
       citeDisclaimer:
-        "cite_check 仅检查引用形态，未验证文献存在性、真实性或内容支持关系。",
+        "形态学通过 ≠ 文献真实存在。此检查不验证文献真实性、存在性，也不验证引文是否支持正文主张。",
     };
+  });
+
+  app.get<{ Params: { id: string } }>(
+    "/api/v1/documents/:id/checklists",
+    async (req, reply) => {
+      requireAuth(state, req.headers.authorization);
+      try {
+        getDocument(workspace, req.params.id);
+        return { runs: listActiveReviewChecklists(workspace, req.params.id) };
+      } catch (error) {
+        if (error instanceof ReviewChecklistNotFoundError) {
+          return reply.code(404).send({ error: error.message });
+        }
+        return reply.code(404).send({ error: "not found" });
+      }
+    },
+  );
+
+  app.post<{
+    Params: { runId: string };
+    Body: { itemIds?: string[]; kind?: "resolve" | "dismiss" };
+  }>("/api/v1/checklists/:runId/decisions", async (req, reply) => {
+    requireAuth(state, req.headers.authorization);
+    if (!Array.isArray(req.body?.itemIds) || !req.body?.kind) {
+      return reply.code(400).send({ error: "itemIds and kind are required" });
+    }
+    try {
+      const result = decideReviewChecklistItems(
+        workspace,
+        req.params.runId,
+        req.body.itemIds,
+        req.body.kind,
+      );
+      return { decision: result.decision, run: result.checklist };
+    } catch (error) {
+      if (error instanceof ReviewChecklistConflictError) {
+        return reply.code(409).send({ error: error.message });
+      }
+      if (error instanceof ReviewChecklistNotFoundError) {
+        return reply.code(404).send({ error: error.message });
+      }
+      if (error instanceof ReviewChecklistValidationError) {
+        return reply.code(400).send({ error: error.message });
+      }
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   app.post<{

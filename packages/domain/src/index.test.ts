@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   ProposalSchema,
   DecisionSchema,
+  ReviewChecklistDecisionSchema,
+  ReviewChecklistRunDraftSchema,
   SelectionCommandSchema,
   TableCellProposalSchema,
   assertDecisionInput,
@@ -166,6 +168,67 @@ describe("apply derivation", () => {
     });
     expect(canApply(proposal, decision)).toBe(false);
     expect(textToApply(proposal, decision)).toBeNull();
+  });
+});
+
+describe("review checklist contracts", () => {
+  const run = {
+    schemaVersion: 1 as const,
+    id: "check-run-1",
+    documentId: "d1",
+    checker: "cite_check" as const,
+    disclaimer: "morphology only",
+    status: "active" as const,
+    createdAt: now,
+  };
+  const item = {
+    schemaVersion: 1 as const,
+    id: "check-item-1",
+    runId: run.id,
+    documentId: run.documentId,
+    blockId: "b1",
+    issueType: "citation.author_year",
+    label: "作者—年份引用",
+    excerpt: "（张三，2020）",
+    detail: "疑似作者—年份引用形态",
+    severity: "info" as const,
+    status: "open" as const,
+    heuristicOnly: true,
+    verification: "not_verified" as const,
+    createdAt: now,
+  };
+
+  it("binds draft items to one active run", () => {
+    expect(ReviewChecklistRunDraftSchema.parse({ run, items: [item] }).items).toHaveLength(1);
+    expect(() => ReviewChecklistRunDraftSchema.parse({
+      run,
+      items: [{ ...item, runId: "other-run" }],
+    })).toThrow(/scope mismatch/);
+    expect(() => ReviewChecklistRunDraftSchema.parse({
+      run,
+      items: [item, { ...item }],
+    })).toThrow(/unique/);
+    expect(() => ReviewChecklistRunDraftSchema.parse({
+      run,
+      items: [{ ...item, status: "resolved", decidedAt: now }],
+    })).toThrow(/must be open/);
+  });
+
+  it("requires non-empty unique ids in one batch decision", () => {
+    const base = {
+      schemaVersion: 1 as const,
+      id: "check-decision-1",
+      runId: run.id,
+      kind: "resolve" as const,
+      createdAt: now,
+    };
+    expect(ReviewChecklistDecisionSchema.parse({ ...base, itemIds: [item.id] }).kind)
+      .toBe("resolve");
+    expect(() => ReviewChecklistDecisionSchema.parse({ ...base, itemIds: [] })).toThrow();
+    expect(() => ReviewChecklistDecisionSchema.parse({
+      ...base,
+      itemIds: [item.id, item.id],
+    })).toThrow(/unique/);
   });
 });
 

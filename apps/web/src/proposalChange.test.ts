@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Proposal } from "./api";
-import { proposalChange } from "./proposalChange";
+import { proposalChange, textPatchGranularity } from "./proposalChange";
 
 const base: Proposal = {
   id: "p1",
@@ -32,7 +32,9 @@ describe("proposalChange", () => {
       afterFragment: "译文",
       contextBefore: "Before ",
       contextAfter: " after",
+      granularityLabel: "短语 patch",
     });
+    expect(textPatchGranularity("这是一个完整句子。")) .toBe("句级 patch");
   });
 
   it("composes a fragment edit without changing surrounding text", () => {

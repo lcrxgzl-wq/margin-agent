@@ -5,6 +5,7 @@ import type {
   ProposalTargetLanguage,
   SelectionBlockRange,
   TableCellChange,
+  ReviewChecklistRunDraft,
 } from "@margin/domain";
 
 /** Product-level reasoning mode; auto omits provider-specific reasoning controls. */
@@ -78,6 +79,7 @@ export type PaperAgentResult = {
   engine: "pi" | "simple";
   proposals: Omit<Proposal, "id" | "createdAt" | "status">[];
   comments?: AgentComment[];
+  reviewChecklists?: ReviewChecklistRunDraft[];
   notes?: string[];
   /** Human-readable tool/step trail for UI. */
   steps?: string[];

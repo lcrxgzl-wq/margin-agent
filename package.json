@@ -19,6 +19,7 @@
     "smoke": "pnpm build && node scripts/smoke-golden.mjs",
     "smoke:memory": "pnpm build && node scripts/smoke-chat-memory.mjs",
     "gate:pi": "pnpm build && node scripts/pi-quality-gate.mjs",
+    "gate:readthrough": "pnpm build && node scripts/pi-readthrough-gate.mjs",
     "gate:docx": "pnpm --filter @margin/storage-local exec vitest run src/corpus.test.ts",
     "gate:office": "pnpm build && node scripts/office-native-gate.mjs",
     "gate:thread-restart": "pnpm build && node scripts/thread-restart-gate.mjs"

@@ -6,6 +6,10 @@ import lockfile from "proper-lockfile";
 import writeFileAtomic from "write-file-atomic";
 import { type BlockSnapshot, type DocumentMeta, contentHash } from "@margin/domain";
 import {
+  initializeReviewChecklistStore,
+  supersedeActiveReviewChecklists,
+} from "./checklist-store.js";
+import {
   applyDocxPreservingEdits,
   docxContentHash,
   extractDocxBlocks,
@@ -296,7 +300,9 @@ export async function openWorkspace(rootInput: string): Promise<Workspace> {
     db.exec("ALTER TABLE proposals ADD COLUMN table_cell_json TEXT");
   }
 
-  return { root, db, releaseLock };
+  const workspace = { root, db, releaseLock };
+  initializeReviewChecklistStore(workspace);
+  return workspace;
 }
 
 export function chunkMarkdown(text: string): BlockSnapshot[] {
@@ -380,6 +386,7 @@ function upsertDocumentIndex(
         `UPDATE proposals SET status='superseded'
          WHERE document_id=? AND status IN ('draft', 'proposed', 'decided')`,
       ).run(id);
+      supersedeActiveReviewChecklists(ws, id);
     }
     ws.db.prepare("COMMIT").run();
   } catch (error) {
@@ -514,6 +521,7 @@ function finalizeNativeSaveJournal(ws: Workspace, journal: NativeSaveJournal): v
       `UPDATE proposals SET status='superseded'
        WHERE document_id=? AND status IN ('draft', 'proposed', 'decided')`,
     ).run(journal.documentId);
+    supersedeActiveReviewChecklists(ws, journal.documentId);
     deleteNativeSaveJournal(ws, journal.documentId);
     ws.db.prepare("COMMIT").run();
   } catch (error) {
@@ -698,6 +706,7 @@ export async function reconcileRegisteredDocxDocuments(ws: Workspace): Promise<n
         `UPDATE proposals SET status='superseded'
          WHERE document_id=? AND status IN ('draft', 'proposed', 'decided')`,
       ).run(document.id);
+      supersedeActiveReviewChecklists(ws, document.id);
       ws.db.prepare("COMMIT").run();
       reconciled += 1;
     } catch (error) {
@@ -779,6 +788,10 @@ const MAX_RICH_SOURCE_BYTES = 25 * 1024 * 1024;
 const MAX_EXTRACTED_SOURCE_CHARS = 2_000_000;
 const MAX_PDF_PAGES = 300;
 
+function sourceVersionHash(buffer: Buffer): string {
+  return createHash("sha256").update(buffer).digest("hex");
+}
+
 const DENIED_EXTERNAL_SEGMENTS = new Set([".ssh", ".aws", ".gnupg", ".git", ".margin"]);
 const DENIED_EXTERNAL_BASENAMES = new Set([".env", ".netrc", ".npmrc", ".pgpass"]);
 
@@ -829,13 +842,14 @@ async function extractRichSourceText(rel: string, buffer: Buffer): Promise<strin
 async function readExternalSource(
   inputPath: string,
   resolved: string,
-): Promise<{ relativePath: string; text: string; bytes: number }> {
+): Promise<{ relativePath: string; text: string; bytes: number; versionHash: string }> {
   const rel = resolved.replace(/\\/g, "/");
   if (TEXT_EXT.test(rel)) {
     const stat = fs.statSync(resolved);
     if (stat.size > MAX_READ_BYTES) throw new Error("file too large to read");
-    const text = fs.readFileSync(resolved, "utf8");
-    return { relativePath: inputPath, text, bytes: Buffer.byteLength(text, "utf8") };
+    const buffer = fs.readFileSync(resolved);
+    const text = buffer.toString("utf8");
+    return { relativePath: inputPath, text, bytes: stat.size, versionHash: sourceVersionHash(buffer) };
   }
   if (!/\.(pdf|docx)$/i.test(rel)) {
     throw new Error("only md/txt/json/csv/pdf/docx can be read");
@@ -844,14 +858,15 @@ async function readExternalSource(
   if (stat.size > MAX_RICH_SOURCE_BYTES) {
     throw new Error("source file is too large (max 25 MiB)");
   }
-  const text = await extractRichSourceText(rel, fs.readFileSync(resolved));
-  return { relativePath: inputPath, text, bytes: stat.size };
+  const buffer = fs.readFileSync(resolved);
+  const text = await extractRichSourceText(rel, buffer);
+  return { relativePath: inputPath, text, bytes: stat.size, versionHash: sourceVersionHash(buffer) };
 }
 
 /** Read a text file inside the workspace (path-safe). */
 export function readWorkspaceText(
   ws: Workspace, relativePath: string,
-): { relativePath: string; text: string; bytes: number } {
+): { relativePath: string; text: string; bytes: number; versionHash: string } {
   const rel = relativePath.replace(/\\/g, "/");
   if (!TEXT_EXT.test(rel)) throw new Error("only md/txt/json/csv can be read");
   const abs = assertInsideWorkspace(ws.root, rel);
@@ -860,11 +875,13 @@ export function readWorkspaceText(
   assertSingleLinkFile(abs);
   const st = fs.statSync(abs);
   if (st.size > MAX_READ_BYTES) throw new Error("file too large to read");
-  const text = fs.readFileSync(abs, "utf8");
+  const buffer = fs.readFileSync(abs);
+  const text = buffer.toString("utf8");
   return {
     relativePath: canonicalRelativePath,
     text,
     bytes: Buffer.byteLength(text, "utf8"),
+    versionHash: sourceVersionHash(buffer),
   };
 }
 
@@ -879,7 +896,7 @@ export async function readWorkspaceSource(
   ws: Workspace,
   relativePath: string,
   opts?: { unlimitedRead?: boolean },
-): Promise<{ relativePath: string; text: string; bytes: number }> {
+): Promise<{ relativePath: string; text: string; bytes: number; versionHash: string }> {
   if (path.isAbsolute(relativePath) || path.win32.isAbsolute(relativePath)) {
     if (!opts?.unlimitedRead) {
       throw new Error(
@@ -911,8 +928,66 @@ export async function readWorkspaceSource(
   if (stat.size > MAX_RICH_SOURCE_BYTES) {
     throw new Error("source file is too large (max 25 MiB)");
   }
-  const text = await extractRichSourceText(rel, fs.readFileSync(abs));
-  return { relativePath: canonicalRelativePath, text, bytes: stat.size };
+  const buffer = fs.readFileSync(abs);
+  const text = await extractRichSourceText(rel, buffer);
+  return { relativePath: canonicalRelativePath, text, bytes: stat.size, versionHash: sourceVersionHash(buffer) };
+}
+
+/** Hash the original source bytes without extracting rich document text. */
+export function readWorkspaceSourceVersion(
+  ws: Workspace,
+  relativePath: string,
+  opts?: { unlimitedRead?: boolean },
+): { relativePath: string; bytes: number; versionHash: string } {
+  if (path.isAbsolute(relativePath) || path.win32.isAbsolute(relativePath)) {
+    if (!opts?.unlimitedRead) {
+      throw new Error(
+        "path is outside workspace; start with --unlimited (or MARGIN_UNLIMITED=1) to allow external reads",
+      );
+    }
+    if (!fs.existsSync(relativePath)) throw new Error("file not found");
+    const resolved = fs.realpathSync(relativePath);
+    const inside = path.relative(fs.realpathSync(ws.root), resolved);
+    if (inside && !inside.startsWith("..") && !path.isAbsolute(inside)) {
+      return readWorkspaceSourceVersion(ws, inside.replace(/\\/g, "/"));
+    }
+    if (isDeniedExternalPath(resolved)) throw new Error("refusing to read sensitive path");
+    assertSingleLinkFile(resolved);
+    if (!/\.(md|markdown|txt|json|csv|pdf|docx)$/i.test(resolved)) {
+      throw new Error("only md/txt/json/csv/pdf/docx can be read");
+    }
+    const stat = fs.statSync(resolved);
+    if (TEXT_EXT.test(resolved) && stat.size > MAX_READ_BYTES) {
+      throw new Error("file too large to read");
+    }
+    if (!TEXT_EXT.test(resolved) && stat.size > MAX_RICH_SOURCE_BYTES) {
+      throw new Error("source file is too large (max 25 MiB)");
+    }
+    const buffer = fs.readFileSync(resolved);
+    return { relativePath, bytes: stat.size, versionHash: sourceVersionHash(buffer) };
+  }
+
+  const rel = relativePath.replace(/\\/g, "/");
+  if (!/\.(md|markdown|txt|json|csv|pdf|docx)$/i.test(rel)) {
+    throw new Error("only md/txt/json/csv/pdf/docx can be read");
+  }
+  const abs = assertInsideWorkspace(ws.root, rel);
+  const canonicalRelativePath = visibleRelativePath(ws.root, abs);
+  if (!fs.existsSync(abs)) throw new Error("file not found");
+  assertSingleLinkFile(abs);
+  const stat = fs.statSync(abs);
+  if (TEXT_EXT.test(rel) && stat.size > MAX_READ_BYTES) {
+    throw new Error("file too large to read");
+  }
+  if (!TEXT_EXT.test(rel) && stat.size > MAX_RICH_SOURCE_BYTES) {
+    throw new Error("source file is too large (max 25 MiB)");
+  }
+  const buffer = fs.readFileSync(abs);
+  return {
+    relativePath: canonicalRelativePath,
+    bytes: stat.size,
+    versionHash: sourceVersionHash(buffer),
+  };
 }
 
 /** Create or overwrite a text file inside the workspace (path-safe, atomic). */

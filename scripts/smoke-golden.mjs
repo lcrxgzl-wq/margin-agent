@@ -80,10 +80,19 @@ try {
   }
   if (run.status !== "done") throw new Error(JSON.stringify(run));
   if (run.engine !== "simple") throw new Error(`expected simple engine, got ${run.engine}`);
-  if (!(run.commentCount > 0)) throw new Error("expected heuristic comments");
+  if (run.commentCount !== 0) throw new Error("automatic heuristic comments must stay disabled");
 
-  const { comments } = await api(`/api/v1/documents/${opened.document.id}/comments`);
-  if (!comments?.length) throw new Error("comments not persisted");
+  const { runs: checklists } = await api(
+    `/api/v1/documents/${opened.document.id}/checklists`,
+  );
+  const checkerNames = checklists?.map((entry) => entry.run.checker).sort();
+  if (JSON.stringify(checkerNames) !== JSON.stringify(["cite_check", "style_lint"])) {
+    throw new Error(`expected cite/style checklists, got ${JSON.stringify(checkerNames)}`);
+  }
+  const citeRun = checklists.find((entry) => entry.run.checker === "cite_check");
+  if (!citeRun?.run.disclaimer.includes("形态学通过 ≠ 文献真实存在")) {
+    throw new Error("citation verification boundary is missing");
+  }
 
   const { proposals } = await api(
     `/api/v1/documents/${opened.document.id}/proposals?status=proposed`,
@@ -101,6 +110,10 @@ try {
       proposalIds: [proposals[0].id],
     }),
   });
+  const { runs: activeAfterApply } = await api(
+    `/api/v1/documents/${opened.document.id}/checklists`,
+  );
+  if (activeAfterApply.length) throw new Error("applied document change must supersede checklists");
   await api(`/api/v1/documents/${opened.document.id}/exports`);
   console.log("GOLDEN_PATH_OK");
 } finally {

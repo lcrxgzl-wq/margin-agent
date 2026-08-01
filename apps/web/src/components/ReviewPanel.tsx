@@ -1,14 +1,18 @@
-import { Check, ChevronLeft, ChevronRight, History, ListChecks, Pencil, RotateCcw, X } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, ClipboardCheck, History, ListChecks, Pencil, RotateCcw, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { listDocumentTimeline, readSourceChunk, type Comment, type Proposal, type TimelineEntry } from "../api";
+import type { ReviewChecklistItem } from "@margin/domain";
+import { listDocumentTimeline, readSourceChunk, type Comment, type Proposal, type ReviewChecklistBundle, type TimelineEntry } from "../api";
 import { proposalChange } from "../proposalChange";
 import { filterTimeline, historyEntryView, historyFilters, type HistoryFilter } from "../reviewHistory";
 import type { ReviewThread } from "../store";
 import { proposalMatchesSelection } from "../selectionIdentity";
+import { checklistOpenCount } from "../reviewChecklists";
+import { ReviewChecklistPanel } from "./ReviewChecklistPanel";
 
 type Props = {
   proposals: Proposal[];
   comments: Comment[];
+  checklists: ReviewChecklistBundle[];
   documentId: string;
   busy: boolean;
   dirty: boolean;
@@ -21,6 +25,12 @@ type Props = {
   threads?: ReviewThread[];
   activeThreadId?: string | null;
   onOpenThread?: (thread: ReviewThread) => void;
+  onChecklistDecision: (
+    runId: string,
+    itemIds: string[],
+    kind: "resolve" | "dismiss",
+  ) => Promise<void>;
+  onLocateChecklistItem: (item: ReviewChecklistItem) => void;
 };
 
 const operationName = {
@@ -62,6 +72,7 @@ function EvidenceRef({ reference }: { reference: string }) {
 export function ReviewPanel({
   proposals,
   comments,
+  checklists,
   documentId,
   busy,
   dirty,
@@ -74,11 +85,13 @@ export function ReviewPanel({
   threads = [],
   activeThreadId,
   onOpenThread,
+  onChecklistDecision,
+  onLocateChecklistItem,
 }: Props) {
   const [activeId, setActiveId] = useState<string | null>(proposals[0]?.id ?? null);
   const [editing, setEditing] = useState(false);
   const [editedText, setEditedText] = useState("");
-  const [view, setView] = useState<"queue" | "history">("queue");
+  const [view, setView] = useState<"queue" | "checks" | "history">("queue");
   const [history, setHistory] = useState<TimelineEntry[]>([]);
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>("all");
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -101,6 +114,7 @@ export function ReviewPanel({
     () => filterTimeline(history, historyFilter),
     [history, historyFilter],
   );
+  const openChecklistItems = checklistOpenCount(checklists);
 
   useEffect(() => {
     if (!proposals.length) {
@@ -152,6 +166,7 @@ export function ReviewPanel({
     <section className="review-panel" aria-label="审阅">
       <nav className="review-sections" aria-label="审阅视图">
         <button type="button" className={view === "queue" ? "active" : ""} onClick={() => setView("queue")}><ListChecks />待确认{proposals.length ? <b>{proposals.length}</b> : null}</button>
+        <button type="button" className={view === "checks" ? "active" : ""} onClick={() => setView("checks")}><ClipboardCheck />检查{openChecklistItems ? <b>{openChecklistItems}</b> : null}</button>
         <button type="button" className={view === "history" ? "active" : ""} onClick={() => setView("history")}><History />历史</button>
       </nav>
       {view === "queue" ? <>
@@ -187,7 +202,7 @@ export function ReviewPanel({
           <header className="review-heading">
             <div>
               <strong>{operationName[change.kind]}</strong>
-              <span>{change.scope === "selection" ? "仅替换选中文字" : change.scope === "table_cell" ? `单元格 ${change.address}` : "整段提案"}</span>
+              <span>{change.scope === "selection" ? change.granularityLabel : change.scope === "table_cell" ? `单元格 ${change.address}` : "整段提案"}</span>
             </div>
             {proposals.length > 1 ? (
               <div className="review-nav" aria-label="切换提案">
@@ -274,7 +289,13 @@ export function ReviewPanel({
           ))}
         </div>
       ) : null}
-      </> : (
+      </> : view === "checks" ? (
+        <ReviewChecklistPanel
+          runs={checklists}
+          onDecision={onChecklistDecision}
+          onLocate={onLocateChecklistItem}
+        />
+      ) : (
         <div className="review-history">
           <nav className="review-sections review-history-filters" aria-label="历史筛选">
             {historyFilters.map((item) => (

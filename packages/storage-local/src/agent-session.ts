@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { SelectionBlockRange } from "@margin/domain";
+import { EvidenceCacheEntrySchema, type EvidenceCacheEntry, type SelectionBlockRange } from "@margin/domain";
 import type { Workspace } from "./workspace-fs.js";
 
 const SESSION_ROW_ID = "current";
@@ -13,6 +13,8 @@ const MAX_ANCHOR_TEXT_CHARS = 100_000;
 const MAX_TABLE_ADDRESS_CHARS = 32;
 const MAX_SOURCE_PATHS = 50;
 const MAX_SOURCE_PATH_CHARS = 500;
+const MAX_EVIDENCE_CACHE_ENTRIES = 80;
+const MAX_EVIDENCE_PREVIEW_CHARS = 800;
 const MAX_TASK_OBJECTIVE_CHARS = 2_000;
 const MAX_TASK_SOURCE_REFS = 100;
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
@@ -70,6 +72,7 @@ export type PersistedAgentSession = {
   chatTurns: PersistedChatTurn[];
   threads: PersistedReviewThread[];
   sourcePaths: string[];
+  evidenceCache: EvidenceCacheEntry[];
   task?: PersistedAgentTask;
 };
 
@@ -80,6 +83,7 @@ type SessionEnvelope = {
   chatTurns?: PersistedChatTurn[];
   threads?: PersistedReviewThread[];
   sourcePaths?: string[];
+  evidenceCache?: EvidenceCacheEntry[];
   task?: PersistedAgentTask;
 };
 
@@ -261,6 +265,34 @@ function normalizeSourcePaths(value: unknown): string[] {
   return [...new Set(paths)].slice(0, MAX_SOURCE_PATHS);
 }
 
+function normalizeEvidenceCache(value: unknown, sourcePaths: string[]): EvidenceCacheEntry[] {
+  if (!Array.isArray(value)) return [];
+  const attached = new Set(sourcePaths);
+  const byRef = new Map<string, EvidenceCacheEntry>();
+  for (const item of value) {
+    const parsed = EvidenceCacheEntrySchema.safeParse(item);
+    if (!parsed.success) continue;
+    const entry = parsed.data;
+    const canonicalPath = normalizeSourcePaths([entry.relativePath])[0];
+    if (canonicalPath !== entry.relativePath || !attached.has(entry.relativePath)) continue;
+    const normalized = {
+      ...entry,
+      preview: entry.preview.slice(0, MAX_EVIDENCE_PREVIEW_CHARS),
+    };
+    for (const [sourceRef, cached] of byRef) {
+      if (
+        cached.relativePath === normalized.relativePath &&
+        cached.versionHash !== normalized.versionHash
+      ) {
+        byRef.delete(sourceRef);
+      }
+    }
+    byRef.delete(entry.sourceRef);
+    byRef.set(entry.sourceRef, normalized);
+  }
+  return [...byRef.values()].slice(-MAX_EVIDENCE_CACHE_ENTRIES);
+}
+
 function normalizeTask(
   value: unknown,
   restoreRunningAsInterrupted = false,
@@ -333,6 +365,7 @@ function parseSessionPayload(raw: string): {
   chatTurns: PersistedChatTurn[];
   threads: PersistedReviewThread[];
   sourcePaths: string[];
+  evidenceCache: EvidenceCacheEntry[];
   task?: PersistedAgentTask;
 } {
   try {
@@ -344,6 +377,7 @@ function parseSessionPayload(raw: string): {
         chatTurns: [],
         threads: [],
         sourcePaths: [],
+        evidenceCache: [],
         task: undefined,
       };
     }
@@ -352,6 +386,7 @@ function parseSessionPayload(raw: string): {
       const rounds = Number(env.clarificationRounds);
       const chatTurns = normalizeChatTurns(env.chatTurns);
       const threads = normalizeReviewThreads(env.threads);
+      const sourcePaths = normalizeSourcePaths(env.sourcePaths);
       return {
         messages: trimMessagesAtTurnBoundary(env.messages),
         documentId:
@@ -361,14 +396,15 @@ function parseSessionPayload(raw: string): {
         clarificationRounds: Number.isFinite(rounds) && rounds > 0 ? Math.min(3, Math.floor(rounds)) : 0,
         chatTurns,
         threads,
-        sourcePaths: normalizeSourcePaths(env.sourcePaths),
+        sourcePaths,
+        evidenceCache: normalizeEvidenceCache(env.evidenceCache, sourcePaths),
         task: normalizeTask(env.task, true),
       };
     }
   } catch {
     /* ignore */
   }
-  return { messages: [], clarificationRounds: 0, chatTurns: [], threads: [], sourcePaths: [], task: undefined };
+  return { messages: [], clarificationRounds: 0, chatTurns: [], threads: [], sourcePaths: [], evidenceCache: [], task: undefined };
 }
 
 /** Ensure agent_sessions table exists (idempotent for older DBs). */
@@ -428,6 +464,7 @@ export function saveAgentSession(
     chatTurns?: PersistedChatTurn[];
     threads?: PersistedReviewThread[];
     sourcePaths?: string[];
+    evidenceCache?: EvidenceCacheEntry[];
     task?: PersistedAgentTask;
   },
 ): PersistedAgentSession {
@@ -447,6 +484,7 @@ export function saveAgentSession(
       ? Math.min(3, Math.floor(session.clarificationRounds))
       : 0;
   const sourcePaths = normalizeSourcePaths(session.sourcePaths);
+  let evidenceCache = normalizeEvidenceCache(session.evidenceCache, sourcePaths);
   const task = normalizeTask(session.task);
 
   const serialize = () =>
@@ -457,6 +495,7 @@ export function saveAgentSession(
       chatTurns,
       threads,
       sourcePaths,
+      evidenceCache,
       task,
     });
 
@@ -473,6 +512,10 @@ export function saveAgentSession(
     threads = threads.slice(1);
     messagesJson = serialize();
   }
+  while (Buffer.byteLength(messagesJson, "utf8") > MAX_JSON_BYTES && evidenceCache.length) {
+    evidenceCache = evidenceCache.slice(1);
+    messagesJson = serialize();
+  }
   if (Buffer.byteLength(messagesJson, "utf8") > MAX_JSON_BYTES) {
     throw new Error("agent session metadata exceeds storage limit");
   }
@@ -485,6 +528,7 @@ export function saveAgentSession(
     chatTurns,
     threads,
     sourcePaths,
+    evidenceCache,
     task,
     updatedAt: new Date().toISOString(),
   };
@@ -520,6 +564,7 @@ export function loadAgentSession(ws: Workspace): PersistedAgentSession | null {
     chatTurns: parsed.chatTurns,
     threads: parsed.threads,
     sourcePaths: parsed.sourcePaths,
+    evidenceCache: parsed.evidenceCache,
     task: parsed.task,
     updatedAt: row.updated_at,
   };
@@ -590,6 +635,7 @@ export function loadAgentSessionEnvelope(
     chatTurns: parsed.chatTurns,
     threads: parsed.threads,
     sourcePaths: parsed.sourcePaths,
+    evidenceCache: parsed.evidenceCache,
     task: parsed.task,
     updatedAt: row.updated_at,
   };

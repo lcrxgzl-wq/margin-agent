@@ -8,6 +8,7 @@ import {
   findSafeCutIndex,
   keepRecentTokensForTier,
   orchestrateCompaction,
+  prunedToolOutputPlaceholder,
   pruneToolOutputs,
 } from "./compaction.js";
 
@@ -35,11 +36,16 @@ function assistantMsg(
   } as unknown as AgentMessage;
 }
 
-function toolResultMsg(toolCallId: string, text: string, timestamp = 0): AgentMessage {
+function toolResultMsg(
+  toolCallId: string,
+  text: string,
+  timestamp = 0,
+  toolName = "read",
+): AgentMessage {
   return {
     role: "toolResult",
     toolCallId,
-    toolName: "read",
+    toolName,
     content: [{ type: "text", text }],
     isError: false,
     timestamp,
@@ -126,11 +132,52 @@ describe("pruneToolOutputs", () => {
 
     const oldResult = pruned[1] as { content: Array<{ text: string }> };
     expect(oldResult.content[0]!.text).toBe(PRUNED_TOOL_OUTPUT_PLACEHOLDER);
+    expect(PRUNED_TOOL_OUTPUT_PLACEHOLDER).toContain("blockId/cursor/sourceRef");
+    expect(PRUNED_TOOL_OUTPUT_PLACEHOLDER).toContain("不要因此用 offset 重扫全文");
     const recentResult = pruned[4] as { content: Array<{ text: string }> };
     expect(recentResult.content[0]!.text).toBe(recentOutput);
     expect(reclaimed).toBe(oldOutput.length - PRUNED_TOOL_OUTPUT_PLACEHOLDER.length);
     // originals untouched
     expect((messages[1] as { content: Array<{ text: string }> }).content[0]!.text).toBe(oldOutput);
+  });
+
+  it("keeps cursor and sourceRef anchors when pruning bounded reads", () => {
+    const oldBlocks = JSON.stringify({
+      cursor: "0:0",
+      nextCursor: "12:0",
+      hasMore: true,
+      chunks: [{ text: "x".repeat(30_000) }],
+    });
+    const oldSource = JSON.stringify({
+      relativePath: "notes.md",
+      sourceRef: "notes.md#sha256=0123456789abcdef&chars=0-10",
+      nextOffset: 10,
+      hasMore: true,
+      text: "y".repeat(30_000),
+    });
+    const messages = [
+      userMsg("u1", 1),
+      toolResultMsg("c1", oldBlocks, 2, "read_document_blocks"),
+      assistantMsg("a1".padEnd(10_000, "a"), { timestamp: 3 }),
+      userMsg("u2", 4),
+      toolResultMsg("c2", oldSource, 5, "read_workspace_file"),
+      assistantMsg("recent".padEnd(30_000, "r"), { timestamp: 6 }),
+    ];
+
+    const { messages: pruned } = pruneToolOutputs(messages);
+
+    const blocksResult = pruned[1] as { content: Array<{ text: string }> };
+    expect(blocksResult.content[0]!.text).toContain("cursor=0:0");
+    expect(blocksResult.content[0]!.text).toContain("nextCursor=12:0");
+    const sourceResult = pruned[4] as { content: Array<{ text: string }> };
+    expect(sourceResult.content[0]!.text).toContain(
+      "sourceRef=notes.md#sha256=0123456789abcdef&chars=0-10",
+    );
+    expect(sourceResult.content[0]!.text).toContain("nextOffset=10");
+    expect(prunedToolOutputPlaceholder(
+      toolResultMsg("c3", "other", 6),
+      "other",
+    )).toBe(PRUNED_TOOL_OUTPUT_PLACEHOLDER);
   });
 
   it("does not execute when reclaimable output is below the 20k minimum", () => {

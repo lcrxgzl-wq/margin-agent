@@ -14,6 +14,7 @@ import {
   isNativeDocx,
   listComments,
   listProposals,
+  listReviewChecklists,
   saveSessionThreads,
   getSession,  type Block,
   type DocumentMeta,
@@ -304,9 +305,10 @@ function Workspace() {
       storeRef.current.setDocBundle(session.opened.document, session.opened.blocks, {
         preserveDocumentDirty,
       });
-      const [proposals, comments] = await Promise.all([
+      const [proposals, comments, checklists] = await Promise.all([
         listProposals(session.opened.document.id),
         listComments(session.opened.document.id),
+        listReviewChecklists(session.opened.document.id),
       ]);
       if (
         storeRef.current.doc?.id !== session.opened.document.id ||
@@ -314,6 +316,7 @@ function Workspace() {
       ) return;
       storeRef.current.setProposals(proposals.proposals);
       storeRef.current.setComments(comments.comments ?? []);
+      storeRef.current.setChecklists(checklists.runs);
       storeRef.current.setThreads((session.review?.threads ?? [])
         .filter((thread) => thread.documentId === session.opened?.document.id)
         .map((thread) => ({
@@ -460,6 +463,7 @@ function Workspace() {
         key: `${thread.id}:${Date.now()}`,
         query,
         proposalId,
+        threadId: thread.id,
         blockId: thread.anchor.blockId,
         tableCell: thread.anchor.tableCell,
       });
@@ -489,12 +493,31 @@ function Workspace() {
   };
   const threadAnchorAlive = !activeThread || selectionAnchorAlive(activeThread.anchor, store.blocks);
   // Stable handler: Canvas memo can cache-hit across App renders; only storeRef is fresh.
-  const onCanvasSelectionChange = useCallback((selection: SelectionInput) => {
+  const onCanvasSelectionChange = useCallback((event: SelectionInput & { programmaticThreadId?: string }) => {
     const current = storeRef.current;
-    current.setSelection(selection);
+    const { programmaticThreadId, ...selection } = event;
     const openThread = current.activeThreadId
       ? current.threads.find((candidate) => candidate.id === current.activeThreadId)
       : null;
+    if (
+      programmaticThreadId &&
+      openThread?.id === programmaticThreadId &&
+      !openThread.collapsed
+    ) {
+      current.setSelection({
+        blockId: openThread.anchor.blockId,
+        blockIds: openThread.anchor.blockIds,
+        selectionRanges: openThread.anchor.selectionRanges,
+        text: openThread.anchor.selectionText,
+        selectionStart: openThread.anchor.selectionStart,
+        tableCell: openThread.anchor.tableCell,
+        crossTableCells: openThread.anchor.crossTableCells,
+        anchor: selection.anchor,
+      });
+      if (selection.anchor) current.updateThreadPosition(openThread.id, selection.anchor);
+      return;
+    }
+    current.setSelection(selection);
     // Selecting a different span while a thread is open should return the floating
     // tools — otherwise the bubble stays hidden behind popoverOpen forever.
     // Compare block+text only so precise-start probes do not collapse the thread.
@@ -533,11 +556,16 @@ function Workspace() {
     // the server. Clear stale cards immediately; the refresh below
     // remains authoritative for comments and any future statuses.
     current.setProposals([]);
-    void Promise.all([listProposals(document.id), listComments(document.id)])
-      .then(([proposals, comments]) => {
+    void Promise.all([
+      listProposals(document.id),
+      listComments(document.id),
+      listReviewChecklists(document.id),
+    ])
+      .then(([proposals, comments, checklists]) => {
         if (storeRef.current.doc?.id !== document.id || storeRef.current.doc.revision !== document.revision) return;
         storeRef.current.setProposals(proposals.proposals);
         storeRef.current.setComments(comments.comments ?? []);
+        storeRef.current.setChecklists(checklists.runs);
       })
       .catch((error) => {
         storeRef.current.appendMessage({
@@ -705,6 +733,7 @@ function Workspace() {
         }}
         proposals={store.proposals}
         comments={store.comments}
+        checklists={store.checklists}
         documentDirty={store.documentDirty}
         reviewError={store.reviewError}
         reviewBusy={Boolean(activeDocument && isNativeDocx(activeDocument) && !officeReady)}
@@ -716,6 +745,17 @@ function Workspace() {
         threads={store.threads}
         activeThreadId={store.activeThreadId}
         onOpenThread={revealThread}
+        onChecklistDecision={actions.onChecklistDecision}
+        onLocateChecklistItem={(item) => {
+          const block = storeRef.current.blocks.find((candidate) => candidate.id === item.blockId);
+          const query = item.excerpt.trim() || block?.text.slice(0, 160) || "";
+          if (!query) return;
+          setFocusRequest({
+            key: `checklist:${item.id}:${Date.now()}`,
+            query,
+            blockId: item.blockId,
+          });
+        }}
         onHeaderPointerDown={beginFloatDrag}
         themeMode={themeMode}
         onThemeModeChange={setThemeMode}
@@ -774,11 +814,16 @@ function Workspace() {
             storeRef.current.setMessages,
           );
           store.setDocBundle(document, blocks);
-          void Promise.all([listProposals(document.id), listComments(document.id)])
-            .then(([proposals, comments]) => {
+          void Promise.all([
+            listProposals(document.id),
+            listComments(document.id),
+            listReviewChecklists(document.id),
+          ])
+            .then(([proposals, comments, checklists]) => {
               if (storeRef.current.doc?.id !== document.id || storeRef.current.doc.revision !== document.revision) return;
               store.setProposals(proposals.proposals);
               store.setComments(comments.comments ?? []);
+              store.setChecklists(checklists.runs);
             })
             .catch(actions.messageError);
           if (report && !report.ok) {

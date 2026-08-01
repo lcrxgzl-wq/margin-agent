@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   citeCheck,
+  createReviewChecklistRun,
   createPaperAgentAdapter,
   createPaperTools,
   preferredEngine,
@@ -73,7 +74,11 @@ describe("paper agent adapter", () => {
       );
       expect(result.engine).toBe("simple");
       expect(result.proposals.length).toBeGreaterThan(0);
-      expect(result.comments?.length).toBeGreaterThan(0);
+      expect(result.comments).toEqual([]);
+      expect(result.reviewChecklists?.map((entry) => entry.run.checker)).toEqual([
+        "cite_check",
+        "style_lint",
+      ]);
       expect(result.steps?.length).toBeGreaterThan(0);
       expect(phases.length).toBeGreaterThan(0);
       expect(phases[0]).toContain("读取");
@@ -275,7 +280,7 @@ describe("paper agent adapter", () => {
 describe("academic heuristics", () => {
   it("cite_check marks not_verified", () => {
     const r = citeCheck([sampleBlocks[1]!]);
-    expect(r.disclaimer).toMatch(/未验证/);
+    expect(r.disclaimer).toMatch(/不验证文献真实性/);
     expect(r.findings.length).toBeGreaterThan(0);
     expect(r.findings.every((f) => f.heuristic_only && f.verification === "not_verified")).toBe(
       true,
@@ -285,6 +290,20 @@ describe("academic heuristics", () => {
   it("style_lint hits clichés", () => {
     const r = styleLint([sampleBlocks[1]!]);
     expect(r.findings.some((f) => f.label.includes("赋能"))).toBe(true);
+  });
+
+  it("builds stable full/subset checklist items and preserves zero-finding runs", () => {
+    const cite = createReviewChecklistRun("cite_check", "doc1", sampleBlocks);
+    expect(cite.items.some((item) => item.issueType === "citation.author_year")).toBe(true);
+    expect(cite.items.every((item) => item.verification === "not_verified")).toBe(true);
+
+    const style = createReviewChecklistRun("style_lint", "doc1", [sampleBlocks[1]!]);
+    expect(style.items.some((item) => item.issueType === "style.cliche")).toBe(true);
+    expect(style.items.every((item) => item.blockId === "b1")).toBe(true);
+
+    const empty = createReviewChecklistRun("cite_check", "doc1", [sampleBlocks[0]!]);
+    expect(empty.items).toEqual([]);
+    expect(empty.run.disclaimer).toMatch(/形态学通过 ≠ 文献真实存在/);
   });
 
   it("outline and search are stable", () => {
@@ -300,12 +319,14 @@ describe("paper tools", () => {
     const drafts: import("./pi-tools.js").Draft[] = [];
     const comments: import("./types.js").AgentComment[] = [];
     const summaries: string[] = [];
+    const checklists: import("@margin/domain").ReviewChecklistRunDraft[] = [];
     const tools = createPaperTools(
       {
         getBlocks: () => sampleBlocks,
         getDocumentId: () => "doc1",
         getRevision: () => 3,
         onFinishSummary: (summary) => summaries.push(summary),
+        onReviewChecklistRun: (draft) => checklists.push(draft),
       },
       drafts,
       comments,
@@ -313,10 +334,12 @@ describe("paper tools", () => {
     expect(tools.map((t) => t.name)).toEqual([
       "get_document_outline",
       "list_blocks",
+      "read_document_blocks",
       "get_block",
       "search_blocks",
       "offer_cascade",
       "propose_block_edit",
+      "propose_text_patch",
       "propose_block_comment",
       "cite_check",
       "style_lint",
@@ -335,6 +358,12 @@ describe("paper tools", () => {
       cite.content.find((c) => c.type === "text")!.text,
     );
     expect(citeJson.findings[0].verification).toBe("not_verified");
+    await byName.style_lint!.execute("3b", { blockId: "b1" });
+    expect(checklists.map((entry) => entry.run.checker)).toEqual([
+      "cite_check",
+      "style_lint",
+    ]);
+    expect(checklists[1]?.items.every((item) => item.blockId === "b1")).toBe(true);
 
     await byName.propose_block_edit!.execute("4", {
       blockId: "b1",
@@ -358,6 +387,145 @@ describe("paper tools", () => {
     });
     expect(fin.terminate).toBe(true);
     expect(summaries).toEqual(["结构分析长文只应作为收束，不应单独消失。"]);
+  });
+
+  it("reads the whole document through bounded cursors without offset rescans", async () => {
+    const blocks = Array.from({ length: 35 }, (_, index) => ({
+      id: `block-${index}`,
+      kind: "paragraph" as const,
+      text: `text-${index}`,
+      order: index,
+      contentHash: `hash-${index}`,
+    }));
+    const tools = createPaperTools({
+      getBlocks: () => blocks,
+      getDocumentId: () => "doc-cursor",
+      getRevision: () => 1,
+    }, [], [], { packId: "none" });
+    const read = tools.find((tool) => tool.name === "read_document_blocks")!;
+    const seen: string[] = [];
+    let cursor = "0:0";
+    for (;;) {
+      const result = await read.execute("read", { cursor, limit: 7 });
+      const payload = JSON.parse(result.content[0]!.text) as {
+        chunks: Array<{ blockId: string; text: string; complete: boolean }>;
+        nextCursor: string | null;
+        hasMore: boolean;
+      };
+      seen.push(...payload.chunks.map((chunk) => chunk.blockId));
+      expect(payload.chunks.every((chunk) => chunk.complete)).toBe(true);
+      if (!payload.hasMore) {
+        expect(payload.nextCursor).toBeNull();
+        break;
+      }
+      expect(payload.nextCursor).not.toBe(cursor);
+      cursor = payload.nextCursor!;
+    }
+    expect(seen).toEqual(blocks.map((block) => block.id));
+  });
+
+  it("caps document batches by characters and resumes inside an oversized block", async () => {
+    const text = "x".repeat(30_000);
+    const tools = createPaperTools({
+      getBlocks: () => [{ id: "long", kind: "paragraph", text, order: 0, contentHash: "long-hash" }],
+      getDocumentId: () => "doc-long",
+      getRevision: () => 1,
+    }, [], [], { packId: "none" });
+    const read = tools.find((tool) => tool.name === "read_document_blocks")!;
+    const first = JSON.parse((await read.execute("first", { cursor: "0:0" })).content[0]!.text);
+    expect(first.chunks[0]).toMatchObject({
+      blockId: "long",
+      textStart: 0,
+      textEnd: 24_000,
+      textLength: 30_000,
+      complete: false,
+    });
+    expect(first.nextCursor).toBe("0:24000");
+    const second = JSON.parse((await read.execute("second", { cursor: first.nextCursor })).content[0]!.text);
+    expect(second.chunks[0]).toMatchObject({ textStart: 24_000, textEnd: 30_000, complete: true });
+    expect(second.chunks[0].text).toHaveLength(6_000);
+    expect(second).toMatchObject({ hasMore: false, nextCursor: null });
+
+    for (const limit of [0, 33, Number.NaN, 1.5]) {
+      await expect(read.execute("bad-limit", { limit })).rejects.toThrow(/limit must be an integer/);
+    }
+    await expect(read.execute("bad-cursor", { cursor: "not-a-cursor" })).rejects.toThrow(/cursor/);
+    await expect(read.execute("past-document", { cursor: "2:0" })).rejects.toThrow(/document bounds/);
+    await expect(read.execute("past-block", { cursor: "0:30001" })).rejects.toThrow(/block text bounds/);
+  });
+
+  it("derives a precise text patch and terminates once the primary target is covered", async () => {
+    const drafts: import("./pi-tools.js").Draft[] = [];
+    const tools = createPaperTools({
+      getBlocks: () => sampleBlocks,
+      getDocumentId: () => "doc1",
+      getRevision: () => 3,
+      proposeScope: { primaryAllowlist: ["b1"] },
+      terminateWhenPrimaryCovered: true,
+    }, drafts, [], { packId: "none" });
+    const propose = tools.find((tool) => tool.name === "propose_text_patch")!;
+    const block = sampleBlocks.find((candidate) => candidate.id === "b1")!;
+    const before = "执行张力";
+    const start = block.text.indexOf(before);
+    const result = await propose.execute("patch", {
+      blockId: block.id,
+      start,
+      end: start + before.length,
+      before,
+      after: "执行矛盾",
+      rationale: "缩小改动范围。",
+      risk: "argumentation",
+    });
+    expect(result.terminate).toBe(true);
+    expect(drafts).toEqual([expect.objectContaining({
+      before: block.text,
+      after: block.text.replace(before, "执行矛盾"),
+      risk: "argument",
+      operation: {
+        kind: "rewrite",
+        scope: "selection",
+        selection: { start, end: start + before.length, before, after: "执行矛盾" },
+      },
+    })]);
+  });
+
+  it("rejects stale, unsafe, duplicate, table, and out-of-scope text patches", async () => {
+    const make = (blocks = sampleBlocks, scope?: { primaryAllowlist: string[]; enforceCascadeGate: boolean }) => {
+      const drafts: import("./pi-tools.js").Draft[] = [];
+      const tools = createPaperTools({
+        getBlocks: () => blocks,
+        getDocumentId: () => "doc1",
+        getRevision: () => 3,
+        ...(scope ? { proposeScope: scope } : {}),
+      }, drafts, [], { packId: "none" });
+      return { drafts, propose: tools.find((tool) => tool.name === "propose_text_patch")! };
+    };
+    const block = sampleBlocks.find((candidate) => candidate.id === "b1")!;
+    const valid = {
+      blockId: block.id,
+      start: 0,
+      end: 1,
+      before: block.text.slice(0, 1),
+      after: "改",
+      rationale: "测试局部修订。",
+    };
+    await expect(make().propose.execute("stale", { ...valid, before: "错" })).rejects.toThrow(/stale/);
+    await expect(make().propose.execute("bounds", {
+      ...valid, start: block.text.length, end: block.text.length + 1, before: "x",
+    })).rejects.toThrow(/stale/);
+    await expect(make().propose.execute("empty", { ...valid, after: " " })).rejects.toThrow(/after is empty/);
+    await expect(make([...sampleBlocks, tableBlock]).propose.execute("table", {
+      ...valid, blockId: tableBlock.id,
+    })).rejects.toThrow(/flattened table/);
+    await expect(make(sampleBlocks, {
+      primaryAllowlist: ["h1"], enforceCascadeGate: true,
+    }).propose.execute("cascade", valid)).rejects.toThrow(/选区外提案被拒绝/);
+
+    const duplicate = make();
+    await duplicate.propose.execute("first", valid);
+    await expect(duplicate.propose.execute("duplicate", { ...valid, after: "另" }))
+      .rejects.toThrow(/already has a proposal/);
+    expect(duplicate.drafts).toHaveLength(1);
   });
 
   it("omits pack tools for the minimal harness or none pack", () => {

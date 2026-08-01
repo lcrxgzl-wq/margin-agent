@@ -1,5 +1,14 @@
 import { randomUUID } from "node:crypto";
-import type { BlockSnapshot } from "@margin/domain";
+import {
+  ReviewChecklistRunDraftSchema,
+  type BlockSnapshot,
+  type ReviewChecklistChecker,
+  type ReviewChecklistRunDraft,
+} from "@margin/domain";
+
+export const CITE_CHECK_DISCLAIMER =
+  "形态学通过 ≠ 文献真实存在。此检查不验证文献真实性、存在性，也不验证引文是否支持正文主张。";
+export const STYLE_LINT_DISCLAIMER = "词表启发，不是全面语体审校。";
 
 export type CiteFinding = {
   blockId: string;
@@ -31,8 +40,7 @@ export function citeCheck(blocks: BlockSnapshot[]): {
   disclaimer: string;
   findings: CiteFinding[];
 } {
-  const disclaimer =
-    "cite_check 仅检查引用形态（作者年/编号/DOI形/引语/占位），未验证文献存在性、真实性或内容支持关系。";
+  const disclaimer = CITE_CHECK_DISCLAIMER;
   const findings: CiteFinding[] = [];
 
   const push = (
@@ -72,18 +80,23 @@ export function citeCheck(blocks: BlockSnapshot[]): {
   return { disclaimer, findings };
 }
 
-const STYLE_PATTERNS: { re: RegExp; label: string }[] = [
-  { re: /赋能/g, label: "套话：赋能" },
-  { re: /困境与路径/g, label: "套话：困境与路径" },
-  { re: /深度融合/g, label: "套话：深度融合" },
-  { re: /新时代背景下/g, label: "套话：新时代背景下" },
-  { re: /行之有效的/g, label: "空泛评价：行之有效的" },
-  { re: /具有重要的(?:现实|理论)意义/g, label: "空泛意义句" },
-  { re: /综上所述[，,]\s*本文认为/g, label: "模板收束句" },
+const STYLE_PATTERNS: Array<{
+  re: RegExp;
+  kind: "cliche" | "empty_evaluation" | "template_closure";
+  label: string;
+}> = [
+  { re: /赋能/g, kind: "cliche", label: "套话：赋能" },
+  { re: /困境与路径/g, kind: "cliche", label: "套话：困境与路径" },
+  { re: /深度融合/g, kind: "cliche", label: "套话：深度融合" },
+  { re: /新时代背景下/g, kind: "cliche", label: "套话：新时代背景下" },
+  { re: /行之有效的/g, kind: "empty_evaluation", label: "空泛评价：行之有效的" },
+  { re: /具有重要的(?:现实|理论)意义/g, kind: "empty_evaluation", label: "空泛意义句" },
+  { re: /综上所述[，,]\s*本文认为/g, kind: "template_closure", label: "模板收束句" },
 ];
 
 export type StyleFinding = {
   blockId: string;
+  kind: "cliche" | "empty_evaluation" | "template_closure";
   label: string;
   excerpt: string;
   risk: "language";
@@ -95,11 +108,12 @@ export function styleLint(blocks: BlockSnapshot[]): {
 } {
   const findings: StyleFinding[] = [];
   for (const b of blocks) {
-    for (const { re, label } of STYLE_PATTERNS) {
+    for (const { re, kind, label } of STYLE_PATTERNS) {
       re.lastIndex = 0;
       for (const m of b.text.matchAll(re)) {
         findings.push({
           blockId: b.id,
+          kind,
           label,
           excerpt: m[0],
           risk: "language",
@@ -108,12 +122,109 @@ export function styleLint(blocks: BlockSnapshot[]): {
     }
   }
   return {
-    disclaimer: "style_lint 基于词表启发，非全面语体审校。",
+    disclaimer: STYLE_LINT_DISCLAIMER,
     findings,
   };
 }
 
-/** Build session comments from cite/style heuristics (no LLM). Cap per scan. */
+const CITE_LABELS: Record<CiteFinding["kind"], string> = {
+  author_year: "作者—年份引用",
+  bracket_num: "编号引用",
+  doi_like: "DOI 形态",
+  quoted_speech: "较长引语",
+  insert_placeholder: "引文占位",
+};
+
+const STYLE_LABELS: Record<StyleFinding["kind"], string> = {
+  cliche: "套话",
+  empty_evaluation: "空泛评价",
+  template_closure: "模板收束",
+};
+
+export function createReviewChecklistRun(
+  checker: ReviewChecklistChecker,
+  documentId: string,
+  blocks: BlockSnapshot[],
+): ReviewChecklistRunDraft {
+  if (!documentId) throw new Error("document id is required for a review checklist");
+  const runId = randomUUID();
+  const createdAt = new Date().toISOString();
+  const draft: ReviewChecklistRunDraft = checker === "cite_check"
+    ? (() => {
+        const result = citeCheck(blocks);
+        return {
+          run: {
+            schemaVersion: 1,
+            id: runId,
+            documentId,
+            checker,
+            disclaimer: result.disclaimer,
+            status: "active",
+            createdAt,
+          },
+          items: result.findings.map((finding) => ({
+            schemaVersion: 1 as const,
+            id: randomUUID(),
+            runId,
+            documentId,
+            blockId: finding.blockId,
+            issueType: `citation.${finding.kind}`,
+            label: CITE_LABELS[finding.kind],
+            excerpt: finding.excerpt,
+            detail: finding.note,
+            severity: finding.kind === "quoted_speech" || finding.kind === "insert_placeholder"
+              ? "warn" as const
+              : "info" as const,
+            status: "open" as const,
+            heuristicOnly: true,
+            verification: "not_verified" as const,
+            createdAt,
+          })),
+        };
+      })()
+    : (() => {
+        const result = styleLint(blocks);
+        return {
+          run: {
+            schemaVersion: 1,
+            id: runId,
+            documentId,
+            checker,
+            disclaimer: result.disclaimer,
+            status: "active",
+            createdAt,
+          },
+          items: result.findings.map((finding) => ({
+            schemaVersion: 1 as const,
+            id: randomUUID(),
+            runId,
+            documentId,
+            blockId: finding.blockId,
+            issueType: `style.${finding.kind}`,
+            label: STYLE_LABELS[finding.kind],
+            excerpt: finding.excerpt,
+            detail: finding.label,
+            severity: "warn" as const,
+            status: "open" as const,
+            heuristicOnly: true,
+            createdAt,
+          })),
+        };
+      })();
+  return ReviewChecklistRunDraftSchema.parse(draft);
+}
+
+export function createReviewChecklistRuns(
+  documentId: string,
+  blocks: BlockSnapshot[],
+): ReviewChecklistRunDraft[] {
+  return [
+    createReviewChecklistRun("cite_check", documentId, blocks),
+    createReviewChecklistRun("style_lint", documentId, blocks),
+  ];
+}
+
+/** Build legacy session comments from cite/style heuristics. */
 export function heuristicComments(
   blocks: BlockSnapshot[],
   opts?: { max?: number },

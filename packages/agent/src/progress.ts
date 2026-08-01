@@ -5,6 +5,8 @@ export function toolPhaseLabel(toolName: string): string {
       return "正在阅读大纲…";
     case "list_blocks":
       return "正在浏览段落…";
+    case "read_document_blocks":
+      return "正在通读文稿…";
     case "get_block":
       return "正在阅读选中段落…";
     case "search_blocks":
@@ -12,6 +14,7 @@ export function toolPhaseLabel(toolName: string): string {
     case "offer_cascade":
       return "正在整理联动候选…";
     case "propose_block_edit":
+    case "propose_text_patch":
       return "正在起草修订…";
     case "propose_table_cell_edit":
       return "正在起草表格单元格修订…";

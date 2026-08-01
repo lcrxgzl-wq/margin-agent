@@ -314,7 +314,16 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
       : mountedToolNames,
   );
   const terminatingToolCalls = new Set<string>();
-  const turnCap = opts.maxTurns ?? 20;
+  const recentReadSignatures: string[] = [];
+  let pendingNonProgressNote: string | undefined;
+  const nonProgressReadTools = new Set([
+    "get_document_outline",
+    "list_blocks",
+    "read_document_blocks",
+    "get_block",
+    "read_workspace_file",
+  ]);
+  const turnCap = opts.maxTurns ?? 40;
   const limit = opts.timeoutMs ?? 300_000;
   let turns = 0;
   let outcome: PiLoopOutcome = "completed";
@@ -451,6 +460,25 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
         if (notes.length < 12) notes.push(`blocked unauthorized tool ${toolCall.name}`);
         return { block: true, reason: `Tool ${toolCall.name} is not allowed by the active profile` };
       }
+      if (nonProgressReadTools.has(toolCall.name)) {
+        const signature = `${toolCall.name}:${JSON.stringify(summary)}`;
+        recentReadSignatures.push(signature);
+        if (recentReadSignatures.length > 6) recentReadSignatures.shift();
+        if (
+          recentReadSignatures.length >= 3 &&
+          recentReadSignatures.slice(-3).every((item) => item === signature)
+        ) {
+          pendingNonProgressNote = `stopped after repeated non-progress read: ${toolCall.name}`;
+          toolAudit.push({
+            toolCallId: toolCall.id,
+            toolName: toolCall.name,
+            status: "blocked",
+            durationMs: 0,
+            args: summary,
+          });
+          return { block: true, reason: "Repeated read made no progress; continue from the last returned block/cursor." };
+        }
+      }
       toolStarts.set(toolCall.id, {
         startedAt: Date.now(),
         args: summary,
@@ -540,7 +568,11 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
         (toolCallId) => terminatingToolCalls.has(toolCallId),
       );
       for (const toolCallId of toolCallIds) terminatingToolCalls.delete(toolCallId);
-      if (turns >= turnCap && toolCallIds.length > 0 && !terminated) {
+      if (pendingNonProgressNote) {
+        const note = pendingNonProgressNote;
+        pendingNonProgressNote = undefined;
+        abort("aborted", note);
+      } else if (turns >= turnCap && toolCallIds.length > 0 && !terminated) {
         abort("aborted", `stopped after ${turnCap} turns`);
       }
     }

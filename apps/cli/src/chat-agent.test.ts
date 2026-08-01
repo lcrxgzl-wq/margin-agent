@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   archiveAgentSession,
   latestAgentCompactionSummary,
+  listActiveReviewChecklists,
   listAgentCompactions,
   listBlocks,
   loadAgentSession,
@@ -29,14 +30,27 @@ import {
   createChatAgentState,
   createWorkspaceBridge,
   isCloseDocumentRequest,
+  replaceAttachedSources,
   restoreChatAgentState,
   rotateChatSessionWithSummary,
+  runChatAgentTurn,
   settleCompactionEvent,
   syncBagFromDocument,
   type AgentMessage,
 } from "./chat-agent.js";
 
 const dirs: string[] = [];
+
+const evidenceEntry = {
+  sourceRef: "notes.txt#sha256=0123456789abcdef&chars=0-4",
+  relativePath: "notes.txt",
+  start: 0,
+  end: 4,
+  extractedHash: "0123456789abcdef",
+  versionHash: "a".repeat(64),
+  preview: "note",
+  readAt: "2026-08-01T00:00:00.000Z",
+};
 
 afterEach(() => {
   for (const dir of dirs.splice(0)) {
@@ -113,6 +127,41 @@ describe("buildTranscriptPayload", () => {
       expect(restored.bag.blocks).toHaveLength(2);
       expect(restored.task?.status).toBe("interrupted");
     } finally {
+      workspace.db.close();
+      await workspace.releaseLock();
+    }
+  });
+});
+
+describe("chat checklist persistence", () => {
+  it("persists an actually invoked checker even when the turn has no Proposal", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-checklist-"));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, "paper.md"), "（张三，2020）提出这一判断。\n", "utf8");
+    const workspace = await openWorkspace(root);
+    const previousEngine = process.env.MARGIN_ENGINE;
+    process.env.MARGIN_ENGINE = "simple";
+    try {
+      const document = openDocument(workspace, "paper.md");
+      const blocks = listBlocks(workspace, document.id);
+      const state = createChatAgentState({ sessionId: "chat-checklist" });
+      syncBagFromDocument(state, document, blocks);
+
+      const result = await runChatAgentTurn({
+        workspace,
+        chat: new ChatMemory(),
+        agentState: state,
+        message: "检查引用形态",
+      });
+
+      expect(result.proposalCount).toBe(0);
+      expect(listActiveReviewChecklists(workspace, document.id)).toMatchObject([{
+        run: { checker: "cite_check", status: "active" },
+        items: [expect.objectContaining({ issueType: "citation.author_year" })],
+      }]);
+    } finally {
+      if (previousEngine === undefined) delete process.env.MARGIN_ENGINE;
+      else process.env.MARGIN_ENGINE = previousEngine;
       workspace.db.close();
       await workspace.releaseLock();
     }
@@ -209,6 +258,7 @@ describe("chat session lifecycle", () => {
       agentMessages: [{ role: "user", content: "revise" }],
       clarificationRounds: 2,
       sourcePaths: ["notes.txt"],
+      evidenceCache: [evidenceEntry],
       sourceDocumentId: "document-1",
     });
     state.bag = {
@@ -224,6 +274,7 @@ describe("chat session lifecycle", () => {
     expect(state.clarificationRounds).toBe(0);
     expect(state.bag.documentId).toBe("document-1");
     expect(state.sourcePaths).toEqual(["notes.txt"]);
+    expect(state.evidenceCache).toEqual([]);
     expect(state.sourceDocumentId).toBe("document-1");
     expect(state.sessionId).not.toBe("before");
   });
@@ -233,6 +284,7 @@ describe("chat session lifecycle", () => {
       agentMessages: [{ role: "user", content: "revise" }],
       clarificationRounds: 3,
       sourcePaths: ["notes.txt"],
+      evidenceCache: [evidenceEntry],
       sourceDocumentId: "document-1",
     });
     state.bag = {
@@ -248,6 +300,7 @@ describe("chat session lifecycle", () => {
     expect(state.agentMessages).toEqual([]);
     expect(state.clarificationRounds).toBe(0);
     expect(state.sourcePaths).toEqual([]);
+    expect(state.evidenceCache).toEqual([]);
     expect(state.sourceDocumentId).toBeUndefined();
   });
 
@@ -257,6 +310,7 @@ describe("chat session lifecycle", () => {
       agentMessages: [{ role: "user", content: "private context" }],
       clarificationRounds: 2,
       sourcePaths: ["notes.txt"],
+      evidenceCache: [evidenceEntry],
       sourceDocumentId: "document-1",
     });
     state.bag = { documentId: "document-1", revision: 1, blocks: [] };
@@ -277,6 +331,7 @@ describe("chat session lifecycle", () => {
     expect(state.agentMessages).toEqual([]);
     expect(state.clarificationRounds).toBe(0);
     expect(state.sourcePaths).toEqual([]);
+    expect(state.evidenceCache).toEqual([]);
     expect(state.sessionId).not.toBe("before");
   });
 
@@ -285,6 +340,28 @@ describe("chat session lifecycle", () => {
     expect(isCloseDocumentRequest("关闭当前文稿")).toBe(true);
     expect(isCloseDocumentRequest("请关闭 DOCX")).toBe(true);
     expect(isCloseDocumentRequest("讨论如何关闭文章结尾")).toBe(false);
+  });
+
+  it("evicts evidence when its attachment is removed", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-evidence-detach-"));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, "notes.txt"), "note", "utf8");
+    fs.writeFileSync(path.join(root, "other.txt"), "other", "utf8");
+    const workspace = await openWorkspace(root);
+    try {
+      const state = createChatAgentState({
+        sourcePaths: ["notes.txt"],
+        evidenceCache: [evidenceEntry],
+      });
+
+      replaceAttachedSources(state, workspace, ["other.txt"]);
+
+      expect(state.sourcePaths).toEqual(["other.txt"]);
+      expect(state.evidenceCache).toEqual([]);
+    } finally {
+      workspace.db.close();
+      await workspace.releaseLock();
+    }
   });
 });
 
@@ -302,6 +379,11 @@ describe("chatAgentStateFromSession (session switch)", () => {
         messages: [{ role: "user", content: "hi" }],
         chatTurns: [{ role: "user", text: "hi" }],
         sourcePaths: ["paper.md"],
+        evidenceCache: [{
+          ...evidenceEntry,
+          sourceRef: "paper.md#sha256=0123456789abcdef&chars=0-4",
+          relativePath: "paper.md",
+        }],
       });
       archiveAgentSession(workspace, "s-1");
 
@@ -313,6 +395,7 @@ describe("chatAgentStateFromSession (session switch)", () => {
       expect(restored.bag.documentId).toBe(document.id);
       expect(restored.bag.blocks.length).toBeGreaterThan(0);
       expect(restored.sourcePaths).toEqual(["paper.md"]);
+      expect(restored.evidenceCache).toHaveLength(1);
 
       // A document that no longer exists: bag stays empty, sources detach.
       const ghost = chatAgentStateFromSession(workspace, {
@@ -322,6 +405,7 @@ describe("chatAgentStateFromSession (session switch)", () => {
       expect(ghost.sessionId).toBe("s-1");
       expect(ghost.bag.documentId).toBeUndefined();
       expect(ghost.sourcePaths).toEqual([]);
+      expect(ghost.evidenceCache).toEqual([]);
       expect(ghost.sourceDocumentId).toBeUndefined();
 
       // No envelope: a fresh state with a new sessionId.

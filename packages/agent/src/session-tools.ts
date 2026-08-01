@@ -1,6 +1,13 @@
 import { type AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import { contentHash, type BlockSnapshot, type DocumentMeta, type TableCellProposalDraft } from "@margin/domain";
+import {
+  contentHash,
+  type BlockSnapshot,
+  type DocumentMeta,
+  type EvidenceCacheEntry,
+  type ReviewChecklistRunDraft,
+  type TableCellProposalDraft,
+} from "@margin/domain";
 import {
   getHarness,
   hasCapability,
@@ -9,6 +16,11 @@ import {
 } from "@margin/harness";
 import { AnalysisRunStore } from "./data/store.js";
 import { createCascadeGate, type CascadeCandidate } from "./cascade.js";
+import {
+  mergeEvidenceCacheEntry,
+  normalizeAttachedEvidenceCache,
+  removeEvidenceCacheRefs,
+} from "./evidence-cache.js";
 import {
   createRemoteMcpTools,
   type RemoteMcpApprovalFn,
@@ -31,10 +43,21 @@ export type WorkspaceBridge = {
     relativePath: string;
     text: string;
     bytes: number;
+    versionHash: string;
   }> | {
     relativePath: string;
     text: string;
     bytes: number;
+    versionHash: string;
+  };
+  readVersion: (relativePath: string) => Promise<{
+    relativePath: string;
+    bytes: number;
+    versionHash: string;
+  }> | {
+    relativePath: string;
+    bytes: number;
+    versionHash: string;
   };
   writeText: (
     relativePath: string,
@@ -80,6 +103,7 @@ export type SessionSideEffects = {
   loadedSkills?: Array<{ name: string; contentHash: string }>;
   cascadeOffer?: CascadeCandidate[];
   tableCellProposals?: TableCellProposalDraft[];
+  reviewChecklists?: ReviewChecklistRunDraft[];
   /** Visible closing text from finish_turn.summary. */
   finishSummary?: string;
 };
@@ -94,6 +118,10 @@ export type SessionToolOptions = {
   cascadeUnlocked?: boolean;
   /** Read-only materials explicitly attached to this session turn. */
   sourcePaths?: string[];
+  /** Host-owned evidence read cache carried across turns in this session. */
+  evidenceCache?: EvidenceCacheEntry[];
+  /** Persist the bounded cache after reads or invalidation. */
+  onEvidenceCacheChange?: (entries: EvidenceCacheEntry[]) => void;
   /** Apply the selected profile as a hard tool boundary (Pi only). */
   enforceProfile?: boolean;
   /** Exact relative paths explicitly approved by the user for this turn. */
@@ -136,13 +164,54 @@ export function createSessionTools(
   const sourcePaths = [
     ...new Set((opts.sourcePaths ?? []).map(normalizeSourcePath).filter(Boolean)),
   ];
+  let evidenceCache = normalizeAttachedEvidenceCache(opts.evidenceCache ?? [], sourcePaths);
+  const publishEvidenceCache = (entries: EvidenceCacheEntry[]) => {
+    evidenceCache = entries;
+    opts.onEvidenceCacheChange?.([...entries]);
+  };
+  const invalidateEvidencePath = (relativePath: string) => {
+    const refs = evidenceCache
+      .filter((entry) => entry.relativePath === relativePath)
+      .map((entry) => entry.sourceRef);
+    publishEvidenceCache(removeEvidenceCacheRefs(evidenceCache, refs));
+  };
+  const validateEvidenceRefs = async (refs: string[]) => {
+    const currentTurnRefs = new Set(effects.readSourceRefs ?? []);
+    const probedVersions = new Map<string, string>();
+    for (const ref of refs) {
+      if (currentTurnRefs.has(ref)) continue;
+      const entry = evidenceCache.find((candidate) => candidate.sourceRef === ref);
+      if (!entry) {
+        throw new Error(
+          "Evidence must use a sourceRef returned by read_workspace_file in this turn or retained in this session: " + ref,
+        );
+      }
+      try {
+        let currentVersion = probedVersions.get(entry.relativePath);
+        if (!currentVersion) {
+          const current = await bridge.readVersion(entry.relativePath);
+          if (normalizeSourcePath(current.relativePath) !== entry.relativePath) {
+            throw new Error("source path changed");
+          }
+          currentVersion = current.versionHash;
+          probedVersions.set(entry.relativePath, currentVersion);
+        }
+        if (currentVersion !== entry.versionHash) {
+          throw new Error("source bytes changed");
+        }
+      } catch {
+        invalidateEvidencePath(entry.relativePath);
+        throw new Error("Evidence sourceRef is stale; read_workspace_file again: " + ref);
+      }
+    }
+  };
   const approvedWritePaths = new Set(
     (opts.workspaceWriteApprovedPaths ?? []).map((item) => normalizeRel(item.trim())),
   );
   const cascadeGate = createCascadeGate();
   const readCache = new Map<
     string,
-    { relativePath: string; text: string; bytes: number }
+    { relativePath: string; text: string; bytes: number; versionHash: string }
   >();
   const sourceHashCache = new Map<string, string>();
   const listFiles: AgentTool = {
@@ -167,7 +236,7 @@ export function createSessionTools(
     name: "read_workspace_file",
     label: "Read Workspace File",
     description:
-      "Read one bounded extracted-text chunk from md/txt/json/csv/pdf/docx inside the workspace. Read-only. Continue with nextOffset while hasMore is true; use sourceRef verbatim in propose_block_edit.evidence.",
+      "Read one bounded extracted-text chunk from md/txt/json/csv/pdf/docx inside the workspace. Prefer this for attached sources (pdf/csv) or closed files. For an already-open document, prefer get_document_outline + get_block/search_blocks instead of paging the whole file by offset. Read-only. Continue with nextOffset while hasMore is true; use sourceRef verbatim in propose_block_edit / propose_text_patch evidence.",
     parameters: Type.Object({
       relativePath: Type.String(),
       offset: Type.Optional(
@@ -218,6 +287,18 @@ export function createSessionTools(
       const sourceRef = nextOffset > offset
         ? `${canonicalPath}#sha256=${sourceHash}&chars=${offset}-${nextOffset}`
         : undefined;
+      if (sourceRef && sourcePaths.includes(canonicalPath)) {
+        publishEvidenceCache(mergeEvidenceCacheEntry(evidenceCache, {
+          sourceRef,
+          relativePath: canonicalPath,
+          start: offset,
+          end: nextOffset,
+          extractedHash: sourceHash,
+          versionHash: file.versionHash,
+          preview: text.slice(0, 800),
+          readAt: new Date().toISOString(),
+        }));
+      }
       effects.readPath = file.relativePath;
       if (sourceRef) {
         effects.readSourceRefs = [
@@ -271,8 +352,13 @@ export function createSessionTools(
         relativePath,
         String(params.content ?? ""),
       );
+      const canonicalWritten = normalizeSourcePath(result.relativePath);
+      readCache.delete(canonicalWritten);
+      readCache.delete(normalizeSourcePath(relativePath));
+      sourceHashCache.delete(canonicalWritten);
+      invalidateEvidencePath(canonicalWritten);
       effects.written = {
-        relativePath: result.relativePath,
+        relativePath: canonicalWritten,
         created: result.created,
       };
       return {
@@ -298,6 +384,11 @@ export function createSessionTools(
       bag.revision = opened.document.revision;
       bag.relativePath = opened.document.relativePath;
       bag.blocks = opened.blocks;
+      const canonicalOpened = normalizeSourcePath(opened.document.relativePath);
+      readCache.delete(canonicalOpened);
+      readCache.delete(normalizeSourcePath(String(params.relativePath)));
+      sourceHashCache.delete(canonicalOpened);
+      invalidateEvidencePath(canonicalOpened);
       effects.opened = opened;
       return {
         content: [
@@ -386,8 +477,34 @@ export function createSessionTools(
         : {}),
       sourcePaths,
       getReadSourceRefs: () => effects.readSourceRefs ?? [],
+      validateEvidenceRefs,
       onFinishSummary: (summary) => {
         effects.finishSummary = summary;
+      },
+      onReviewChecklistRun: (draft) => {
+        const runs = effects.reviewChecklists ?? [];
+        const index = runs.findIndex((entry) =>
+          entry.run.documentId === draft.run.documentId &&
+          entry.run.checker === draft.run.checker,
+        );
+        if (index < 0) {
+          effects.reviewChecklists = [...runs, draft];
+          return;
+        }
+        const current = runs[index]!;
+        const itemKey = (item: ReviewChecklistRunDraft["items"][number]) =>
+          [item.blockId, item.issueType, item.excerpt, item.detail].join("\u0000");
+        const seen = new Set(current.items.map(itemKey));
+        const incoming = draft.items
+          .filter((item) => !seen.has(itemKey(item)))
+          .map((item) => ({
+            ...item,
+            runId: current.run.id,
+            documentId: current.run.documentId,
+          }));
+        effects.reviewChecklists = runs.map((entry, runIndex) => runIndex === index
+          ? { ...current, items: [...current.items, ...incoming] }
+          : entry);
       },
     },
     drafts,
