@@ -22,6 +22,8 @@ export type Selection = {
   /** Exact immutable UTF-16 range in every covered Office block. */
   selectionRanges?: SelectionBlockRange[];
   text: string;
+  /** Exact text shown by the canvas before whitespace alignment to storage. */
+  rawText?: string;
   selectionStart?: number;
   tableCell?: TableCellSelection;
   /** True when the range spans more than one table cell. */

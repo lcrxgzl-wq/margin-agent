@@ -35,6 +35,7 @@ export type CanvasProps = {
     blockIds?: string[];
     selectionRanges?: SelectionBlockRange[];
     text: string;
+    rawText?: string;
     selectionStart?: number;
     tableCell?: TableCellSelection;
     anchor?: { x: number; y: number } | null;

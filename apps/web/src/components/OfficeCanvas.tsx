@@ -75,6 +75,7 @@ type SelectionInfo = {
   blockIds?: string[];
   selectionRanges?: SelectionBlockRange[];
   text: string;
+  rawText?: string;
   selectionStart?: number;
   tableCell?: TableCellSelection;
   /** True when the range spans more than one table cell. */
@@ -511,7 +512,7 @@ export function OfficeCanvas(props: Props) {
     const block = blocksRef.current.find((candidate) => candidate.id === blockId);
     const startElementIndex = paragraphElements?.indexOf(context.startElement) ?? -1;
     const preferredStart = startElementIndex >= 0 && paragraphElements
-      ? elementText(paragraphElements.slice(0, startElementIndex)).length
+      ? elementText(paragraphElements.slice(0, startElementIndex)).replace(/\u200b/g, "").length
       : undefined;
     const tableCell = currentTableCell(context);
     const range = editor.command.getRange();
@@ -575,6 +576,7 @@ export function OfficeCanvas(props: Props) {
       blockIds,
       selectionRanges,
       text: canonicalSelectionText,
+      rawText: text,
       selectionStart: canonicalSelectionStart,
       tableCell,
       crossTableCells,
@@ -721,6 +723,8 @@ export function OfficeCanvas(props: Props) {
       return { marks, text: editor.command.getText().main };
     });
     editorRef.current = editor;
+    const onHostMouseUp = () => window.setTimeout(emitSelection, 0);
+    host.addEventListener("mouseup", onHostMouseUp);
     editor.listener.contentChange = () => {
       contentChangeCountRef.current += 1;
       if (pendingProgrammaticContentChangesRef.current > 0) {
@@ -807,6 +811,7 @@ export function OfficeCanvas(props: Props) {
       editor.listener.rangeStyleChange = null;
       editor.listener.pageScaleChange = null;
       editor.destroy();
+      host.removeEventListener("mouseup", onHostMouseUp);
       restorePixelRatio();
       onDirtyChangeRef.current(false);
       Reflect.deleteProperty(host, "__marginOfficeDiagnostics");

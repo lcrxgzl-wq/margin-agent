@@ -291,6 +291,30 @@ ${instruction ? `作者指令（必须优先遵循）:\n"""\n${instruction.slice
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
+export type TranslateSelectionInput = {
+  text: string;
+  targetLanguage: "zh-CN" | "en";
+  signal?: AbortSignal;
+  timeoutMs?: number;
+};
+
+/** Single-shot translation: no session history, no proposals, no document writes. */
+export async function translateSelection(input: TranslateSelectionInput): Promise<string> {
+  const text = input.text.trim();
+  if (!text) throw new Error("translation text is empty");
+  const apiKey = runtimeApiKey(runtimeFormat());
+  const baseURL = process.env.MARGIN_BASE_URL;
+  if (!apiKey && !baseURL) {
+    return "离线模式未启用翻译；配置模型后可使用单次翻译。";
+  }
+  const target = input.targetLanguage === "en" ? "规范的学术英语" : "简体中文";
+  const system = "你是 Margin 的单次翻译助手。只输出译文，不解释，不重复原文，不输出提案或 JSON。";
+  const prompt = "请把下面的选区翻译成" + target + "。保留术语、引文、数字、专名与事实，不新增内容。选区：" + text;
+  const completion = await requestTextCompletion(prompt, system, input.signal, input.timeoutMs);
+  const translated = completion.trim();
+  return translated || "（模型返回为空）";
+}
+
 export type DiscussInput = {
   message: string;
   excerpt?: string;

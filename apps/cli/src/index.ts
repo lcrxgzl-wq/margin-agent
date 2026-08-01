@@ -92,6 +92,7 @@ import {
   configureRequestPolicy,
   discoverLlmModels,
   testLlmModelConnection,
+  translateSelection,
   type LlmProviderProbeInput,
 } from "@margin/llm";
 import {
@@ -1038,6 +1039,30 @@ async function main() {
         return reply.code(400).send({ error: error.message });
       }
       return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post<{
+    Body: { text?: string; targetLanguage?: "zh-CN" | "en" };
+  }>("/api/v1/translate", async (req, reply) => {
+    requireAuth(state, req.headers.authorization);
+    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+    if (!text) return reply.code(400).send({ error: "text is required" });
+    if (text.length > 100_000) {
+      return reply.code(413).send({ error: "translation text is too long" });
+    }
+    try {
+      loadAndApplyLlmSettings(workspacePath);
+      const translation = await translateSelection({
+        text,
+        targetLanguage: req.body?.targetLanguage === "en" ? "en" : "zh-CN",
+        timeoutMs: readLlmSettingsStore(workspacePath).agentTimeoutMs,
+      });
+      return { translation };
+    } catch (error) {
+      return reply.code(500).send({
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   });
 

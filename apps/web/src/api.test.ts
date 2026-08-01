@@ -206,6 +206,33 @@ describe("review checklist requests", () => {
       kind: "resolve",
     });
   });
+
+  it("posts a single-shot translation without document or session context", async () => {
+    vi.stubGlobal("location", { href: "http://127.0.0.1/#token=test-token" });
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => undefined,
+    });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      statusText: "",
+      json: async () => ({ translation: "译文" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { translateSelection } = await import("./api");
+    await expect(translateSelection("原文", "zh-CN")).resolves.toEqual({
+      translation: "译文",
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v1/translate");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({
+      text: "原文",
+      targetLanguage: "zh-CN",
+    });
+  });
 });
 
 describe("document-scoped session requests", () => {

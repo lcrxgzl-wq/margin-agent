@@ -16,6 +16,7 @@ import {
   listProposals,
   listReviewChecklists,
   saveSessionThreads,
+  translateSelection,
   getSession,  type Block,
   type DocumentMeta,
   type LlmSettingsPublic,
@@ -31,11 +32,12 @@ import { SelectionMenu } from "./components/SelectionMenu";
 import { SettingsHub } from "./components/SettingsHub";
 import { SessionMenu } from "./components/SessionMenu";
 import { ThreadPopover } from "./components/ThreadPopover";
+import { TranslationPopover, type TranslationState } from "./components/TranslationPopover";
 import type { CanvasFocusRequest } from "./components/canvasTypes";
 import { clampFloatRect, defaultFloatRect, type FloatRect } from "./layoutGeometry";
 import { MarginStoreProvider, useMarginStore, type ReviewThread, type SelectionInput, type ThreadAnchor } from "./store";
 import { useWorkspaceActions } from "./useWorkspaceActions";
-import { polishIntent, translateAssistInstruction, translationIntent } from "./selectionEditIntent";
+import { polishIntent, translationIntent } from "./selectionEditIntent";
 import { selectionEditUnavailableReason } from "./selectionSafety";
 import { clearChatAfterDirectDocumentOpen, resyncChatAfterAgentDocumentOpen } from "./documentChatSync";
 import {
@@ -126,7 +128,11 @@ function Workspace() {
     return saved === "light" || saved === "dark" ? saved : "system";
   });
   const [selectionClearToken, setSelectionClearToken] = useState(0);
+  const [translation, setTranslation] = useState<TranslationState | null>(null);
+  const translationRequestRef = useRef(0);
   const clearSelectionEverywhere = () => {
+    translationRequestRef.current += 1;
+    setTranslation(null);
     store.clearSelection();
     setSelectionClearToken((value) => value + 1);
   };
@@ -496,6 +502,8 @@ function Workspace() {
   const onCanvasSelectionChange = useCallback((event: SelectionInput & { programmaticThreadId?: string }) => {
     const current = storeRef.current;
     const { programmaticThreadId, ...selection } = event;
+    translationRequestRef.current += 1;
+    setTranslation(null);
     const openThread = current.activeThreadId
       ? current.threads.find((candidate) => candidate.id === current.activeThreadId)
       : null;
@@ -539,6 +547,36 @@ function Workspace() {
       }),
     );
     if (thread) current.updateThreadPosition(thread.id, selection.anchor);
+  }, []);
+
+  const startTranslation = useCallback(() => {
+    const current = storeRef.current;
+    const anchor = current.selection.anchor;
+    const source = current.selection.rawText ?? current.selection.text;
+    if (!anchor || !source.trim()) return;
+    current.setMenu(null);
+    const requestId = ++translationRequestRef.current;
+    const target = translationIntent(source).targetLanguage ?? "zh-CN";
+    setTranslation({ anchor: { ...anchor }, source, status: "loading" });
+    void translateSelection(source, target)
+      .then((data) => {
+        if (translationRequestRef.current !== requestId) return;
+        setTranslation({
+          anchor: { ...anchor },
+          source,
+          status: "done",
+          result: data.translation,
+        });
+      })
+      .catch((reason) => {
+        if (translationRequestRef.current !== requestId) return;
+        setTranslation({
+          anchor: { ...anchor },
+          source,
+          status: "error",
+          error: reason instanceof Error ? reason.message : String(reason),
+        });
+      });
   }, []);
 
   const onSaveHandlerChange = useCallback((save: (() => Promise<boolean>) | null) => {
@@ -703,8 +741,8 @@ function Workspace() {
         documentId={activeDocument?.id}
         llmMode={store.llm?.llmMode ?? (store.llm?.provider?.apiKeySet ? "byok" : "mock")}
         selectionHint={
-          store.selection.text.trim()
-            ? store.selection.text.trim().slice(0, 48) + (store.selection.text.length > 48 ? "…" : "")
+          (store.selection.rawText ?? store.selection.text).trim()
+            ? (store.selection.rawText ?? store.selection.text).trim().slice(0, 48) + ((store.selection.rawText ?? store.selection.text).length > 48 ? "…" : "")
             : undefined
         }
         selectionBlockCount={
@@ -882,22 +920,7 @@ function Workspace() {
           onRewriteDirected={() =>
             actions.dispatchSelection("rewrite_directed", store.menu!.blockId, store.menu!.text, undefined, store.menu!.selectionStart, "rewrite", undefined, store.menu!.tableCell, store.menu!.blockIds, store.menu!.crossTableCells, store.menu!.selectionRanges)
           }
-          onTranslate={() => {
-            const intent = translationIntent(store.menu!.text);
-            actions.dispatchSelection(
-              "discuss",
-              store.menu!.blockId,
-              store.menu!.text,
-              translateAssistInstruction(intent.targetLanguage),
-              store.menu!.selectionStart,
-              undefined,
-              undefined,
-              store.menu!.tableCell,
-              store.menu!.blockIds,
-              store.menu!.crossTableCells,
-              store.menu!.selectionRanges,
-            );
-          }}
+          onTranslate={startTranslation}
           onPolish={() =>
             actions.dispatchSelection(
               "rewrite_directed",
@@ -925,6 +948,7 @@ function Workspace() {
           !store.menu &&
           !store.busy &&
           !store.rewritePrompt &&
+          !translation &&
           !(popoverOpen && selectionOwnedByOpenThread(activeThread?.anchor, store.selection))
         }
         x={store.selection.anchor?.x ?? 0}
@@ -947,26 +971,13 @@ function Workspace() {
           store.selection.crossTableCells,
           store.selection.selectionRanges,
         )}
-        onTranslate={() => {
-          const intent = translationIntent(store.selection.text);
-          actions.dispatchSelection(
-            "discuss",
-            store.selection.blockId,
-            store.selection.text,
-            translateAssistInstruction(intent.targetLanguage),
-            store.selection.selectionStart,
-            undefined,
-            undefined,
-            store.selection.tableCell,
-            store.selection.blockIds,
-            store.selection.crossTableCells,
-            store.selection.selectionRanges,
-          );
-        }}
+        onTranslate={startTranslation}
         onDiscuss={() => {
           actions.dispatchSelection("discuss", store.selection.blockId, store.selection.text, undefined, store.selection.selectionStart, undefined, undefined, store.selection.tableCell, store.selection.blockIds, store.selection.crossTableCells, store.selection.selectionRanges);
         }}
-        onMore={() =>
+        onMore={() => {
+          translationRequestRef.current += 1;
+          setTranslation(null);
           store.setMenu({
             x: store.selection.anchor?.x ?? window.innerWidth / 2,
             y: (store.selection.anchor?.y ?? 120) + 8,
@@ -977,9 +988,18 @@ function Workspace() {
             selectionStart: store.selection.selectionStart,
             tableCell: store.selection.tableCell,
             crossTableCells: store.selection.crossTableCells,
-          })
-        }
+          });
+        }}
       />
+      {translation ? (
+        <TranslationPopover
+          translation={translation}
+          onClose={() => {
+            translationRequestRef.current += 1;
+            setTranslation(null);
+          }}
+        />
+      ) : null}
       {popoverOpen && activeThread ? (
         <ThreadPopover
           thread={activeThread}

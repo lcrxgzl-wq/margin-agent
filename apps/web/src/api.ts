@@ -292,6 +292,16 @@ export async function decideReviewChecklist(
   );
 }
 
+export async function translateSelection(
+  text: string,
+  targetLanguage: "zh-CN" | "en",
+) {
+  return api<{ translation: string }>("/api/v1/translate", {
+    method: "POST",
+    body: JSON.stringify({ text, targetLanguage }),
+  });
+}
+
 export type TimelineEntry = {
   id: string;
   createdAt: string;

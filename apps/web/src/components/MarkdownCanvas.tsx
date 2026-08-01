@@ -97,7 +97,13 @@ function MarkdownCanvasView({
           anchor = null;
         }
       }
-      onSelectionChange({ blockId, blockIds: ids.length > 1 ? ids : undefined, text, anchor });
+      onSelectionChange({
+        blockId,
+        blockIds: ids.length > 1 ? ids : undefined,
+        text,
+        rawText: text,
+        anchor,
+      });
     },
   });
 
