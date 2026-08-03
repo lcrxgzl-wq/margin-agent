@@ -8,6 +8,7 @@ import {
   publicLlmSettings,
   readLlmSettingsStore,
   saveLlmSettings,
+  writeLlmSettingsStore,
 } from "./llm-settings.js";
 
 describe("llm-settings", () => {
@@ -388,6 +389,62 @@ describe("reasoning settings", () => {
     );
     expect(readLlmSettingsStore(root).agentTimeoutMs).toBeUndefined();
     expect(publicLlmSettings(readLlmSettingsStore(root)).agentTimeoutMs).toBeUndefined();
+  });
+
+  it("persists retry attempts and delay, then clears both to runtime defaults", async () => {
+    expect(readLlmSettingsStore(root).retryAttempts).toBeUndefined();
+    expect(readLlmSettingsStore(root).retryDelayMs).toBeUndefined();
+
+    await saveLlmSettings(root, { retryAttempts: 7, retryDelayMs: 45_000 });
+    expect(readLlmSettingsStore(root)).toMatchObject({
+      retryAttempts: 7,
+      retryDelayMs: 45_000,
+    });
+    expect(publicLlmSettings(readLlmSettingsStore(root))).toMatchObject({
+      retryAttempts: 7,
+      retryDelayMs: 45_000,
+    });
+
+    await saveLlmSettings(root, { retryAttempts: null, retryDelayMs: null });
+    expect(readLlmSettingsStore(root).retryAttempts).toBeUndefined();
+    expect(readLlmSettingsStore(root).retryDelayMs).toBeUndefined();
+  });
+
+  it("rejects invalid retry settings and ignores invalid persisted values", async () => {
+    await expect(saveLlmSettings(root, { retryAttempts: 0 })).rejects.toThrow(/retryAttempts/);
+    await expect(saveLlmSettings(root, { retryAttempts: 11 })).rejects.toThrow(/retryAttempts/);
+    await expect(saveLlmSettings(root, { retryDelayMs: -1 })).rejects.toThrow(/retryDelayMs/);
+    await expect(saveLlmSettings(root, { retryDelayMs: 300_001 })).rejects.toThrow(/retryDelayMs/);
+
+    fs.writeFileSync(
+      path.join(root, ".margin", "llm-settings.json"),
+      JSON.stringify({
+        activeId: "custom",
+        retryAttempts: 99,
+        retryDelayMs: -1,
+        providers: [{
+          id: "custom",
+          name: "Custom",
+          apiFormat: "openai",
+          authStyle: "bearer",
+          baseURL: "https://provider.test/v1",
+          model: "model-a",
+        }],
+      }),
+      "utf8",
+    );
+    expect(readLlmSettingsStore(root).retryAttempts).toBeUndefined();
+    expect(readLlmSettingsStore(root).retryDelayMs).toBeUndefined();
+  });
+
+  it("rejects invalid retry values at the public low-level writer", async () => {
+    const store = readLlmSettingsStore(root);
+    await expect(
+      writeLlmSettingsStore(root, { ...store, retryAttempts: 99 }),
+    ).rejects.toThrow(/retryAttempts/);
+    await expect(
+      writeLlmSettingsStore(root, { ...store, retryDelayMs: -1 }),
+    ).rejects.toThrow(/retryDelayMs/);
   });
 
   it("persists a custom selection context cap and clears it with null", async () => {

@@ -1,5 +1,5 @@
 import { ArrowUp, Check, Pencil, RotateCcw, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent } from "react";
 import type { Comment, Proposal } from "../api";
 import { submitEnterFrom } from "../ime";
@@ -118,10 +118,12 @@ type Props = {
   proposals: Proposal[];
   comments: Comment[];
   messages: ChatMessage[];
+  retryMessageId?: string;
   busy: boolean;
   statusLine: string;
   dirty: boolean;
   onSend: (text: string) => void;
+  onRetry?: (messageId: string) => void;
   onAccept: (proposalId: string) => void | boolean | Promise<void | boolean>;
   onEdit: (proposalId: string, editedText: string) => void | boolean | Promise<void | boolean>;
   onUndo: (proposalId: string) => void | boolean | Promise<void | boolean>;
@@ -140,10 +142,12 @@ export function ThreadPopover({
   proposals,
   comments,
   messages,
+  retryMessageId,
   busy,
   statusLine,
   dirty,
   onSend,
+  onRetry,
   onAccept,
   onEdit,
   onUndo,
@@ -315,9 +319,20 @@ export function ThreadPopover({
           {messages.length ? (
             <div className="thread-messages">
               {messages.map((message) => (
-                <p key={message.id} data-role={message.role} className="thread-message">
-                  {message.text || (busy ? "…" : "")}
-                </p>
+                <Fragment key={message.id}>
+                  <p data-role={message.role} className="thread-message">
+                    {message.text || (busy ? "…" : "")}
+                  </p>
+                  {message.id === retryMessageId && onRetry ? (
+                    <div className="task-receipt retry" role="status">
+                      <span>请求未完成</span>
+                      <button type="button" disabled={busy} onClick={() => onRetry(message.id)}>
+                        <RotateCcw size={12} aria-hidden />
+                        重试
+                      </button>
+                    </div>
+                  ) : null}
+                </Fragment>
               ))}
             </div>
           ) : null}

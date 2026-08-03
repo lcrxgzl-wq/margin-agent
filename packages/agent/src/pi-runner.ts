@@ -94,6 +94,8 @@ export async function runPiBlockScan(
     sessionId: `pi-scan-${createHash("sha256").update(`margin-scan:${ctx.documentId}`).digest("hex").slice(0, 24)}`,
     maxTurns: maxTurns(profile.limits.maxTurns),
     timeoutMs: ctx.timeoutMs ?? timeoutMs(profile.limits.timeoutMs),
+    retryAttempts: ctx.retryAttempts,
+    retryDelayMs: ctx.retryDelayMs,
     maxContextMessages: profile.limits.maxContextMessages,
     maxContextChars: profile.limits.maxContextChars,
     allowedToolNames: tools.map((tool) => tool.name),

@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { Proposal } from "./api";
 import {
+  openThreadSelectionDisposition,
   proposalMatchesSelection,
   proposalSelectionIdentity,
   sameSelectionIdentity,
+  sameTranslationSelectionIdentity,
   selectionAnchorAlive,
   selectionOwnedByOpenThread,
   selectionClearlyDivergedFromThread,
+  shouldCancelTranslationForSelectionEvent,
 } from "./selectionIdentity";
 
 function selectionProposal(overrides: Partial<Proposal> = {}): Proposal {
@@ -73,6 +76,32 @@ describe("selection identity", () => {
       selectionText: "旧值",
       tableCell: { address: "C3", row: 3, column: 3, before: "旧值" },
     })).toBe(false);
+  });
+
+  it("distinguishes translation spans inside the same table cell", () => {
+    const cell = { address: "B3", row: 3, column: 2, before: "甲文本乙文本" };
+    expect(sameTranslationSelectionIdentity({
+      blockId: "table-1",
+      selectionText: "甲文本",
+      selectionStart: 0,
+      tableCell: cell,
+    }, {
+      blockId: "table-1",
+      selectionText: "乙文本",
+      selectionStart: 3,
+      tableCell: cell,
+    })).toBe(false);
+    expect(sameTranslationSelectionIdentity({
+      blockId: "table-1",
+      selectionText: "甲文本",
+      selectionStart: 0,
+      tableCell: cell,
+    }, {
+      blockId: "table-1",
+      selectionText: "甲文本",
+      selectionStart: 0,
+      tableCell: cell,
+    })).toBe(true);
   });
 
   it("keeps repeated text at different offsets as separate threads", () => {
@@ -215,6 +244,11 @@ describe("selection identity", () => {
     })).toBe(false);
     expect(selectionClearlyDivergedFromThread(thread, {
       blockId: "block-1",
+      text: "重复文字",
+      selectionStart: 11,
+    })).toBe(true);
+    expect(selectionClearlyDivergedFromThread(thread, {
+      blockId: "block-1",
       text: "另一段",
     })).toBe(true);
   });
@@ -240,5 +274,53 @@ describe("selection identity", () => {
       text: "重复文字",
       selectionStart: 1,
     })).toBe(false);
+  });
+
+  it("ignores an unrelated programmatic proposal focus while another thread is open", () => {
+    const openThread = {
+      id: "thread-a",
+      anchor: {
+        blockId: "shared-block",
+        selectionText: "repeated text",
+        selectionStart: 0,
+      },
+    };
+
+    expect(openThreadSelectionDisposition(openThread, {
+      blockId: "shared-block",
+      text: "repeated text",
+      selectionStart: 20,
+      anchor: { x: 800, y: 600 },
+      userInitiated: false,
+    })).toBe("ignore");
+    expect(openThreadSelectionDisposition(openThread, {
+      blockId: "shared-block",
+      text: "repeated text",
+      selectionStart: 20,
+      anchor: { x: 800, y: 600 },
+      programmaticThreadId: "thread-a",
+      userInitiated: false,
+    })).toBe("thread");
+    expect(openThreadSelectionDisposition(openThread, {
+      blockId: "shared-block",
+      text: "repeated text",
+      selectionStart: 0,
+      anchor: { x: 120, y: 180 },
+      userInitiated: false,
+    })).toBe("thread");
+    expect(openThreadSelectionDisposition(openThread, {
+      blockId: "shared-block",
+      text: "repeated text",
+      selectionStart: 20,
+      anchor: { x: 800, y: 600 },
+      userInitiated: true,
+    })).toBe("selection");
+  });
+
+  it("cancels stale translation for every accepted selection change", () => {
+    expect(shouldCancelTranslationForSelectionEvent(false, "selection")).toBe(true);
+    expect(shouldCancelTranslationForSelectionEvent(false, "thread")).toBe(true);
+    expect(shouldCancelTranslationForSelectionEvent(false, "ignore")).toBe(false);
+    expect(shouldCancelTranslationForSelectionEvent(true, "selection")).toBe(false);
   });
 });

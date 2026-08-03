@@ -10,6 +10,7 @@ import open from "open";
 import {
   openWorkspace,
   openDocumentFile,
+  enqueueDocumentMutation,
   getDocument,
   listBlocks,
   listProposals,
@@ -18,8 +19,8 @@ import {
   readWorkspaceSource,
   readWorkspaceSourceVersion,
   writeWorkspaceText,
-  supersedeOpenProposals,
-  saveProposal,
+  saveScanArtifactsAtomically,
+  ScanArtifactsConflictError,
   saveDecision,
   rejectProposal,
   reopenProposal,
@@ -35,10 +36,9 @@ import {
   saveNativeDocx,
   reconcileRegisteredDocxDocuments,
   exportDocumentDocx,
-  replaceDocumentComments,
   listComments,
   listActiveReviewChecklists,
-  saveReviewChecklistRun,
+  getReviewChecklist,
   decideReviewChecklistItems,
   ReviewChecklistConflictError,
   ReviewChecklistNotFoundError,
@@ -70,6 +70,7 @@ import {
   createReviewChecklistRuns,
   runBlockScan,
   resolveEngine,
+  resolveRuntimeModel,
   type ToolAuditEvent,
   type RemoteMcpApprovalRequest,
   type RemoteMcpBridge,
@@ -110,6 +111,7 @@ import {
   rotateChatSessionWithSummary,
   runChatAgentTurn,
   syncBagFromDocument,
+  taskForPersistence,
   type ChatAgentState,
 } from "./chat-agent.js";
 import { applyConversationNote, decisionConversationNote } from "./conversation-notes.js";
@@ -131,6 +133,8 @@ import {
   validateProposalSelectionRanges,
 } from "./proposal-selection.js";
 import { abortOnClientDisconnect } from "./stream-lifecycle.js";
+import { workspacePathComparisonKey } from "./workspace-path.js";
+import { buildContextUsage } from "./context-usage.js";
 import {
   callEnabledRemoteMcpTool,
   discoverWorkspaceRemoteMcp,
@@ -218,6 +222,20 @@ type RunState = {
   phase?: string;
   steps?: string[];
   toolAudit?: ToolAuditEvent[];
+};
+
+const MAX_CHAT_REQUEST_ID_LENGTH = 200;
+const MAX_COMPLETED_CHAT_REQUESTS = 100;
+const CHAT_REQUEST_ID_PATTERN = /^[^\s\p{C}]+$/u;
+
+type ChatDoneEvent = Record<string, unknown> & {
+  type: "done";
+  reply: string;
+};
+
+type CompletedChatRequest = {
+  fingerprint: string;
+  done: ChatDoneEvent;
 };
 
 type AppState = {
@@ -325,6 +343,8 @@ async function main() {
 
   /** Serialize chat turns so concurrent requests don't corrupt bag/memory. */
   let chatTail: Promise<unknown> = Promise.resolve();
+  const completedChatRequests = new Map<string, CompletedChatRequest>();
+  const inFlightChatRequests = new Map<string, string>();
   const enqueueChat = <T>(fn: () => Promise<T>): Promise<T> => {
     const run = chatTail.then(fn, fn);
     chatTail = run.then(
@@ -349,6 +369,10 @@ async function main() {
     ),
   };
   state.chat.hydrate(loadPersistedChatTurns(workspace));
+  const contextUsage = () => buildContextUsage(
+    state.agent.agentMessages,
+    resolveRuntimeModel().model.contextWindow,
+  );
   const persistSession = () =>
     saveAgentSession(workspace, {
       sessionId: state.agent.sessionId,
@@ -359,7 +383,7 @@ async function main() {
       threads: state.reviewThreads,
       sourcePaths: state.agent.sourcePaths,
       evidenceCache: state.agent.evidenceCache,
-      task: state.agent.task,
+      task: taskForPersistence(state.agent),
     });
   /** GET /api/v1/session payload — also returned by session new/switch so the web reuses one hydrate path. */
   const sessionPayload = () => {
@@ -381,6 +405,7 @@ async function main() {
       clarificationRounds: state.agent.clarificationRounds ?? 0,
       sourcePaths: state.agent.sourcePaths,
       task: state.agent.task,
+      context: contextUsage(),
       opened,
       chat: {
         turns: state.chat.list(),
@@ -399,7 +424,7 @@ async function main() {
     const hasContent =
       state.agent.agentMessages.length > 0 ||
       state.chat.list().length > 0 ||
-      Boolean(state.agent.task);
+      Boolean(taskForPersistence(state.agent));
     if (hasContent) archiveAgentSession(workspace, state.agent.sessionId);
   };
 
@@ -410,7 +435,7 @@ async function main() {
     contentHash: string;
   }>();
   const readSourceExcerpt = async (relativePath: string) => {
-    const cacheKey = relativePath.replace(/\\/g, "/").toLocaleLowerCase();
+    const cacheKey = workspacePathComparisonKey(relativePath.replace(/\\/g, "/"));
     const version = readWorkspaceSourceVersion(workspace, relativePath);
     const cached = sourceExcerptCache.get(cacheKey);
     if (cached?.versionHash === version.versionHash) return cached;
@@ -463,6 +488,8 @@ async function main() {
           reasoningMode: scanLlmStore.reasoningMode,
           reasoningOptIn: activeProfile(scanLlmStore).reasoningOptIn,
           timeoutMs: scanLlmStore.agentTimeoutMs,
+          retryAttempts: scanLlmStore.retryAttempts,
+          retryDelayMs: scanLlmStore.retryDelayMs,
           documentId,
           revision: doc.revision,
           blocks,
@@ -498,9 +525,15 @@ async function main() {
         patch({ status: "superseded", phase: "文稿已切换，结果未写入" });
         return;
       }
-      const proposalIds: string[] = [];
-      for (const draft of scan.proposals) {
-        if (state.runs.get(runId)?.status === "cancelled") return;
+      const currentDocument = getDocument(workspace, documentId);
+      if (
+        currentDocument.revision !== doc.revision ||
+        currentDocument.contentHash !== doc.contentHash
+      ) {
+        patch({ status: "superseded", phase: "文稿已更新，结果未写入" });
+        return;
+      }
+      const proposals = scan.proposals.map((draft) => {
         const proposal = {
           ...draft,
           id: randomUUID(),
@@ -511,21 +544,22 @@ async function main() {
         if (!targetBlock || targetBlock.contentHash !== draft.baseHash) {
           throw new Error("block hash mismatch");
         }
-        saveProposal(workspace, proposal);
-        proposalIds.push(proposal.id);
-      }
-      replaceDocumentComments(
-        workspace,
-        documentId,
-        (scan.comments ?? []).map((c) => ({
-          id: c.id,
-          blockId: c.blockId,
-          text: c.text,
-          severity: c.severity,
+        return proposal;
+      });
+      const proposalIds = proposals.map((proposal) => proposal.id);
+      const comments = (scan.comments ?? []).map((comment) => {
+        if (comment.documentId && comment.documentId !== documentId) {
+          throw new Error("scan comment document mismatch");
+        }
+        return {
+          id: comment.id,
+          blockId: comment.blockId,
+          text: comment.text,
+          severity: comment.severity,
           runId,
-          source: c.source,
-        })),
-      );
+          source: comment.source,
+        };
+      });
       const checklistByChecker = new Map(
         (scan.reviewChecklists ?? []).map((checklist) => [checklist.run.checker, checklist]),
       );
@@ -535,8 +569,35 @@ async function main() {
           checklistByChecker.set(checklist.run.checker, checklist);
         }
       }
-      for (const checklist of checklistByChecker.values()) {
-        saveReviewChecklistRun(workspace, checklist);
+      if (state.runs.get(runId)?.status === "cancelled") return;
+      const persistence = await enqueueDocumentMutation(workspace, documentId, () => {
+        if (signal?.aborted || state.runs.get(runId)?.status === "cancelled") {
+          return "cancelled" as const;
+        }
+        if (state.latestScanRunByDocument.get(documentId) !== runId) {
+          return "superseded" as const;
+        }
+        if (!isActiveDocumentRequest(state.agent.bag.documentId, documentId)) {
+          return "document_switched" as const;
+        }
+        saveScanArtifactsAtomically(workspace, documentId, {
+          expectedRevision: doc.revision,
+          expectedContentHash: doc.contentHash,
+          proposals,
+          comments,
+          reviewChecklists: [...checklistByChecker.values()],
+          supersedeOpenProposals: !opts?.instruction && blockIds.length > 2,
+        });
+        return "saved" as const;
+      });
+      if (persistence === "cancelled") return;
+      if (persistence === "superseded") {
+        patch({ status: "superseded", phase: "已被较新的任务替代" });
+        return;
+      }
+      if (persistence === "document_switched") {
+        patch({ status: "superseded", phase: "文稿已切换，结果未写入" });
+        return;
       }
       patch({
         status: "done",
@@ -555,6 +616,10 @@ async function main() {
       if (state.runs.get(runId)?.status === "cancelled") return;
       if (state.latestScanRunByDocument.get(documentId) !== runId) {
         patch({ status: "superseded", phase: "已被较新的任务替代" });
+        return;
+      }
+      if (e instanceof ScanArtifactsConflictError) {
+        patch({ status: "superseded", phase: "文稿已更新，结果未写入" });
         return;
       }
       patch({
@@ -586,10 +651,6 @@ async function main() {
       selectedSkills?: string[];
     },
   ) => {
-    // Selection rewrite keeps prior pending proposals on other blocks.
-    if (!opts?.instruction && blockIds.length > 2) {
-      supersedeOpenProposals(workspace, documentId);
-    }
     const runId = randomUUID();
     const previousRunId = state.latestScanRunByDocument.get(documentId);
     if (previousRunId) {
@@ -732,6 +793,8 @@ async function main() {
       reasoningMode?: "auto" | "fast" | "standard" | "deep" | null;
       harnessId?: string | null;
       agentTimeoutMs?: number | null;
+      retryAttempts?: number | null;
+      retryDelayMs?: number | null;
       contextTier?: "eco" | "standard" | "max" | null;
       selectionContextChars?: number | null;
       /** Automatic context compaction toggle; null clears back to default. */
@@ -1020,14 +1083,24 @@ async function main() {
     if (!Array.isArray(req.body?.itemIds) || !req.body?.kind) {
       return reply.code(400).send({ error: "itemIds and kind are required" });
     }
+    const { itemIds, kind } = req.body;
     try {
-      const result = decideReviewChecklistItems(
-        workspace,
-        req.params.runId,
-        req.body.itemIds,
-        req.body.kind,
-      );
-      return { decision: result.decision, run: result.checklist };
+      return await enqueueChat(async () => {
+        const checklist = getReviewChecklist(workspace, req.params.runId);
+        if (!isActiveDocumentRequest(
+          state.agent.bag.documentId,
+          checklist.run.documentId,
+        )) {
+          return reply.code(409).send({ ok: false, reason: "document_mismatch" });
+        }
+        const result = decideReviewChecklistItems(
+          workspace,
+          req.params.runId,
+          itemIds,
+          kind,
+        );
+        return { decision: result.decision, run: result.checklist };
+      });
     } catch (error) {
       if (error instanceof ReviewChecklistConflictError) {
         return reply.code(409).send({ error: error.message });
@@ -1051,18 +1124,27 @@ async function main() {
     if (text.length > 100_000) {
       return reply.code(413).send({ error: "translation text is too long" });
     }
+    const targetLanguage = req.body?.targetLanguage;
+    if (targetLanguage !== "zh-CN" && targetLanguage !== "en") {
+      return reply.code(400).send({ error: "targetLanguage must be zh-CN or en" });
+    }
+    const controller = new AbortController();
+    const stopWatchingDisconnect = abortOnClientDisconnect(req.raw, reply.raw, controller);
     try {
       loadAndApplyLlmSettings(workspacePath);
       const translation = await translateSelection({
         text,
-        targetLanguage: req.body?.targetLanguage === "en" ? "en" : "zh-CN",
+        targetLanguage,
         timeoutMs: readLlmSettingsStore(workspacePath).agentTimeoutMs,
+        signal: controller.signal,
       });
       return { translation };
     } catch (error) {
       return reply.code(500).send({
         error: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      stopWatchingDisconnect();
     }
   });
 
@@ -1172,12 +1254,15 @@ async function main() {
       return reply.code(400).send({ error: "选区快捷提案最多使用 12 份资料；请缩小挂载范围或改用对话研究任务" });
     }
     const availableSources = new Map(
-      listWorkspaceSourceFiles(workspace).map((relativePath) => [relativePath.toLocaleLowerCase(), relativePath]),
+      listWorkspaceSourceFiles(workspace).map((relativePath) => [
+        workspacePathComparisonKey(relativePath),
+        relativePath,
+      ]),
     );
     const sourcePaths: string[] = [];
     for (const relativePath of requestedSourcePaths) {
       const normalized = relativePath.trim().replace(/\\/g, "/").replace(/^\.\//, "");
-      const canonical = availableSources.get(normalized.toLocaleLowerCase());
+      const canonical = availableSources.get(workspacePathComparisonKey(normalized));
       if (!canonical) return reply.code(400).send({ error: `source file not found or unsupported: ${normalized}` });
       if (!sourcePaths.includes(canonical)) sourcePaths.push(canonical);
     }
@@ -1225,8 +1310,11 @@ async function main() {
     try {
       const requestedPath = match[1]!.replace(/\\/g, "/");
       const canonicalPath = new Map(
-        listWorkspaceSourceFiles(workspace).map((relativePath) => [relativePath.toLocaleLowerCase(), relativePath]),
-      ).get(requestedPath.toLocaleLowerCase());
+        listWorkspaceSourceFiles(workspace).map((relativePath) => [
+          workspacePathComparisonKey(relativePath),
+          relativePath,
+        ]),
+      ).get(workspacePathComparisonKey(requestedPath));
       if (!canonicalPath) return reply.code(400).send({ error: "source file not found or unsupported" });
       const source = await readSourceExcerpt(canonicalPath);
       if (expectedHash && source.contentHash !== expectedHash) {
@@ -1904,24 +1992,31 @@ async function main() {
             : undefined,
           threadId,
         });
-        if (previousDocumentId && state.agent.bag.documentId !== previousDocumentId) {
+        if (
+          turn.conversationReset ||
+          (previousDocumentId && state.agent.bag.documentId !== previousDocumentId)
+        ) {
           state.reviewThreads = [];
           persistSession();
         }
         return { cleared: false as const, closed: false as const, turn };
       });
-      if (outcome.cleared) return { reply: "对话已清空，当前文稿保持打开。" };
+      if (outcome.cleared) {
+        return { reply: "对话已清空，当前文稿保持打开。", context: contextUsage() };
+      }
       if (outcome.closed) {
         return {
           reply: outcome.hadDocument ? "已关闭当前文稿。" : "当前没有打开的文稿。",
           closed: true,
           sourcePaths: [],
           clarificationRounds: 0,
+          context: contextUsage(),
         };
       }
       const { turn } = outcome;
       return {
         reply: turn.reply,
+        conversationReset: turn.conversationReset,
         opened: turn.opened,
         engine: turn.engine,
         steps: turn.steps,
@@ -1932,6 +2027,7 @@ async function main() {
         notes: turn.notes,
         loadedSkills: turn.loadedSkills,
         task: turn.task,
+        context: contextUsage(),
       };
     } catch (e) {
       return reply.code(500).send({ error: e instanceof Error ? e.message : String(e) });
@@ -1952,18 +2048,64 @@ async function main() {
       threadId?: string;
       harnessId?: string;
       selectedSkills?: string[];
+      requestId?: string;
     };
   }>("/api/v1/chat/stream", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
-    const selectedSkillsResult = resolveSelectedSkills(req.body?.selectedSkills);
-    if (!selectedSkillsResult.ok) {
-      return reply.code(400).send({ error: selectedSkillsResult.error });
-    }
     const message = (req.body?.message ?? "").trim();
     if (!message) return reply.code(400).send({ error: "message required" });
     const threadId = req.body?.threadId?.trim();
     if (req.body?.threadId !== undefined && (!threadId || threadId.length > 200)) {
       return reply.code(400).send({ error: "invalid threadId" });
+    }
+    const requestId = req.body?.requestId;
+    if (
+      requestId !== undefined &&
+      (typeof requestId !== "string" ||
+        requestId.length === 0 ||
+        requestId.length > MAX_CHAT_REQUEST_ID_LENGTH ||
+        !CHAT_REQUEST_ID_PATTERN.test(requestId))
+    ) {
+      return reply.code(400).send({ error: "invalid requestId" });
+    }
+    const requestFingerprint = contentHash(JSON.stringify({
+      message,
+      documentId: req.body?.documentId ?? null,
+      selectionBlockIds: req.body?.selectionBlockIds ?? null,
+      selectionText: req.body?.selectionText ?? null,
+      selectionStart: req.body?.selectionStart ?? null,
+      cascadeBlockIds: req.body?.cascadeBlockIds ?? null,
+      sourcePaths: req.body?.sourcePaths ?? null,
+      chatMode: req.body?.chatMode === "socratic" ? "socratic" : "direct",
+      threadId: threadId ?? null,
+      harnessId: req.body?.harnessId ?? null,
+      selectedSkills: req.body?.selectedSkills ?? null,
+    }));
+    const completedBeforeQueue = requestId
+      ? completedChatRequests.get(requestId)
+      : undefined;
+    if (completedBeforeQueue?.fingerprint !== undefined &&
+      completedBeforeQueue.fingerprint !== requestFingerprint) {
+      return reply.code(409).send({ error: "requestId already used for a different request" });
+    }
+    const inFlightFingerprint = requestId
+      ? inFlightChatRequests.get(requestId)
+      : undefined;
+    if (inFlightFingerprint !== undefined && inFlightFingerprint !== requestFingerprint) {
+      return reply.code(409).send({ error: "requestId already used for a different request" });
+    }
+
+    if (completedBeforeQueue) {
+      reply
+        .type("application/x-ndjson; charset=utf-8")
+        .header("Cache-Control", "no-cache")
+        .send(`${JSON.stringify(completedBeforeQueue.done)}\n`);
+      return;
+    }
+
+    const selectedSkillsResult = resolveSelectedSkills(req.body?.selectedSkills);
+    if (!selectedSkillsResult.ok) {
+      return reply.code(400).send({ error: selectedSkillsResult.error });
     }
     const clearRequested = /^(清空对话|清除对话|新会话|reset\s*chat)(?:。|！|!)?$/i.test(message);
     const closeRequested = isCloseDocumentRequest(message);
@@ -1976,24 +2118,21 @@ async function main() {
         return reply.code(selectionError.statusCode).send({ error: selectionError.error });
       }
     }
-
     reply.hijack();
     reply.raw.writeHead(200, {
       "Content-Type": "application/x-ndjson; charset=utf-8",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
     });
-    const ac = new AbortController();
-    const stopWatchingDisconnect = abortOnClientDisconnect(req.raw, reply.raw, ac);
     const send = (obj: Record<string, unknown>) => {
       if (reply.raw.destroyed || reply.raw.writableEnded) return;
       reply.raw.write(`${JSON.stringify(obj)}\n`);
     };
+    const ac = new AbortController();
+    const stopWatchingDisconnect = abortOnClientDisconnect(req.raw, reply.raw, ac);
 
     const runId = randomUUID();
     const mcpApprovalAudit: McpApprovalAuditEntry[] = [];
-    // A new run supersedes any still-pending approvals of this session.
-    mcpApprovalRegistry.denyAllForSession(state.agent.sessionId, "superseded");
     ac.signal.addEventListener("abort", () => {
       for (const audit of mcpApprovalRegistry.denyAllForRun(runId, "run-cancelled")) {
         mcpApprovalAudit.push(audit);
@@ -2024,19 +2163,63 @@ async function main() {
         return outcome.decision;
       },
     };
+    let ownsInFlightRequest = Boolean(requestId && inFlightFingerprint === undefined);
+    if (requestId && ownsInFlightRequest) {
+      inFlightChatRequests.set(requestId, requestFingerprint);
+    }
+    if (inFlightFingerprint === undefined) {
+      // A genuinely new run supersedes any still-pending approvals of this session.
+      mcpApprovalRegistry.denyAllForSession(state.agent.sessionId, "superseded");
+    }
+    const releaseInFlightRequest = () => {
+      if (
+        requestId &&
+        ownsInFlightRequest &&
+        inFlightChatRequests.get(requestId) === requestFingerprint
+      ) {
+        inFlightChatRequests.delete(requestId);
+      }
+    };
 
     try {
       if (!clearRequested) send({ type: "status", text: "正在处理…" });
       let streamed = false;
-      const outcome = await enqueueChat(async () => {
-        if (ac.signal.aborted) return { disconnected: true as const };
+      const executeChatRequest = async () => {
+        const completedInQueue = requestId
+          ? completedChatRequests.get(requestId)
+          : undefined;
+        if (completedInQueue) {
+          if (completedInQueue.fingerprint !== requestFingerprint) {
+            return { kind: "conflict" as const };
+          }
+          return { kind: "done" as const, done: completedInQueue.done, replayed: true };
+        }
+        if (ac.signal.aborted) return { kind: "disconnected" as const };
+        if (requestId && !ownsInFlightRequest && !inFlightChatRequests.has(requestId)) {
+          ownsInFlightRequest = true;
+          inFlightChatRequests.set(requestId, requestFingerprint);
+        }
+
+        const complete = (done: ChatDoneEvent) => {
+          if (requestId) {
+            setBoundedMap(
+              completedChatRequests,
+              requestId,
+              { fingerprint: requestFingerprint, done },
+              MAX_COMPLETED_CHAT_REQUESTS,
+            );
+          }
+          return done;
+        };
         if (clearRequested) {
           const clearedSessionId = state.agent.sessionId;
           state.chat.clear();
           clearChatAgentConversation(state.agent);
           persistSession();
           deleteAgentSession(workspace, clearedSessionId);
-          return { cleared: true as const, closed: false as const };
+          const text = "对话已清空，当前文稿保持打开。";
+          const done = complete({ type: "done", reply: text, context: contextUsage() });
+          return { kind: "done" as const, done, replayed: false, delta: text };
         }
         if (closeRequested) {
           const hadDocument = Boolean(state.agent.bag.documentId);
@@ -2046,7 +2229,15 @@ async function main() {
           state.chat.remember("user", message);
           state.chat.remember("assistant", response);
           persistSession();
-          return { cleared: false as const, closed: true as const, hadDocument };
+          const done = complete({
+            type: "done",
+            reply: response,
+            closed: true,
+            clarificationRounds: 0,
+            sourcePaths: [],
+            context: contextUsage(),
+          });
+          return { kind: "done" as const, done, replayed: false, delta: response };
         }
         let switchedDocument = false;
         if (req.body.documentId && req.body.documentId !== state.agent.bag.documentId) {
@@ -2091,51 +2282,57 @@ async function main() {
             streamed = true;
             send({ type: "delta", text: chunk });
           },
+          onDeltaReset: (text) => {
+            streamed = Boolean(text);
+            send({ type: "replace", text });
+          },
         });
-        if (previousDocumentId && state.agent.bag.documentId !== previousDocumentId) {
+        if (
+          turn.conversationReset ||
+          (previousDocumentId && state.agent.bag.documentId !== previousDocumentId)
+        ) {
           state.reviewThreads = [];
           persistSession();
         }
-        return { cleared: false as const, closed: false as const, turn };
-      });
-      if (outcome.disconnected) return;
-      if (outcome.cleared) {
-        const text = "对话已清空，当前文稿保持打开。";
-        send({ type: "delta", text });
-        send({ type: "done", reply: text });
-        reply.raw.end();
-        return;
-      }
-      if (outcome.closed) {
-        const text = outcome.hadDocument ? "已关闭当前文稿。" : "当前没有打开的文稿。";
-        send({ type: "delta", text });
-        send({
+        const done = complete({
           type: "done",
-          reply: text,
-          closed: true,
-          clarificationRounds: 0,
-          sourcePaths: [],
+          reply: turn.reply,
+          conversationReset: turn.conversationReset,
+          opened: turn.opened,
+          engine: turn.engine,
+          steps: (turn.steps ?? []).filter(isUserFacingPhase),
+          proposalCount: turn.proposalCount,
+          clarificationRounds: turn.clarificationRounds,
+          sourcePaths: turn.sourcePaths,
+          cascadeOffer: turn.cascadeOffer,
+          notes: turn.notes,
+          loadedSkills: turn.loadedSkills,
+          task: turn.task,
+          context: contextUsage(),
         });
+        return {
+          kind: "done" as const,
+          done,
+          replayed: false,
+          delta: !streamed && turn.reply ? turn.reply : undefined,
+        };
+      };
+      const outcome = await enqueueChat(async () => {
+        try {
+          return await executeChatRequest();
+        } finally {
+          releaseInFlightRequest();
+        }
+      });
+      if (outcome.kind === "disconnected") return;
+      if (outcome.kind === "conflict") {
+        send({ type: "error", error: "requestId already used for a different request" });
         reply.raw.end();
         return;
       }
-      const { turn } = outcome;
       if (ac.signal.aborted) return;
-      if (!streamed && turn.reply) send({ type: "delta", text: turn.reply });
-      send({
-        type: "done",
-        reply: turn.reply,
-        opened: turn.opened,
-        engine: turn.engine,
-        steps: (turn.steps ?? []).filter(isUserFacingPhase),
-        proposalCount: turn.proposalCount,
-        clarificationRounds: turn.clarificationRounds,
-        sourcePaths: turn.sourcePaths,
-        cascadeOffer: turn.cascadeOffer,
-        notes: turn.notes,
-        loadedSkills: turn.loadedSkills,
-        task: turn.task,
-      });
+      if (!outcome.replayed && outcome.delta) send({ type: "delta", text: outcome.delta });
+      send(outcome.done);
       reply.raw.end();
     } catch (e) {
       if (!ac.signal.aborted && !reply.raw.destroyed && !reply.raw.writableEnded) {
@@ -2143,6 +2340,7 @@ async function main() {
         reply.raw.end();
       }
     } finally {
+      releaseInFlightRequest();
       stopWatchingDisconnect();
     }
   });
@@ -2198,6 +2396,7 @@ async function main() {
           );
           if (!result.ok) return reply.code(409).send(result);
           syncBagFromDocument(state.agent, result.document, result.blocks);
+          persistSession();
           return result;
         });
       } catch (error) {

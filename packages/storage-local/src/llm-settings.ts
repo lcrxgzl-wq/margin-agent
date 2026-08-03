@@ -19,12 +19,34 @@ function normalizeReasoningMode(value: unknown): ReasoningMode | undefined {
 
 export const AGENT_TIMEOUT_MIN_MS = 1_000;
 export const AGENT_TIMEOUT_MAX_MS = 1_800_000;
+export const RETRY_ATTEMPTS_MIN = 1;
+export const RETRY_ATTEMPTS_MAX = 10;
+export const RETRY_DELAY_MIN_MS = 0;
+export const RETRY_DELAY_MAX_MS = 300_000;
 
 function normalizeAgentTimeoutMs(value: unknown): number | undefined {
   return typeof value === "number" &&
     Number.isInteger(value) &&
     value >= AGENT_TIMEOUT_MIN_MS &&
     value <= AGENT_TIMEOUT_MAX_MS
+    ? value
+    : undefined;
+}
+
+function normalizeRetryAttempts(value: unknown): number | undefined {
+  return typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= RETRY_ATTEMPTS_MIN &&
+    value <= RETRY_ATTEMPTS_MAX
+    ? value
+    : undefined;
+}
+
+function normalizeRetryDelayMs(value: unknown): number | undefined {
+  return typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= RETRY_DELAY_MIN_MS &&
+    value <= RETRY_DELAY_MAX_MS
     ? value
     : undefined;
 }
@@ -75,6 +97,10 @@ export type LlmSettingsStore = {
   reasoningMode?: ReasoningMode;
   /** User-configured pi session timeout (ms); undefined falls back to env/profile. */
   agentTimeoutMs?: number;
+  /** Total attempts for transient model transport/provider errors. */
+  retryAttempts?: number;
+  /** Fixed delay between transient model retries (ms). */
+  retryDelayMs?: number;
   /** Custom inline selection cap (chars); undefined follows the context tier. */
   selectionContextChars?: number;
   /** Context budget tier; undefined falls back to the standard preset. */
@@ -110,6 +136,10 @@ export type LlmSettingsPublic = {
   reasoningMode: ReasoningMode;
   /** Present only when the user configured an explicit pi session timeout. */
   agentTimeoutMs?: number;
+  /** Present only when the user configured a transient-error attempt count. */
+  retryAttempts?: number;
+  /** Present only when the user configured a transient-error delay. */
+  retryDelayMs?: number;
   /** Present only when the user configured a custom inline selection cap. */
   selectionContextChars?: number;
   /** Present only when the user configured an explicit context tier. */
@@ -332,6 +362,8 @@ export function readLlmSettingsStore(root: string): LlmSettingsStore {
         : undefined;
     const reasoningMode = normalizeReasoningMode(raw.reasoningMode);
     const agentTimeoutMs = normalizeAgentTimeoutMs(raw.agentTimeoutMs);
+    const retryAttempts = normalizeRetryAttempts(raw.retryAttempts);
+    const retryDelayMs = normalizeRetryDelayMs(raw.retryDelayMs);
     const selectionContextChars = normalizeSelectionContextChars(raw.selectionContextChars);
     const contextTier = normalizeContextTier(raw.contextTier);
     const compactionAuto = normalizeCompactionAuto(raw.compactionAuto);
@@ -341,6 +373,8 @@ export function readLlmSettingsStore(root: string): LlmSettingsStore {
       harnessId,
       reasoningMode,
       agentTimeoutMs,
+      retryAttempts,
+      retryDelayMs,
       selectionContextChars,
       contextTier,
       compactionAuto,
@@ -466,6 +500,8 @@ export function publicLlmSettings(
     harnessId: store.harnessId,
     reasoningMode: store.reasoningMode ?? "auto",
     agentTimeoutMs: store.agentTimeoutMs,
+    retryAttempts: store.retryAttempts,
+    retryDelayMs: store.retryDelayMs,
     selectionContextChars: store.selectionContextChars,
     contextTier: store.contextTier,
     compactionAuto: store.compactionAuto,
@@ -485,6 +521,10 @@ export type SaveLlmSettingsInput = {
   reasoningMode?: ReasoningMode | null;
   /** Set the pi session timeout in ms (1000-1800000); null clears back to default. */
   agentTimeoutMs?: number | null;
+  /** Set total transient-error attempts (1-10); null clears back to 5. */
+  retryAttempts?: number | null;
+  /** Set retry delay in ms (0-300000); null clears back to 30000. */
+  retryDelayMs?: number | null;
   /** Set the inline selection cap in chars (1000-100000); null follows the context tier. */
   selectionContextChars?: number | null;
   /** Set the context tier (eco/standard/max); null clears back to the default. */
@@ -499,11 +539,21 @@ export async function writeLlmSettingsStore(
 ): Promise<LlmSettingsStore> {
   const abs = settingsPath(root);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
+  const retryAttempts = normalizeRetryAttempts(store.retryAttempts);
+  if (store.retryAttempts !== undefined && retryAttempts === undefined) {
+    throw new Error("retryAttempts 必须是 1–10 之间的整数");
+  }
+  const retryDelayMs = normalizeRetryDelayMs(store.retryDelayMs);
+  if (store.retryDelayMs !== undefined && retryDelayMs === undefined) {
+    throw new Error("retryDelayMs 必须是 0–300000 之间的整数毫秒");
+  }
   const normalized: LlmSettingsStore = {
     activeId: store.activeId,
     harnessId: store.harnessId,
     reasoningMode: store.reasoningMode,
     agentTimeoutMs: store.agentTimeoutMs,
+    retryAttempts,
+    retryDelayMs,
     selectionContextChars: store.selectionContextChars,
     contextTier: store.contextTier,
     compactionAuto: store.compactionAuto,
@@ -623,6 +673,30 @@ export async function saveLlmSettings(
         throw new Error("agentTimeoutMs 必须是 1000–1800000 之间的整数毫秒");
       }
       store = { ...store, agentTimeoutMs };
+    }
+  }
+
+  if (input.retryAttempts !== undefined) {
+    if (input.retryAttempts === null) {
+      store = { ...store, retryAttempts: undefined };
+    } else {
+      const retryAttempts = normalizeRetryAttempts(input.retryAttempts);
+      if (retryAttempts === undefined) {
+        throw new Error("retryAttempts 必须是 1–10 之间的整数");
+      }
+      store = { ...store, retryAttempts };
+    }
+  }
+
+  if (input.retryDelayMs !== undefined) {
+    if (input.retryDelayMs === null) {
+      store = { ...store, retryDelayMs: undefined };
+    } else {
+      const retryDelayMs = normalizeRetryDelayMs(input.retryDelayMs);
+      if (retryDelayMs === undefined) {
+        throw new Error("retryDelayMs 必须是 0–300000 之间的整数毫秒");
+      }
+      store = { ...store, retryDelayMs };
     }
   }
 

@@ -49,6 +49,9 @@ export type PersistedReviewThread = {
 export type PersistedAgentTask = {
   objective: string;
   status: "running" | "completed" | "interrupted";
+  /** Document snapshot this task can safely resume against. */
+  documentId?: string;
+  documentRevision?: number;
   currentStep?: string;
   sourcePaths: string[];
   sourceRefs: string[];
@@ -69,6 +72,7 @@ export type PersistedAgentSession = {
   messages: unknown[];
   updatedAt: string;
   clarificationRounds: number;
+  documentModeLeanLock?: boolean;
   chatTurns: PersistedChatTurn[];
   threads: PersistedReviewThread[];
   sourcePaths: string[];
@@ -80,6 +84,7 @@ type SessionEnvelope = {
   messages: unknown[];
   documentId?: string;
   clarificationRounds?: number;
+  documentModeLeanLock?: boolean;
   chatTurns?: PersistedChatTurn[];
   threads?: PersistedReviewThread[];
   sourcePaths?: string[];
@@ -319,9 +324,20 @@ function normalizeTask(
         .slice(0, MAX_TASK_SOURCE_REFS)
     : [];
   const proposalCount = Number(task.proposalCount);
+  const documentId = typeof task.documentId === "string" && task.documentId.trim()
+    ? task.documentId.trim()
+    : undefined;
+  const documentRevision = typeof task.documentRevision === "number"
+    ? task.documentRevision
+    : Number.NaN;
+  const hasDocumentBinding = Boolean(
+    documentId && Number.isInteger(documentRevision) && documentRevision >= 0,
+  );
   return {
     objective,
     status,
+    documentId: hasDocumentBinding ? documentId : undefined,
+    documentRevision: hasDocumentBinding ? documentRevision : undefined,
     currentStep:
       typeof task.currentStep === "string" && task.currentStep.trim()
         ? task.currentStep.trim().slice(0, 200)
@@ -362,6 +378,7 @@ function parseSessionPayload(raw: string): {
   messages: unknown[];
   documentId?: string;
   clarificationRounds: number;
+  documentModeLeanLock: boolean;
   chatTurns: PersistedChatTurn[];
   threads: PersistedReviewThread[];
   sourcePaths: string[];
@@ -374,6 +391,7 @@ function parseSessionPayload(raw: string): {
       return {
         messages: trimMessagesAtTurnBoundary(parsed),
         clarificationRounds: 0,
+        documentModeLeanLock: false,
         chatTurns: [],
         threads: [],
         sourcePaths: [],
@@ -394,6 +412,7 @@ function parseSessionPayload(raw: string): {
             ? env.documentId.trim()
             : undefined,
         clarificationRounds: Number.isFinite(rounds) && rounds > 0 ? Math.min(3, Math.floor(rounds)) : 0,
+        documentModeLeanLock: Boolean(env.documentModeLeanLock),
         chatTurns,
         threads,
         sourcePaths,
@@ -404,7 +423,7 @@ function parseSessionPayload(raw: string): {
   } catch {
     /* ignore */
   }
-  return { messages: [], clarificationRounds: 0, chatTurns: [], threads: [], sourcePaths: [], evidenceCache: [], task: undefined };
+  return { messages: [], clarificationRounds: 0, documentModeLeanLock: false, chatTurns: [], threads: [], sourcePaths: [], evidenceCache: [], task: undefined };
 }
 
 /** Ensure agent_sessions table exists (idempotent for older DBs). */
@@ -461,6 +480,7 @@ export function saveAgentSession(
     documentId?: string;
     messages: unknown[];
     clarificationRounds?: number;
+    documentModeLeanLock?: boolean;
     chatTurns?: PersistedChatTurn[];
     threads?: PersistedReviewThread[];
     sourcePaths?: string[];
@@ -483,6 +503,7 @@ export function saveAgentSession(
     typeof session.clarificationRounds === "number" && session.clarificationRounds > 0
       ? Math.min(3, Math.floor(session.clarificationRounds))
       : 0;
+  const documentModeLeanLock = Boolean(session.documentModeLeanLock);
   const sourcePaths = normalizeSourcePaths(session.sourcePaths);
   let evidenceCache = normalizeEvidenceCache(session.evidenceCache, sourcePaths);
   const task = normalizeTask(session.task);
@@ -492,6 +513,7 @@ export function saveAgentSession(
       messages: trimmed,
       documentId: session.documentId,
       clarificationRounds,
+      documentModeLeanLock,
       chatTurns,
       threads,
       sourcePaths,
@@ -525,6 +547,7 @@ export function saveAgentSession(
     documentId: session.documentId,
     messages: (JSON.parse(messagesJson) as SessionEnvelope).messages,
     clarificationRounds,
+    documentModeLeanLock,
     chatTurns,
     threads,
     sourcePaths,
@@ -561,6 +584,7 @@ export function loadAgentSession(ws: Workspace): PersistedAgentSession | null {
     documentId: parsed.documentId,
     messages: parsed.messages,
     clarificationRounds: parsed.clarificationRounds,
+    documentModeLeanLock: parsed.documentModeLeanLock,
     chatTurns: parsed.chatTurns,
     threads: parsed.threads,
     sourcePaths: parsed.sourcePaths,
@@ -632,6 +656,7 @@ export function loadAgentSessionEnvelope(
     documentId: parsed.documentId,
     messages: parsed.messages,
     clarificationRounds: parsed.clarificationRounds,
+    documentModeLeanLock: parsed.documentModeLeanLock,
     chatTurns: parsed.chatTurns,
     threads: parsed.threads,
     sourcePaths: parsed.sourcePaths,

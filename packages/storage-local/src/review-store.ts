@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { ProposalSchema, type ApplyEvent, type Decision, type DecisionKind, type Proposal, assertDecisionInput, canApply, contentHash, tableCellTextToApply, textToApply } from "@margin/domain";
+import { ProposalSchema, type ApplyEvent, type Decision, type DecisionKind, type Proposal, type ReviewChecklistRunDraft, assertDecisionInput, canApply, contentHash, tableCellTextToApply, textToApply } from "@margin/domain";
 import type { Workspace } from "./workspace-fs.js";
 import {
   MAX_DOCUMENT_BYTES,
@@ -7,14 +7,25 @@ import {
   enqueueDocumentMutation,
   getDocument,
   listBlocks,
+  readRegisteredDocumentContentHash,
   recoverNativeSaveJournals,
-  resolveWorkspacePath,
+  resolveRegisteredDocumentPath,
 } from "./workspace-fs.js";
 import fs from "node:fs";
 import path from "node:path";
 import writeFileAtomic from "write-file-atomic";
 import { applyDocxParagraphEdits, applyDocxTableCellEdit, docxContentHash } from "./office-docx.js";
-import { supersedeActiveReviewChecklists } from "./checklist-store.js";
+import {
+  saveReviewChecklistRunWithinTransaction,
+  supersedeActiveReviewChecklists,
+} from "./checklist-store.js";
+
+export class ScanArtifactsConflictError extends Error {
+  constructor(message = "scan document snapshot no longer matches") {
+    super(message);
+    this.name = "ScanArtifactsConflictError";
+  }
+}
 
 export function saveProposal(ws: Workspace, proposal: Proposal): void {
   const validated = ProposalSchema.parse(proposal);
@@ -119,6 +130,96 @@ export function replaceDocumentComments(
   const now = new Date().toISOString();
   for (const c of comments) {
     insert.run(c.id, documentId, c.blockId, c.text, c.severity, c.runId, c.source, now);
+  }
+}
+
+export function saveScanArtifactsAtomically(
+  ws: Workspace,
+  documentId: string,
+  artifacts: {
+    expectedRevision: number;
+    expectedContentHash: string;
+    proposals: Proposal[];
+    comments: Omit<StoredAgentComment, "documentId" | "createdAt">[];
+    reviewChecklists: ReviewChecklistRunDraft[];
+    replaceComments?: boolean;
+    supersedeOpenProposals?: boolean;
+  },
+): void {
+  ws.db.prepare("BEGIN IMMEDIATE").run();
+  try {
+    const document = ws.db.prepare(
+      "SELECT revision, content_hash, relative_path FROM documents WHERE id = ?",
+    ).get(documentId) as {
+      revision: number;
+      content_hash: string;
+      relative_path: string;
+    } | undefined;
+    if (
+      !document ||
+      document.revision !== artifacts.expectedRevision ||
+      document.content_hash !== artifacts.expectedContentHash
+    ) {
+      throw new ScanArtifactsConflictError();
+    }
+    const assertDiskSnapshot = () => {
+      try {
+        if (
+          readRegisteredDocumentContentHash(ws, document.relative_path) !==
+          artifacts.expectedContentHash
+        ) {
+          throw new ScanArtifactsConflictError("scan document file no longer matches");
+        }
+      } catch (error) {
+        if (error instanceof ScanArtifactsConflictError) throw error;
+        throw new ScanArtifactsConflictError("scan document file is no longer readable");
+      }
+    };
+    assertDiskSnapshot();
+    const readBlock = ws.db.prepare(
+      "SELECT content_hash FROM blocks WHERE document_id = ? AND id = ?",
+    );
+    for (const proposal of artifacts.proposals) {
+      const block = readBlock.get(documentId, proposal.blockId) as
+        | { content_hash: string }
+        | undefined;
+      if (
+        proposal.documentId !== documentId ||
+        proposal.baseRevision !== document.revision ||
+        !block ||
+        block.content_hash !== proposal.baseHash
+      ) {
+        throw new ScanArtifactsConflictError("scan proposal base no longer matches");
+      }
+    }
+    for (const comment of artifacts.comments) {
+      if (!readBlock.get(documentId, comment.blockId)) {
+        throw new Error("scan comment block mismatch");
+      }
+    }
+    for (const checklist of artifacts.reviewChecklists) {
+      if (checklist.run.documentId !== documentId) {
+        throw new Error("scan checklist document mismatch");
+      }
+      if (checklist.items.some((item) =>
+        item.documentId !== documentId || !readBlock.get(documentId, item.blockId)
+      )) {
+        throw new Error("scan checklist item block mismatch");
+      }
+    }
+    if (artifacts.supersedeOpenProposals) supersedeOpenProposals(ws, documentId);
+    for (const proposal of artifacts.proposals) saveProposal(ws, proposal);
+    if (artifacts.replaceComments !== false) {
+      replaceDocumentComments(ws, documentId, artifacts.comments);
+    }
+    for (const checklist of artifacts.reviewChecklists) {
+      saveReviewChecklistRunWithinTransaction(ws, checklist);
+    }
+    assertDiskSnapshot();
+    ws.db.prepare("COMMIT").run();
+  } catch (error) {
+    try { ws.db.prepare("ROLLBACK").run(); } catch { /* ignore */ }
+    throw error;
   }
 }
 
@@ -565,6 +666,7 @@ function finalizeApplyJournal(ws: Workspace, journal: ApplyJournal): void {
     }
     const supersede = ws.db.prepare(`UPDATE proposals SET status='superseded' WHERE id=?`);
     for (const proposalId of journal.proposalIds) supersede.run(proposalId);
+    ws.db.prepare("DELETE FROM agent_comments WHERE document_id = ?").run(journal.documentId);
     supersedeActiveReviewChecklists(ws, journal.documentId);
     const insertEvent = ws.db.prepare(
       `INSERT INTO apply_events (
@@ -611,7 +713,7 @@ export async function recoverApplyJournals(ws: Workspace): Promise<void> {
     ) {
       throw new Error("invalid apply journal");
     }
-    const absolutePath = resolveWorkspacePath(ws.root, journal.relativePath);
+    const absolutePath = resolveRegisteredDocumentPath(ws, journal.relativePath);
     if (!fs.existsSync(absolutePath)) {
       deleteApplyJournal(ws, journal.documentId);
       continue;
@@ -693,7 +795,7 @@ async function applyApprovedOnce(
   }
   const decisions = latestDecisionsByProposal(ws, proposals.map((proposal) => proposal.id));
 
-  const abs = resolveWorkspacePath(ws.root, doc.relativePath);
+  const abs = resolveRegisteredDocumentPath(ws, doc.relativePath);
   const isDocx = /\.docx$/i.test(doc.relativePath);
   if (fs.statSync(abs).size > MAX_DOCUMENT_BYTES) {
     throw new Error("document is too large (max 50 MiB)");

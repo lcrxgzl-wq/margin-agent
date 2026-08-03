@@ -22,7 +22,7 @@ vi.mock("@margin/llm", async (importOriginal) => {
 vi.mock("./resolve-model.js", () => ({
   effectiveThinkingLevel: () => undefined,
   hasRuntimeCredentials: () => true,
-  resolveRuntimeModel: () => ({ model: {}, apiKey: "test-key" }),
+  resolveRuntimeModel: () => ({ model: { contextWindow: 128_000 }, apiKey: "test-key" }),
 }));
 
 const {
@@ -37,6 +37,11 @@ const bridge: WorkspaceBridge = {
   readText: () => {
     throw new Error("unused");
   },
+  readVersion: (relativePath) => ({
+    relativePath,
+    bytes: 0,
+    versionHash: "a".repeat(64),
+  }),
   writeText: async () => {
     throw new Error("unused");
   },
@@ -108,6 +113,27 @@ describe("session assistant text boundaries", () => {
     expect(JSON.stringify(turn.messages)).toContain(rawText);
   });
 
+  it("does not reuse an earlier assistant reply when the current turn has no text", async () => {
+    mocks.runPiAgentLoop.mockResolvedValue({
+      ...loopResult(),
+      messages: [
+        { role: "user", content: "上一问" },
+        { role: "assistant", content: [{ type: "text", text: "上一轮回答" }] },
+        { role: "user", content: "当前问题" },
+        { role: "assistant", content: [{ type: "toolCall", id: "finish-1" }] },
+      ] as never,
+    });
+
+    const turn = await runPiSessionTurn({
+      message: "当前问题",
+      bridge,
+      bag: { revision: 0, blocks: [] },
+    });
+
+    expect(turn.reply).toBe("本轮已结束。若要继续，直接说下一步。");
+    expect(turn.reply).not.toContain("上一轮回答");
+  });
+
   it("filters thinking blocks split across streamDiscuss chunks", async () => {
     const chunks = [
       "Visible <thi",
@@ -129,6 +155,141 @@ describe("session assistant text boundaries", () => {
 
     expect(deltas.join("")).toBe("Visible  answer");
     expect(turn.reply).toBe("Visible  answer");
+  });
+});
+
+describe("recoverable Pi loop stops", () => {
+  it.each([
+    "stopped after 40 turns",
+    "stopped after repeated non-progress read: read_document_blocks",
+  ])("marks %s as requiring continuation", async (note) => {
+    mocks.runPiAgentLoop.mockResolvedValue({
+      ...loopResult(),
+      outcome: "aborted",
+      notes: [note],
+      streamedText: "已完成部分通读。",
+    });
+
+    const turn = await runPiSessionTurn({
+      message: "通读全文并分析结构",
+      bridge,
+      bag: { revision: 0, blocks: [] },
+    });
+
+    expect(turn.continuationRequired).toBe(true);
+    expect(turn.reply).toContain("继续");
+  });
+
+  it("does not promise cursor continuation after switching documents", async () => {
+    const switchingBridge: WorkspaceBridge = {
+      ...bridge,
+      listSourceFiles: () => ["b.md"],
+      openDocument: async () => ({
+        document: {
+          id: "doc-b",
+          relativePath: "b.md",
+          revision: 2,
+          contentHash: "document-b-hash",
+          updatedAt: "2026-08-03T00:00:00.000Z",
+        },
+        blocks: [{
+          id: "b1",
+          kind: "paragraph",
+          text: "Document B",
+          order: 0,
+          contentHash: "block-b-hash",
+        }],
+      }),
+    };
+    mocks.runPiAgentLoop.mockImplementationOnce(async (input: {
+      tools: Array<{
+        name: string;
+        execute: (id: string, params: unknown) => Promise<unknown>;
+      }>;
+    }) => {
+      const openDocument = input.tools.find((tool) => tool.name === "open_document");
+      await openDocument!.execute("open-b", { relativePath: "b.md" });
+      return {
+        ...loopResult(),
+        outcome: "aborted",
+        notes: ["stopped after 40 turns"],
+        streamedText: "已完成部分读取。",
+      };
+    });
+
+    const turn = await runPiSessionTurn({
+      message: "打开 b.md 并分析",
+      bridge: switchingBridge,
+      bag: {
+        documentId: "doc-a",
+        relativePath: "a.md",
+        revision: 1,
+        blocks: [{
+          id: "a1",
+          kind: "paragraph",
+          text: "Document A",
+          order: 0,
+          contentHash: "block-a-hash",
+        }],
+      },
+    });
+
+    expect(turn.documentSwitchOccurred).toBe(true);
+    expect(turn.continuationRequired).toBeUndefined();
+    expect(turn.reply).toContain("请针对当前文稿重新提出任务");
+    expect(turn.reply).not.toContain("block/cursor");
+  });
+});
+
+describe("offline rewrite cancellation", () => {
+  const envKeys = ["MARGIN_API_FORMAT", "MARGIN_BASE_URL", "MARGIN_API_KEY"] as const;
+  let savedEnv: Record<(typeof envKeys)[number], string | undefined>;
+
+  beforeEach(() => {
+    savedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]])) as typeof savedEnv;
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_BASE_URL = "https://provider.test/v1";
+    process.env.MARGIN_API_KEY = "test-key";
+  });
+
+  afterEach(() => {
+    for (const key of envKeys) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+  });
+
+  it("aborts a simple-mode rewrite completion with the caller signal", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_input, init?: RequestInit) =>
+      await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("Aborted", "AbortError")),
+          { once: true },
+        );
+      }),
+    ));
+    const controller = new AbortController();
+    const pending = runOfflineSessionTurn({
+      message: "重写这段",
+      bridge,
+      bag: {
+        documentId: "doc-1",
+        revision: 0,
+        blocks: [{
+          id: "b1",
+          kind: "paragraph",
+          text: "Original paragraph.",
+          order: 0,
+          contentHash: "hash-1",
+        }],
+      },
+      signal: controller.signal,
+    });
+
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   });
 });
 
@@ -349,6 +510,20 @@ describe("runPiSessionTurn timeout resolution", () => {
     });
     expect(mocks.runPiAgentLoop.mock.calls[0]![0].timeoutMs).toBe(300_000);
   });
+
+  it("forwards explicit transient retry settings", async () => {
+    await runPiSessionTurn({
+      message: "继续修订",
+      bridge,
+      bag: { revision: 0, blocks: [] },
+      retryAttempts: 7,
+      retryDelayMs: 45_000,
+    });
+    expect(mocks.runPiAgentLoop.mock.calls[0]![0]).toMatchObject({
+      retryAttempts: 7,
+      retryDelayMs: 45_000,
+    });
+  });
 });
 
 describe("runPiSessionTurn context tiers", () => {
@@ -463,18 +638,136 @@ describe("runPiSessionTurn context tiers", () => {
     expect(lastPrompt()).toContain("宿主会重新校验原文件 SHA-256");
   });
 
-  it("injects a readthrough strategy hint for open-document 通读", async () => {
+  it("evicts stale evidence before building the prompt directory", async () => {
+    const sourceRef = "notes.txt#sha256=0123456789abcdef&chars=0-8";
+    let persisted = [{
+      sourceRef,
+      relativePath: "notes.txt",
+      start: 0,
+      end: 8,
+      extractedHash: "0123456789abcdef",
+      versionHash: "a".repeat(64),
+      preview: "stale preview",
+      readAt: "2026-08-01T00:00:00.000Z",
+    }];
+    await runPiSessionTurn({
+      message: "继续依据资料修订",
+      bridge: {
+        ...bridge,
+        readVersion: (relativePath) => ({
+          relativePath,
+          bytes: 9,
+          versionHash: "b".repeat(64),
+        }),
+      },
+      bag: { revision: 0, blocks: [] },
+      sourcePaths: ["notes.txt"],
+      evidenceCache: persisted,
+      onEvidenceCacheChange: (entries) => { persisted = entries; },
+    });
+
+    expect(lastPrompt()).not.toContain("[会话已读证据目录]");
+    expect(lastPrompt()).not.toContain(sourceRef);
+    expect(lastPrompt()).not.toContain("stale preview");
+    expect(persisted).toEqual([]);
+  });
+
+  it("publishes cache normalization even when retained evidence is fresh", async () => {
+    const retained = {
+      sourceRef: "notes.txt#sha256=0123456789abcdef&chars=0-8",
+      relativePath: "notes.txt",
+      start: 0,
+      end: 8,
+      extractedHash: "0123456789abcdef",
+      versionHash: "a".repeat(64),
+      preview: "retained preview",
+      readAt: "2026-08-01T00:00:00.000Z",
+    };
+    const detached = {
+      ...retained,
+      sourceRef: "detached.txt#sha256=0123456789abcdef&chars=0-8",
+      relativePath: "detached.txt",
+      preview: "must be removed",
+    };
+    let persisted = [retained, detached];
+
+    await runPiSessionTurn({
+      message: "继续依据资料修订",
+      bridge,
+      bag: { revision: 0, blocks: [] },
+      sourcePaths: ["notes.txt"],
+      evidenceCache: persisted,
+      onEvidenceCacheChange: (entries) => { persisted = entries; },
+    });
+
+    expect(persisted).toEqual([retained]);
+    expect(lastPrompt()).toContain(retained.sourceRef);
+    expect(lastPrompt()).not.toContain(detached.sourceRef);
+  });
+
+  it("injects the full open document instead of a 通读 ceremony", async () => {
     await runPiSessionTurn({
       message: "请通读全文并做结构分析",
       bridge,
       bag: {
-        revision: 0,
-        blocks: [{ id: "b1", kind: "paragraph", text: "hello", order: 0, contentHash: "h" }],
+        revision: 3,
+        relativePath: "paper.md",
+        blocks: [{ id: "b1", kind: "paragraph", text: "hello body", order: 0, contentHash: "h" }],
       },
     });
-    expect(lastPrompt()).toContain("[通读策略]");
-    expect(lastPrompt()).toContain("get_document_outline");
-    expect(lastPrompt()).toContain("不要用 read_workspace_file 按 offset 扫已打开文稿");
+    expect(lastPrompt()).not.toContain("[通读策略]");
+    expect(lastPrompt()).toContain("[Margin 文稿全文 revision=3 path=paper.md blocks=1]");
+    expect(lastPrompt()).toContain("### b1 (paragraph)");
+    expect(lastPrompt()).toContain("hello body");
+    expect(lastPrompt()).not.toContain("大纲（仅标题）");
+  });
+
+  it("keeps selection focus without neighbor context in full mode", async () => {
+    const blocks = [
+      paragraph("b1", 0, "前文段落内容"),
+      paragraph("b2", 1, "选中段落内容"),
+      paragraph("b3", 2, "后文段落内容"),
+    ];
+    const turn = await runPiSessionTurn({
+      message: "润色这段",
+      bridge,
+      bag: { revision: 1, relativePath: "paper.md", blocks },
+      selectionBlockIds: ["b2"],
+      selectionHint: "选中段落内容",
+    });
+    expect(turn.documentMode).toBe("full");
+    expect(lastPrompt()).toContain("[Margin 文稿全文 revision=1");
+    expect(lastPrompt()).toContain('用户当前选区（blockIds: b2）');
+    expect(lastPrompt()).toContain("选中段落内容");
+    expect(lastPrompt()).not.toContain("[选区上下文]");
+  });
+
+  it("strips prior full-document copies from the transcript before the next turn", async () => {
+    const injection = [
+      "[Margin 文稿全文 revision=1 path=old.md blocks=1]",
+      "### old (paragraph)",
+      "stale body that must leave",
+      "[/Margin 文稿全文]",
+    ].join("\n");
+    await runPiSessionTurn({
+      message: "继续",
+      bridge,
+      bag: {
+        revision: 2,
+        relativePath: "paper.md",
+        blocks: [{ id: "b1", kind: "paragraph", text: "fresh body", order: 0, contentHash: "h" }],
+      },
+      messages: [{ role: "user", content: `上一问\n${injection}` } as never],
+    });
+    expect(lastOpts().messages as Array<{ content?: string }>).toEqual([
+      expect.objectContaining({
+        content: expect.stringContaining("[Margin 文稿全文已移除；以本轮注入为准]"),
+      }),
+    ]);
+    expect(String((lastOpts().messages as Array<{ content?: string }>)[0]?.content ?? ""))
+      .not.toContain("stale body that must leave");
+    expect(lastPrompt()).toContain("fresh body");
+    expect(lastPrompt()).toContain("revision=2");
   });
 
   it("uses the complete standard loop preset when contextTier is unset", async () => {
@@ -523,9 +816,15 @@ describe("runPiSessionTurn context tiers", () => {
   it("caps outline headings at 48 by default, 24 on eco, unlimited on max", async () => {
     const blocks = Array.from({ length: 60 }, (_, i) => heading(`h${i + 1}`, i, `标题 ${i + 1}`));
 
-    await runPiSessionTurn({ message: "继续修订", bridge, bag: { revision: 0, blocks } });
+    await runPiSessionTurn({
+      message: "继续修订",
+      bridge,
+      bag: { revision: 0, blocks },
+      documentModeLeanLock: true,
+    });
     expect(lastPrompt()).toContain("标题 48");
     expect(lastPrompt()).not.toContain("标题 49");
+    expect(lastPrompt()).not.toContain("[Margin 文稿全文");
 
     await runPiSessionTurn({
       message: "继续修订",
@@ -541,6 +840,7 @@ describe("runPiSessionTurn context tiers", () => {
       bridge,
       bag: { revision: 0, blocks },
       contextTier: "max",
+      documentModeLeanLock: true,
     });
     expect(lastPrompt()).toContain("标题 60");
   });
@@ -556,6 +856,7 @@ describe("runPiSessionTurn context tiers", () => {
       bridge,
       bag: { revision: 0, blocks },
       selectionBlockIds: ["b2"],
+      documentModeLeanLock: true,
     });
     expect(lastPrompt()).toContain("[选区上下文]");
     expect(lastPrompt()).toContain("前文段落内容");
@@ -576,6 +877,7 @@ describe("runPiSessionTurn context tiers", () => {
       bag: { revision: 0, blocks },
       selectionBlockIds: ["b3"],
       contextTier: "max",
+      documentModeLeanLock: true,
     });
     expect(lastPrompt()).toContain("far-before");
     expect(lastPrompt()).toContain("p".repeat(2_000));

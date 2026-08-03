@@ -103,4 +103,12 @@ describe("runPiBlockScan request policy", () => {
     await runPiBlockScan({ ...ctx, timeoutMs: 90_000 });
     expect(mockPiLoop.calls[0]!.timeoutMs).toBe(90_000);
   });
+
+  it("forwards explicit transient retry settings", async () => {
+    await runPiBlockScan({ ...ctx, retryAttempts: 6, retryDelayMs: 12_000 });
+    expect(mockPiLoop.calls[0]).toMatchObject({
+      retryAttempts: 6,
+      retryDelayMs: 12_000,
+    });
+  });
 });

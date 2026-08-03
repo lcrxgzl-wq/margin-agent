@@ -20,11 +20,12 @@ import {
   type RemoteMcpApprovalFn,
   type RemoteMcpBridge,
 } from "@margin/agent";
-import type { BlockSnapshot, DocumentMeta, EvidenceCacheEntry } from "@margin/domain";
+import type { BlockSnapshot, DocumentMeta, EvidenceCacheEntry, Proposal } from "@margin/domain";
 import {
   archiveAgentSession,
   activeProfile,
   assertNotRegisteredDocumentWrite,
+  enqueueDocumentMutation,
   getDocument,
   importExternalDocxDocument,
   latestAgentCompactionSummary,
@@ -34,17 +35,16 @@ import {
   loadAgentSession,
   loadAgentSessionEnvelope,
   openDocumentFile,
+  readRegisteredDocumentContentHash,
   readWorkspaceSource,
   readWorkspaceSourceVersion,
   readLlmSettingsStore,
   readSkillSettings,
   disabledSkillNames,
   readNativeDocxTableCell,
-  replaceDocumentComments,
   saveAgentCompaction,
   saveAgentSession,
-  saveProposal,
-  saveReviewChecklistRun,
+  saveScanArtifactsAtomically,
   saveAgentTranscript,
   writeWorkspaceText,
   type PersistedAgentSession,
@@ -60,6 +60,7 @@ import {
   parseExplicitLocalDocxPath,
 } from "./local-document-intent.js";
 import { buildDomainSnapshot, buildProposalHint, buildSessionSummaryNote } from "./conversation-notes.js";
+import { workspacePathComparisonKey } from "./workspace-path.js";
 
 const MAX_SOURCE_PATHS = 50;
 
@@ -74,6 +75,12 @@ export type ChatAgentState = {
   /** Main document that owns sourcePaths; used to clear attachments on document switch. */
   sourceDocumentId?: string;
   task?: PersistedAgentTask;
+  /** Stale persisted task kept only long enough to restart it on the current revision. */
+  restartTask?: PersistedAgentTask;
+  /** A reset already happened server-side but has not reached a successful UI response yet. */
+  conversationResetPending: boolean;
+  /** Stay on lean document injection after an overflow demotion this session. */
+  documentModeLeanLock: boolean;
 };
 
 export function createChatAgentState(seed?: {
@@ -84,6 +91,7 @@ export function createChatAgentState(seed?: {
   evidenceCache?: EvidenceCacheEntry[];
   sourceDocumentId?: string;
   task?: PersistedAgentTask;
+  documentModeLeanLock?: boolean;
 }): ChatAgentState {
   return {
     sessionId: seed?.sessionId ?? randomUUID(),
@@ -94,6 +102,8 @@ export function createChatAgentState(seed?: {
     evidenceCache: seed?.evidenceCache ?? [],
     sourceDocumentId: seed?.sourceDocumentId,
     task: seed?.task,
+    conversationResetPending: false,
+    documentModeLeanLock: Boolean(seed?.documentModeLeanLock),
   };
 }
 
@@ -113,6 +123,7 @@ export function chatAgentStateFromSession(
     evidenceCache: normalizeAttachedEvidenceCache(saved.evidenceCache ?? [], saved.sourcePaths ?? []),
     sourceDocumentId: saved.documentId,
     task: saved.task,
+    documentModeLeanLock: Boolean(saved.documentModeLeanLock),
   });
   if (saved.documentId) {
     try {
@@ -129,12 +140,26 @@ export function chatAgentStateFromSession(
       state.sourceDocumentId = undefined;
     }
   }
+  if (
+    state.task?.status === "interrupted" &&
+    !isTaskResumableForDocument(state.task, state.bag)
+  ) {
+    state.restartTask = state.task;
+    state.task = undefined;
+    state.agentMessages = [];
+    state.clarificationRounds = 0;
+  }
   return state;
 }
 
 /** Restore Pi AgentMessage[] from the last persisted session, if any. */
 export function restoreChatAgentState(workspace: Workspace): ChatAgentState {
   return chatAgentStateFromSession(workspace, loadAgentSession(workspace));
+}
+
+/** Keep a hidden stale task durable without exposing its selection to the UI. */
+export function taskForPersistence(state: ChatAgentState): PersistedAgentTask | undefined {
+  return state.task ?? state.restartTask;
 }
 
 
@@ -156,7 +181,7 @@ export function syncBagFromDocument(
   document: DocumentMeta,
   blocks: BlockSnapshot[],
 ): boolean {
-  const currentDocumentId = state.bag.documentId ?? state.sourceDocumentId;
+  const currentDocumentId = state.sourceDocumentId ?? state.bag.documentId;
   const switched = Boolean(currentDocumentId && currentDocumentId !== document.id);
   if (switched) {
     clearChatAgentConversation(state);
@@ -169,6 +194,15 @@ export function syncBagFromDocument(
     relativePath: document.relativePath,
     blocks,
   };
+  if (
+    state.task?.status === "interrupted" &&
+    !isTaskResumableForDocument(state.task, state.bag)
+  ) {
+    state.restartTask = state.task;
+    state.task = undefined;
+    state.agentMessages = [];
+    state.clarificationRounds = 0;
+  }
   return switched;
 }
 
@@ -190,7 +224,7 @@ export function replaceAttachedSources(
   }
   const available = new Map(
     listWorkspaceSourceFiles(workspace).map((relativePath) => [
-      relativePath.toLocaleLowerCase(),
+      workspacePathComparisonKey(relativePath),
       relativePath,
     ]),
   );
@@ -200,7 +234,7 @@ export function replaceAttachedSources(
       .replace(/\\/g, "/")
       .replace(/^\.\//, "");
     if (!normalized) continue;
-    const relativePath = available.get(normalized.toLocaleLowerCase());
+    const relativePath = available.get(workspacePathComparisonKey(normalized));
     if (!relativePath) {
       throw new Error(`source file not found or unsupported: ${normalized}`);
     }
@@ -216,7 +250,10 @@ export function replaceAttachedSources(
   state.sourceDocumentId = state.bag.documentId;
 }
 
-export function createWorkspaceBridge(workspace: Workspace): WorkspaceBridge {
+export function createWorkspaceBridge(
+  workspace: Workspace,
+  activeDocument?: SessionDocBag,
+): WorkspaceBridge {
   return {
     skillsRoot: path.join(workspace.root, ".margin", "skills"),
     listSourceFiles: () => listWorkspaceSourceFiles(workspace),
@@ -233,9 +270,33 @@ export function createWorkspaceBridge(workspace: Workspace): WorkspaceBridge {
       return writeWorkspaceText(workspace, relativePath, content);
     },
     openDocument: async (relativePath) => {
-      const document = await openDocumentFile(workspace, relativePath.replace(/\\/g, "/"));
+      const normalizedPath = relativePath.replace(/\\/g, "/").replace(/^\.\//, "");
+      const activePath = activeDocument?.relativePath
+        ?.replace(/\\/g, "/")
+        .replace(/^\.\//, "");
+      const sameActivePath = Boolean(
+        activeDocument?.documentId &&
+        activePath !== undefined &&
+        workspacePathComparisonKey(activePath) === workspacePathComparisonKey(normalizedPath),
+      );
+      const indexedDocument = sameActivePath
+        ? getDocument(workspace, activeDocument!.documentId!)
+        : undefined;
+      const unchangedActiveDocument = Boolean(
+        indexedDocument &&
+        indexedDocument.revision === activeDocument?.revision &&
+        readRegisteredDocumentContentHash(workspace, indexedDocument.relativePath) ===
+          indexedDocument.contentHash,
+      );
+      const document = unchangedActiveDocument
+        ? indexedDocument!
+        : await openDocumentFile(workspace, normalizedPath);
       const blocks = listBlocks(workspace, document.id);
-      return { document, blocks };
+      return {
+        document,
+        blocks,
+        alreadyOpen: unchangedActiveDocument,
+      };
     },
     listProtectedDocumentPaths: () => listRegisteredDocumentPaths(workspace),
     readTableCell: (documentId, blockId, row, column) =>
@@ -245,6 +306,8 @@ export function createWorkspaceBridge(workspace: Workspace): WorkspaceBridge {
 
 export type ChatAgentTurnResult = {
   reply: string;
+  /** Host reset document-scoped conversation context during this turn. */
+  conversationReset?: boolean;
   opened?: { document: DocumentMeta; blocks: BlockSnapshot[] };
   engine?: string;
   steps?: string[];
@@ -257,6 +320,33 @@ export type ChatAgentTurnResult = {
   loadedSkills?: Array<{ name: string; contentHash: string }>;
   task?: PersistedAgentTask;
 };
+
+function taskDocumentBinding(bag: SessionDocBag): {
+  documentId?: string;
+  documentRevision?: number;
+} {
+  return bag.documentId
+    ? { documentId: bag.documentId, documentRevision: bag.revision }
+    : {};
+}
+
+function isTaskResumableForDocument(
+  task: PersistedAgentTask,
+  bag: SessionDocBag,
+): boolean {
+  if (!bag.documentId) {
+    return task.documentId === undefined &&
+      task.documentRevision === undefined &&
+      task.selection === undefined;
+  }
+  return task.documentId === bag.documentId && task.documentRevision === bag.revision;
+}
+
+function isTaskResumeRequest(message: string): boolean {
+  return /^(?:请)?(?:继续(?:分析|处理|通读|审阅|检查|修改|修订|润色|写|做)?|接着(?:做|分析|处理|通读|审阅|检查|修改|修订|润色|写)?|恢复(?:任务|上次任务)?|continue(?:\s+(?:analysis|working|the\s+task))?)(?:一下|下去)?(?:吧|呢)?(?:[。！？!.?])?$/i.test(
+    message.trim(),
+  );
+}
 
 export function buildTranscriptPayload(input: {
   steps?: string[];
@@ -299,6 +389,9 @@ export function clearChatAgentConversation(state: ChatAgentState): void {
   state.clarificationRounds = 0;
   state.evidenceCache = [];
   state.task = undefined;
+  state.restartTask = undefined;
+  state.conversationResetPending = false;
+  state.documentModeLeanLock = false;
 }
 
 /** Append a rule-based "[Margin 记录]" user-role note to the pi transcript (model-visible memory). */
@@ -323,7 +416,7 @@ export function rotateChatSessionWithSummary(
 ): void {
   const previousSessionId = state.sessionId;
   const hasContent =
-    state.agentMessages.length > 0 || hasChatTurns || Boolean(state.task);
+    state.agentMessages.length > 0 || hasChatTurns || Boolean(taskForPersistence(state));
   const archived = hasContent
     ? archiveAgentSession(workspace, previousSessionId)
     : false;
@@ -475,10 +568,11 @@ export async function compactChatAgentConversation(opts: {
     documentId: agentState.bag.documentId,
     messages: agentState.agentMessages,
     clarificationRounds: agentState.clarificationRounds,
+    documentModeLeanLock: agentState.documentModeLeanLock,
     chatTurns: chat.list(),
     sourcePaths: agentState.sourcePaths,
     evidenceCache: agentState.evidenceCache,
-    task: agentState.task,
+    task: taskForPersistence(agentState),
   });
   return {
     tokensBefore: outcome.tokensBefore,
@@ -497,6 +591,9 @@ export function closeChatAgentDocument(state: ChatAgentState): void {
   state.evidenceCache = [];
   state.sourceDocumentId = undefined;
   state.task = undefined;
+  state.restartTask = undefined;
+  state.conversationResetPending = false;
+  state.documentModeLeanLock = false;
 }
 
 export function isCloseDocumentRequest(message: string): boolean {
@@ -521,6 +618,7 @@ export async function runChatAgentTurn(opts: {
   threadId?: string;
   onProgress?: (phase: string) => void;
   onDelta?: (chunk: string) => void;
+  onDeltaReset?: (text: string) => void;
   signal?: AbortSignal;
   /** Remote MCP bridge + per-call approval (stream chat path only). */
   remoteMcp?: { bridge: RemoteMcpBridge; requestApproval: RemoteMcpApprovalFn };
@@ -534,30 +632,75 @@ export async function runChatAgentTurn(opts: {
     replaceAttachedSources(agentState, workspace, opts.sourcePaths);
   }
   const requestedMessage = opts.message;
-  const resumeRequested = /^(?:继续|接着做|恢复任务|continue)(?:。|！|!)?$/i.test(
-    requestedMessage.trim(),
-  );
-  const interruptedTask = resumeRequested && agentState.task?.status === "interrupted"
+  const resumeRequested = isTaskResumeRequest(requestedMessage);
+  const persistedInterruptedTask = agentState.task?.status === "interrupted"
     ? agentState.task
     : undefined;
+  const pendingRestartTask = agentState.restartTask;
+  const interruptedCandidate =
+    resumeRequested
+      ? persistedInterruptedTask ?? pendingRestartTask
+      : undefined;
+  const interruptedTask =
+    interruptedCandidate && isTaskResumableForDocument(interruptedCandidate, agentState.bag)
+      ? interruptedCandidate
+      : undefined;
+  const staleInterruptedTask = interruptedCandidate && !interruptedTask
+    ? interruptedCandidate
+    : undefined;
+  const restartInterruptedTask = Boolean(
+    staleInterruptedTask?.documentId &&
+    staleInterruptedTask.documentId === agentState.bag.documentId &&
+    staleInterruptedTask.documentRevision !== agentState.bag.revision,
+  );
+  const revisionResetRequired = Boolean(
+    pendingRestartTask ||
+    (persistedInterruptedTask &&
+      !isTaskResumableForDocument(persistedInterruptedTask, agentState.bag)),
+  );
+  if (revisionResetRequired) {
+    archiveAgentSession(workspace, agentState.sessionId);
+    clearChatAgentConversation(agentState);
+    chat.clear();
+    agentState.conversationResetPending = true;
+  }
   const message = interruptedTask
     ? `继续此前任务：${interruptedTask.objective}`
-    : requestedMessage;
+    : restartInterruptedTask
+      ? `文稿已更新。请从当前版本重新执行此前任务，不要复用旧选区或读取位置：${staleInterruptedTask!.objective}`
+      : staleInterruptedTask
+        ? "此前中断任务无法安全绑定到当前文稿。请告知用户需要针对当前文稿重新说明具体任务，不要执行旧任务。"
+        : requestedMessage;
   const objective = interruptedTask
     ? interruptedTask.objective
-    : requestedMessage.trim();
-  const selectionBlockIds = opts.selectionBlockIds?.length
-    ? opts.selectionBlockIds
-    : interruptedTask?.selection?.blockIds;
-  const selectionText = opts.selectionText?.trim()
-    ? opts.selectionText
-    : interruptedTask?.selection?.text;
-  const selectionStart = Number.isInteger(opts.selectionStart) && Number(opts.selectionStart) >= 0
-    ? opts.selectionStart
-    : interruptedTask?.selection?.start;
+    : restartInterruptedTask
+      ? staleInterruptedTask!.objective
+      : requestedMessage.trim();
+  const selectionBlockIds = interruptedTask
+    ? interruptedTask.selection?.blockIds
+    : staleInterruptedTask
+      ? undefined
+      : opts.selectionBlockIds?.length
+      ? opts.selectionBlockIds
+      : undefined;
+  const selectionText = interruptedTask
+    ? interruptedTask.selection?.text
+    : staleInterruptedTask
+      ? undefined
+      : opts.selectionText?.trim()
+      ? opts.selectionText
+      : undefined;
+  const selectionStart = interruptedTask
+    ? interruptedTask.selection?.start
+    : staleInterruptedTask
+      ? undefined
+      : Number.isInteger(opts.selectionStart) && Number(opts.selectionStart) >= 0
+      ? opts.selectionStart
+      : undefined;
   agentState.task = {
     objective,
     status: "running",
+    ...taskDocumentBinding(agentState.bag),
     currentStep: "正在处理…",
     sourcePaths: [...agentState.sourcePaths],
     sourceRefs: [],
@@ -574,10 +717,11 @@ export async function runChatAgentTurn(opts: {
     documentId: agentState.bag.documentId,
     messages: agentState.agentMessages,
     clarificationRounds: agentState.clarificationRounds,
+    documentModeLeanLock: agentState.documentModeLeanLock,
     chatTurns: chat.list(),
     sourcePaths: agentState.sourcePaths,
     evidenceCache: agentState.evidenceCache,
-    task: agentState.task,
+    task: taskForPersistence(agentState),
   });
   const clarificationRound = agentState.clarificationRounds ?? 0;
   const proposalHint = agentState.bag.documentId
@@ -586,6 +730,24 @@ export async function runChatAgentTurn(opts: {
   const localDocxPath = parseExplicitLocalDocxPath(message);
   const verifyDocumentOpen =
     !agentState.bag.documentId && isDocumentOpenStatusMessage(message);
+  const turnBag = {
+    ...agentState.bag,
+    blocks: [...agentState.bag.blocks],
+  };
+  let turnEvidenceCache = [...agentState.evidenceCache];
+  const syncFailedTurnRevision = () => {
+    const documentId = agentState.bag.documentId;
+    if (!documentId || turnBag.documentId !== documentId) return false;
+    try {
+      const current = getDocument(workspace, documentId);
+      if (current.revision === agentState.bag.revision) return false;
+      syncBagFromDocument(agentState, current, listBlocks(workspace, documentId));
+      agentState.conversationResetPending = true;
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   const llmSettings = readLlmSettingsStore(workspace.root);
   const compactionEvents: CompactionEvent[] = [];
@@ -616,6 +778,8 @@ export async function runChatAgentTurn(opts: {
       : await runSessionTurn({
         reasoningMode: llmSettings.reasoningMode,
         timeoutMs: llmSettings.agentTimeoutMs,
+        retryAttempts: llmSettings.retryAttempts,
+        retryDelayMs: llmSettings.retryDelayMs,
         contextTier: llmSettings.contextTier,
         selectionContextChars: llmSettings.selectionContextChars,
         reasoningOptIn: activeProfile(llmSettings).reasoningOptIn,
@@ -631,15 +795,15 @@ export async function runChatAgentTurn(opts: {
         workspaceWriteApprovalMessage: requestedMessage,
         proposalHint: proposalHint || undefined,
         messages: agentState.agentMessages,
-        bag: agentState.bag,
-        bridge: createWorkspaceBridge(workspace),
+        bag: turnBag,
+        bridge: createWorkspaceBridge(workspace, turnBag),
         selectionHint: selectionText,
         selectionBlockIds,
         cascadeBlockIds: opts.cascadeBlockIds,
         sourcePaths: agentState.sourcePaths,
-        evidenceCache: agentState.evidenceCache,
+        evidenceCache: turnEvidenceCache,
         onEvidenceCacheChange: (entries) => {
-          agentState.evidenceCache = entries;
+          turnEvidenceCache = entries;
         },
         history: chat.prior(),
         sessionId: agentState.sessionId,
@@ -650,6 +814,7 @@ export async function runChatAgentTurn(opts: {
         selectedSkills: opts.selectedSkills,
         clarificationRound,
         signal: opts.signal,
+        documentModeLeanLock: agentState.documentModeLeanLock,
         onProgress: (ev) => {
           if (agentState.task) {
             agentState.task.currentStep = ev.phase;
@@ -658,21 +823,27 @@ export async function runChatAgentTurn(opts: {
           opts.onProgress?.(ev.phase);
         },
         onDelta: verifyDocumentOpen ? undefined : opts.onDelta,
+        onDeltaReset: verifyDocumentOpen ? undefined : opts.onDeltaReset,
       });
   } catch (error) {
+    if (turnBag.documentId === agentState.bag.documentId) {
+      agentState.evidenceCache = turnEvidenceCache;
+    }
     if (agentState.task) {
       agentState.task.status = "interrupted";
       agentState.task.updatedAt = new Date().toISOString();
     }
+    syncFailedTurnRevision();
     saveAgentSession(workspace, {
       sessionId: agentState.sessionId,
       documentId: agentState.bag.documentId,
       messages: agentState.agentMessages,
       clarificationRounds: agentState.clarificationRounds,
+      documentModeLeanLock: agentState.documentModeLeanLock,
       chatTurns: chat.list(),
       sourcePaths: agentState.sourcePaths,
       evidenceCache: agentState.evidenceCache,
-      task: agentState.task,
+      task: taskForPersistence(agentState),
     });
     if (error instanceof PiLoopFailure) {
       saveAgentTranscript(workspace, {
@@ -696,6 +867,7 @@ export async function runChatAgentTurn(opts: {
     throw error;
   }
 
+  agentState.evidenceCache = turnEvidenceCache;
   turn.reply = stripLiteralThinkingBlocks(turn.reply);
 
   if (
@@ -714,22 +886,35 @@ export async function runChatAgentTurn(opts: {
   }
 
   agentState.agentMessages = turn.messages;
+  if (turn.documentModeLeanLock) {
+    agentState.documentModeLeanLock = true;
+  }
   for (const event of compactionEvents) {
     settleCompactionEvent(workspace, agentState, chat, event);
   }
+  let switchedDocument = Boolean(turn.documentSwitchOccurred);
   if (turn.opened) {
-    const switched = syncBagFromDocument(
+    const finalDocumentSwitched = syncBagFromDocument(
       agentState,
       turn.opened.document,
       turn.opened.blocks,
     );
-    if (switched) chat.clear();
+    switchedDocument = finalDocumentSwitched || switchedDocument;
+    if (turn.documentSwitchOccurred && !finalDocumentSwitched) {
+      clearChatAgentConversation(agentState);
+      agentState.sourcePaths = [];
+    }
+    if (switchedDocument) chat.clear();
   }
 
   const runId = randomUUID();
-  const proposalIds: string[] = [];
+  const proposals: Proposal[] = [];
   if (agentState.bag.documentId && turn.proposals.length) {
     for (const draft of turn.proposals) {
+      if (
+        draft.documentId !== agentState.bag.documentId ||
+        draft.baseRevision !== agentState.bag.revision
+      ) continue;
       const targetBlock = agentState.bag.blocks.find((block) => block.id === draft.blockId);
       if (!targetBlock || targetBlock.contentHash !== draft.baseHash) continue;
       const proposal = {
@@ -738,32 +923,27 @@ export async function runChatAgentTurn(opts: {
         status: "proposed" as const,
         createdAt: new Date().toISOString(),
       };
-      saveProposal(workspace, proposal);
-      proposalIds.push(proposal.id);
+      proposals.push(proposal);
     }
   }
-  if (agentState.bag.documentId && turn.comments.length) {
-    replaceDocumentComments(
-      workspace,
-      agentState.bag.documentId,
-      turn.comments.map((c) => ({
-        id: c.id,
-        blockId: c.blockId,
-        text: c.text,
-        severity: c.severity,
-        runId,
-        source: c.source,
-      })),
-    );
-  }
-  if (agentState.bag.documentId && turn.reviewChecklists?.length) {
-    for (const checklist of turn.reviewChecklists) {
-      if (checklist.run.documentId !== agentState.bag.documentId) continue;
-      saveReviewChecklistRun(workspace, checklist);
-    }
-  }
+  const activeComments = agentState.bag.documentId
+    ? turn.comments.filter((comment) =>
+        !comment.documentId || comment.documentId === agentState.bag.documentId,
+      )
+    : [];
+  const reviewChecklists = agentState.bag.documentId
+    ? (turn.reviewChecklists ?? []).filter(
+        (checklist) => checklist.run.documentId === agentState.bag.documentId,
+      )
+    : [];
   if (agentState.bag.documentId && turn.tableCellProposals?.length) {
     for (const draft of turn.tableCellProposals) {
+      if (
+        draft.documentId !== agentState.bag.documentId ||
+        draft.baseRevision !== agentState.bag.revision
+      ) continue;
+      const targetBlock = agentState.bag.blocks.find((block) => block.id === draft.blockId);
+      if (!targetBlock || targetBlock.contentHash !== draft.baseHash) continue;
       const proposal = {
         schemaVersion: 1 as const,
         id: randomUUID(),
@@ -780,43 +960,107 @@ export async function runChatAgentTurn(opts: {
         status: "proposed" as const,
         createdAt: new Date().toISOString(),
       };
-      saveProposal(workspace, proposal);
-      proposalIds.push(proposal.id);
+      proposals.push(proposal);
+    }
+  }
+  const proposalIds = proposals.map((proposal) => proposal.id);
+  const comments = activeComments.map((comment) => ({
+    id: comment.id,
+    blockId: comment.blockId,
+    text: comment.text,
+    severity: comment.severity,
+    runId,
+    source: comment.source,
+  }));
+  if (
+    agentState.bag.documentId &&
+    (proposals.length || comments.length || reviewChecklists.length)
+  ) {
+    const documentId = agentState.bag.documentId;
+    const expectedRevision = agentState.bag.revision;
+    try {
+      await enqueueDocumentMutation(workspace, documentId, () => {
+        const document = getDocument(workspace, documentId);
+        saveScanArtifactsAtomically(workspace, documentId, {
+          expectedRevision,
+          expectedContentHash: document.contentHash,
+          proposals,
+          comments,
+          reviewChecklists,
+          replaceComments: comments.length > 0,
+        });
+      });
+    } catch (error) {
+      agentState.task = {
+        objective,
+        status: "interrupted",
+        ...taskDocumentBinding(agentState.bag),
+        currentStep: "审阅结果保存失败",
+        sourcePaths: [...agentState.sourcePaths],
+        sourceRefs: turn.workReport?.sourceRefs ?? [],
+        proposalCount: 0,
+        inspectedDocument: turn.workReport?.inspectedDocument ?? false,
+        consistencyChecked: turn.workReport?.consistencyChecked ?? false,
+        selection: !switchedDocument && selectionBlockIds?.length
+          ? { blockIds: [...selectionBlockIds], text: selectionText, start: selectionStart }
+          : undefined,
+        updatedAt: new Date().toISOString(),
+      };
+      syncFailedTurnRevision();
+      saveAgentSession(workspace, {
+        sessionId: agentState.sessionId,
+        documentId: agentState.bag.documentId,
+        messages: agentState.agentMessages,
+        clarificationRounds: agentState.clarificationRounds,
+        documentModeLeanLock: agentState.documentModeLeanLock,
+        chatTurns: chat.list(),
+        sourcePaths: agentState.sourcePaths,
+        evidenceCache: agentState.evidenceCache,
+        task: taskForPersistence(agentState),
+      });
+      throw error;
     }
   }
 
-  agentState.clarificationRounds = nextClarificationRound({
-    previous: clarificationRound,
-    message,
-    proposalCount: proposalIds.length,
-    chatMode: opts.chatMode,
-  });
+  agentState.clarificationRounds = switchedDocument
+    ? 0
+    : nextClarificationRound({
+      previous: clarificationRound,
+      message,
+      proposalCount: proposalIds.length,
+      chatMode: opts.chatMode,
+    });
 
   agentState.task = {
     objective,
-    status: "completed",
+    status: turn.continuationRequired && !switchedDocument ? "interrupted" : "completed",
+    ...taskDocumentBinding(agentState.bag),
     sourcePaths: [...agentState.sourcePaths],
     sourceRefs: turn.workReport?.sourceRefs ?? [],
     proposalCount: proposalIds.length,
     inspectedDocument: turn.workReport?.inspectedDocument ?? false,
     consistencyChecked: turn.workReport?.consistencyChecked ?? false,
-    selection: selectionBlockIds?.length
+    selection: !switchedDocument && selectionBlockIds?.length
       ? { blockIds: [...selectionBlockIds], text: selectionText, start: selectionStart }
       : undefined,
     updatedAt: new Date().toISOString(),
   };
 
-  chat.remember("user", requestedMessage, opts.threadId);
-  chat.remember("assistant", turn.reply, opts.threadId);
+  const conversationReset = switchedDocument || revisionResetRequired ||
+    agentState.conversationResetPending;
+  const retainedThreadId = conversationReset ? undefined : opts.threadId;
+  chat.remember("user", requestedMessage, retainedThreadId);
+  chat.remember("assistant", turn.reply, retainedThreadId);
   saveAgentSession(workspace, {
     sessionId: agentState.sessionId,
     documentId: agentState.bag.documentId,
     messages: agentState.agentMessages,
     clarificationRounds: agentState.clarificationRounds,
+    documentModeLeanLock: agentState.documentModeLeanLock,
     chatTurns: chat.list(),
     sourcePaths: agentState.sourcePaths,
     evidenceCache: agentState.evidenceCache,
-    task: agentState.task,
+    task: taskForPersistence(agentState),
   });
   const turnId = randomUUID();
   saveAgentTranscript(workspace, {
@@ -840,8 +1084,11 @@ export async function runChatAgentTurn(opts: {
     createdAt: new Date().toISOString(),
   });
 
+  agentState.conversationResetPending = false;
+
   return {
     reply: turn.reply,
+    conversationReset: conversationReset || undefined,
     opened: turn.opened,
     engine: turn.engine,
     steps: turn.steps,

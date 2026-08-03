@@ -1161,6 +1161,10 @@ textarea {
   background: var(--warn);
 }
 
+.task-receipt.retry::before {
+  background: var(--warn);
+}
+
 .task-receipt button {
   border: 0;
   padding: 0;
@@ -1168,6 +1172,12 @@ textarea {
   background: transparent;
   font: inherit;
   cursor: pointer;
+}
+
+.task-receipt.retry button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
 }
 
 .context-strip span {
@@ -1503,6 +1513,14 @@ textarea {
   color: var(--mute);
   font-size: 0.72rem;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-usage {
+  flex: 0 0 auto;
+  color: var(--mute);
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 

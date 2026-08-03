@@ -4,6 +4,7 @@ import { memo, useEffect, useMemo, useRef } from "react";
 import type { Block, Comment, Proposal } from "../api";
 import { MarginBlock } from "../extensions/MarginBlock";
 import { blocksToDocJson, findBlockIdNearSelection, findBlockIdsInSelection } from "../doc";
+import { resolveMarkdownSelectionStart } from "../markdownSelection";
 import { PendingContext } from "../pendingContext";
 import type { CanvasProps } from "./canvasTypes";
 
@@ -83,12 +84,21 @@ function MarkdownCanvasView({
           const text = view.state.doc.textBetween(from, to, "\n");
           const blockId = findBlockIdNearSelection(view.state.doc, from, to);
           const ids = findBlockIdsInSelection(view.state.doc, from, to);
+          const selectionStart = resolveMarkdownSelectionStart(
+            view.state.doc,
+            blocks,
+            blockId,
+            from,
+            to,
+            text,
+          );
           onContextMenu({
             x: event.clientX,
             y: event.clientY,
             blockId,
             blockIds: ids.length > 1 ? ids : undefined,
             text: text || "",
+            selectionStart,
           });
           return true;
         },
@@ -99,6 +109,14 @@ function MarkdownCanvasView({
       const text = empty ? "" : ed.state.doc.textBetween(from, to, "\n");
       const blockId = findBlockIdNearSelection(ed.state.doc, from, to);
       const ids = empty ? [] : findBlockIdsInSelection(ed.state.doc, from, to);
+      const selectionStart = resolveMarkdownSelectionStart(
+        ed.state.doc,
+        blocks,
+        blockId,
+        from,
+        to,
+        text,
+      );
       let anchor: { x: number; y: number } | null = null;
       if (!empty && text.trim()) {
         try {
@@ -119,6 +137,7 @@ function MarkdownCanvasView({
         blockIds: ids.length > 1 ? ids : undefined,
         text,
         rawText: text,
+        selectionStart,
         anchor,
         userInitiated: userSelectionInputRef.current || transaction.getMeta("pointer") === true,
       });

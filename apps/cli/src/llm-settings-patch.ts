@@ -25,6 +25,10 @@ export type LlmSettingsPutBody = {
   harnessId?: string | null;
   /** Pi session timeout in ms; null clears back to the default. */
   agentTimeoutMs?: number | null;
+  /** Total transient-error attempts; null clears back to 5. */
+  retryAttempts?: number | null;
+  /** Fixed transient-error delay in ms; null clears back to 30000. */
+  retryDelayMs?: number | null;
   /** Inline selection cap in chars; null follows the context tier. */
   selectionContextChars?: number | null;
   /** Context budget tier; null clears back to the default (standard). */
@@ -67,6 +71,8 @@ export function buildLlmSettingsUpdate(
     harnessId,
     reasoningMode: body.reasoningMode,
     agentTimeoutMs: body.agentTimeoutMs,
+    retryAttempts: body.retryAttempts,
+    retryDelayMs: body.retryDelayMs,
     selectionContextChars: body.selectionContextChars,
     contextTier: body.contextTier,
     compactionAuto: body.compactionAuto,

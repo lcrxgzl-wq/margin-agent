@@ -54,6 +54,73 @@ function byName(tools: ReturnType<typeof createSessionTools>) {
 }
 
 describe("session evidence validation", () => {
+  it("accepts a probed current-turn ref from an unattached file without retaining it", async () => {
+    const drafts: Draft[] = [];
+    const probedPaths: string[] = [];
+    const persistedChanges: EvidenceCacheEntry[][] = [];
+    const tools = byName(createSessionTools(
+      bridge({
+        readText: () => ({
+          relativePath: "notes/canonical.txt",
+          text: "evidence",
+          bytes: 8,
+          versionHash: VERSION_A,
+        }),
+        readVersion: (relativePath) => {
+          probedPaths.push(relativePath);
+          return { relativePath, bytes: 8, versionHash: VERSION_A };
+        },
+      }),
+      bag(),
+      drafts,
+      [],
+      {},
+      {
+        sourcePaths: [],
+        onEvidenceCacheChange: (entries) => { persistedChanges.push(entries); },
+      },
+    ));
+
+    const read = await tools.read_workspace_file!.execute("read", {
+      relativePath: "notes/alias.txt",
+      offset: 0,
+      limit: 8,
+    });
+    const readJson = JSON.parse((read.content[0] as { text: string }).text);
+    expect(readJson).toMatchObject({
+      relativePath: "notes/canonical.txt",
+      attached: false,
+    });
+
+    await tools.propose_block_edit!.execute("current", {
+      blockId: "b1",
+      after: "revised first",
+      rationale: "Uses a workspace file read in this turn.",
+      evidence: [readJson.sourceRef],
+    });
+
+    expect(probedPaths).toEqual(["notes/canonical.txt"]);
+    expect(drafts[0]?.evidence).toEqual([readJson.sourceRef]);
+    expect(persistedChanges).toEqual([]);
+
+    const nextTurnDrafts: Draft[] = [];
+    const nextTurn = byName(createSessionTools(
+      bridge(),
+      bag(),
+      nextTurnDrafts,
+      [],
+      {},
+      { sourcePaths: [], evidenceCache: [] },
+    ));
+    await expect(nextTurn.propose_block_edit!.execute("next-turn", {
+      blockId: "b1",
+      after: "revised again",
+      rationale: "Must not reuse unattached evidence next turn.",
+      evidence: [readJson.sourceRef],
+    })).rejects.toThrow(/attached sourcePath|returned by read_workspace_file/i);
+    expect(nextTurnDrafts).toEqual([]);
+  });
+
   it("reuses a prior-turn ref only after a source-byte version probe", async () => {
     let extracts = 0;
     let probes = 0;
@@ -138,7 +205,7 @@ describe("session evidence validation", () => {
       evidence: [readJson.sourceRef],
     });
     expect(extracts).toBe(1);
-    expect(probes).toBe(0);
+    expect(probes).toBe(1);
     expect(persisted).toHaveLength(1);
 
     const secondDrafts: Draft[] = [];
@@ -166,8 +233,67 @@ describe("session evidence validation", () => {
       evidence: [readJson.sourceRef],
     });
     expect(extracts).toBe(1);
-    expect(probes).toBe(1);
+    expect(probes).toBe(2);
     expect(secondDrafts[0]?.evidence).toEqual([readJson.sourceRef]);
+  });
+
+  it("rejects a current-turn ref when source bytes change after the read", async () => {
+    let version = VERSION_A;
+    let text = "evidence";
+    let reads = 0;
+    let persisted: EvidenceCacheEntry[] = [];
+    const drafts: Draft[] = [];
+    const tools = byName(createSessionTools(
+      bridge({
+        readText: () => {
+          reads += 1;
+          return {
+            relativePath: "sources/paper.pdf",
+            text,
+            bytes: 8,
+            versionHash: version,
+          };
+        },
+        readVersion: () => ({
+          relativePath: "sources/paper.pdf",
+          bytes: 8,
+          versionHash: version,
+        }),
+      }),
+      bag(),
+      drafts,
+      [],
+      {},
+      {
+        sourcePaths: ["sources/paper.pdf"],
+        onEvidenceCacheChange: (entries) => { persisted = entries; },
+      },
+    ));
+    const read = await tools.read_workspace_file!.execute("read", {
+      relativePath: "sources/paper.pdf",
+      offset: 0,
+      limit: 8,
+    });
+    const sourceRef = JSON.parse((read.content[0] as { text: string }).text).sourceRef;
+    version = VERSION_B;
+    text = "changed!";
+
+    await expect(tools.propose_block_edit!.execute("stale-current", {
+      blockId: "b1",
+      after: "revised",
+      rationale: "Should fail after the source changes.",
+      evidence: [sourceRef],
+    })).rejects.toThrow(/stale.*read_workspace_file again/i);
+    expect(persisted).toEqual([]);
+    expect(drafts).toEqual([]);
+
+    const reread = await tools.read_workspace_file!.execute("reread", {
+      relativePath: "sources/paper.pdf",
+      offset: 0,
+      limit: 8,
+    });
+    expect(JSON.parse((reread.content[0] as { text: string }).text).text).toBe("changed!");
+    expect(reads).toBe(2);
   });
 
   it.each([

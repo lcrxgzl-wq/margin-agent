@@ -8,7 +8,7 @@ afterEach(() => {
 });
 
 describe("AgentTab runtime presets", () => {
-  it("renders editable thirty-minute timeout and 100k selection controls", async () => {
+  it("renders retry, timeout and selection-context controls", async () => {
     vi.stubGlobal("location", { href: "http://127.0.0.1/#token=test-token" });
     vi.stubGlobal("localStorage", {
       getItem: () => null,
@@ -25,5 +25,10 @@ describe("AgentTab runtime presets", () => {
     expect(html).toContain("20 分钟");
     expect(html).toContain("30 分钟");
     expect(html).not.toContain("2 分钟");
+    expect(html).toContain("失败重试总尝试数");
+    expect(html).toContain('placeholder="5"');
+    expect(html).toContain("重试间隔（秒）");
+    expect(html).toContain('placeholder="30"');
+    expect(html).toContain("包含首次请求");
   });
 });

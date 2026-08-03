@@ -9,12 +9,16 @@ import {
   exportPacket,
   getDocument,
   listBlocks,
+  listComments,
   listDocumentTimeline,
   listProposals,
   openDocument,
   openWorkspace,
   recoverApplyJournals,
   recoverDecidedProposals,
+  replaceDocumentComments,
+  saveScanArtifactsAtomically,
+  ScanArtifactsConflictError,
   saveDecision,
   saveProposal,
   saveProposalResolutionBatch,
@@ -70,12 +74,139 @@ function proposalFor(
   };
 }
 
+describe("saveScanArtifactsAtomically", () => {
+  it("rejects an external disk edit that has not been reindexed", async () => {
+    const { root, ws, document, blocks } = await testWorkspace();
+    const existing = proposalFor(document, blocks[0]!, { id: "existing-proposal" });
+    saveProposal(ws, existing);
+    replaceDocumentComments(ws, document.id, [{
+      id: "existing-comment",
+      blockId: blocks[0]!.id,
+      text: "must survive the rejected scan",
+      severity: "info",
+      runId: "existing-run",
+      source: "test",
+    }]);
+    fs.writeFileSync(path.join(root, "paper.md"), "externally changed\n", "utf8");
+
+    expect(() => saveScanArtifactsAtomically(ws, document.id, {
+      expectedRevision: document.revision,
+      expectedContentHash: document.contentHash,
+      proposals: [proposalFor(document, blocks[0]!, { id: "stale-disk-proposal" })],
+      comments: [{
+        id: "stale-disk-comment",
+        blockId: blocks[0]!.id,
+        text: "must not persist",
+        severity: "warn",
+        runId: "stale-disk-run",
+        source: "test",
+      }],
+      reviewChecklists: [],
+      supersedeOpenProposals: true,
+    })).toThrow(ScanArtifactsConflictError);
+
+    expect(listProposals(ws, document.id)).toMatchObject([{
+      id: "existing-proposal",
+      status: "proposed",
+    }]);
+    expect(listComments(ws, document.id)).toMatchObject([{
+      id: "existing-comment",
+      text: "must survive the rejected scan",
+    }]);
+  });
+
+  it("rejects a registered path retargeted through a symlink", async () => {
+    const { root, ws, document, blocks } = await testWorkspace();
+    const registeredPath = path.join(root, "paper.md");
+    const originalTarget = path.join(root, "paper-original.md");
+    const replacementTarget = path.join(root, "paper-replacement.md");
+    fs.renameSync(registeredPath, originalTarget);
+    fs.writeFileSync(replacementTarget, "first paragraph\n\nsecond paragraph\n", "utf8");
+    fs.symlinkSync(replacementTarget, registeredPath, "file");
+
+    expect(() => saveScanArtifactsAtomically(ws, document.id, {
+      expectedRevision: document.revision,
+      expectedContentHash: document.contentHash,
+      proposals: [proposalFor(document, blocks[0]!)],
+      comments: [{
+        id: "retargeted-comment",
+        blockId: blocks[0]!.id,
+        text: "must not persist",
+        severity: "warn",
+        runId: "retargeted-run",
+        source: "test",
+      }],
+      reviewChecklists: [],
+    })).toThrow(ScanArtifactsConflictError);
+
+    expect(listProposals(ws, document.id)).toEqual([]);
+    expect(listComments(ws, document.id)).toEqual([]);
+  });
+
+  it("rejects stale document and block snapshots without partial writes", async () => {
+    const { root, ws, document, blocks } = await testWorkspace();
+    fs.writeFileSync(path.join(root, "paper.md"), "replacement paragraph\n", "utf8");
+    const revised = openDocument(ws, "paper.md");
+    const revisedBlock = listBlocks(ws, revised.id)[0]!;
+
+    expect(() => saveScanArtifactsAtomically(ws, document.id, {
+      expectedRevision: document.revision,
+      expectedContentHash: document.contentHash,
+      proposals: [proposalFor(document, blocks[0]!)],
+      comments: [{
+        id: "stale-comment",
+        blockId: blocks[0]!.id,
+        text: "stale comment",
+        severity: "info",
+        runId: "stale-run",
+        source: "test",
+      }],
+      reviewChecklists: [],
+    })).toThrow(ScanArtifactsConflictError);
+    expect(listProposals(ws, document.id)).toEqual([]);
+    expect(listComments(ws, document.id)).toEqual([]);
+
+    expect(() => saveScanArtifactsAtomically(ws, revised.id, {
+      expectedRevision: revised.revision,
+      expectedContentHash: revised.contentHash,
+      proposals: [proposalFor(revised, revisedBlock, { baseHash: "stale-block-hash" })],
+      comments: [],
+      reviewChecklists: [],
+    })).toThrow(ScanArtifactsConflictError);
+    expect(listProposals(ws, document.id)).toEqual([]);
+
+    expect(() => saveScanArtifactsAtomically(ws, revised.id, {
+      expectedRevision: revised.revision,
+      expectedContentHash: revised.contentHash,
+      proposals: [],
+      comments: [{
+        id: "orphan-comment",
+        blockId: "missing-block",
+        text: "must not persist",
+        severity: "warn",
+        runId: "invalid-run",
+        source: "test",
+      }],
+      reviewChecklists: [],
+    })).toThrow("scan comment block mismatch");
+    expect(listComments(ws, document.id)).toEqual([]);
+  });
+});
+
 describe("applyApproved", () => {
   it("supersedes stale proposals when an externally changed Markdown file is reopened", async () => {
     const { root, ws, document, blocks } = await testWorkspace();
     const proposal = proposalFor(document, blocks[0]);
     saveProposal(ws, proposal);
     saveDecision(ws, proposal.id, "Y");
+    replaceDocumentComments(ws, document.id, [{
+      id: "comment-before-reopen",
+      blockId: blocks[0]!.id,
+      text: "stale after reopen",
+      severity: "info",
+      runId: "scan-before-reopen",
+      source: "test",
+    }]);
     fs.writeFileSync(path.join(root, "paper.md"), "external replacement\n", "utf8");
 
     const reopened = openDocument(ws, "paper.md");
@@ -83,6 +214,33 @@ describe("applyApproved", () => {
     expect(reopened.revision).toBe(document.revision + 1);
     expect(listProposals(ws, document.id, "decided")).toHaveLength(0);
     expect(listProposals(ws, document.id)[0]?.status).toBe("superseded");
+    expect(listComments(ws, document.id)).toEqual([]);
+  });
+
+  it("rejects apply when the registered Markdown file is retargeted through a symlink", async () => {
+    const { root, ws, document, blocks } = await testWorkspace();
+    const proposal = proposalFor(document, blocks[0]);
+    saveProposal(ws, proposal);
+    saveDecision(ws, proposal.id, "Y");
+    const registeredPath = path.join(root, "paper.md");
+    const originalTarget = path.join(root, "paper-original.md");
+    const replacementTarget = path.join(root, "paper-replacement.md");
+    const originalText = fs.readFileSync(registeredPath, "utf8");
+    fs.renameSync(registeredPath, originalTarget);
+    fs.writeFileSync(replacementTarget, originalText, "utf8");
+    fs.symlinkSync(replacementTarget, registeredPath, "file");
+
+    await expect(applyApproved(
+      ws,
+      document.id,
+      document.revision,
+      document.contentHash,
+    )).rejects.toThrow("registered document path target changed");
+
+    expect(fs.readFileSync(replacementTarget, "utf8")).toBe(originalText);
+    expect(getDocument(ws, document.id)).toEqual(document);
+    expect(listProposals(ws, document.id, "decided")).toHaveLength(1);
+    expect(fs.readdirSync(path.join(root, ".margin", "backups"))).toEqual([]);
   });
 
   it("finalizes an apply journal when the replacement reached disk before a crash", async () => {
@@ -150,6 +308,57 @@ describe("applyApproved", () => {
     expect(reopened.db.prepare(
       "SELECT proposal_id, ok, after_hash FROM apply_events",
     ).get()).toEqual({ proposal_id: proposal.id, ok: 1, after_hash: nextHash });
+  });
+
+  it("rejects apply journal recovery after the registered Markdown file is retargeted", async () => {
+    const { root, ws, document, blocks } = await testWorkspace();
+    const nextBlocks = blocks.map((block, index) => index === 0
+      ? { ...block, text: "retargeted journal content", contentHash: contentHash("retargeted journal content") }
+      : block);
+    const nextText = blocksToMarkdown(nextBlocks);
+    const nextHash = contentHash(nextText);
+    const now = "2026-01-01T00:00:00.000Z";
+    ws.db.prepare(
+      `INSERT INTO apply_journals (
+        document_id, relative_path, before_hash, after_hash, payload_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      document.id,
+      document.relativePath,
+      document.contentHash,
+      nextHash,
+      JSON.stringify({
+        schemaVersion: 1,
+        documentId: document.id,
+        relativePath: document.relativePath,
+        beforeRevision: document.revision,
+        afterRevision: document.revision + 1,
+        beforeHash: document.contentHash,
+        afterHash: nextHash,
+        updatedAt: now,
+        blocks: nextBlocks,
+        proposalIds: [],
+        events: [],
+      }),
+      now,
+    );
+    const registeredPath = path.join(root, "paper.md");
+    const originalTarget = path.join(root, "paper-original.md");
+    const replacementTarget = path.join(root, "paper-replacement.md");
+    const originalText = fs.readFileSync(registeredPath, "utf8");
+    fs.renameSync(registeredPath, originalTarget);
+    fs.writeFileSync(replacementTarget, nextText, "utf8");
+    fs.symlinkSync(replacementTarget, registeredPath, "file");
+
+    await expect(recoverApplyJournals(ws))
+      .rejects.toThrow("registered document path target changed");
+
+    expect(getDocument(ws, document.id)).toEqual(document);
+    expect(listBlocks(ws, document.id)).toEqual(blocks);
+    expect(ws.db.prepare("SELECT COUNT(*) AS count FROM apply_journals").get())
+      .toEqual({ count: 1 });
+    expect(fs.readFileSync(originalTarget, "utf8")).toBe(originalText);
+    expect(fs.readFileSync(replacementTarget, "utf8")).toBe(nextText);
   });
 
   it("rolls back a pre-replacement journal and leaves its decision retryable", async () => {
@@ -357,6 +566,14 @@ describe("applyApproved", () => {
     saveProposal(ws, requested);
     saveDecision(ws, hidden.id, "Y");
     saveDecision(ws, requested.id, "Y");
+    replaceDocumentComments(ws, document.id, [{
+      id: "comment-before-apply",
+      blockId: blocks[0]!.id,
+      text: "stale after apply",
+      severity: "info",
+      runId: "scan-before-apply",
+      source: "test",
+    }]);
 
     const result = await applyApproved(
       ws,
@@ -371,6 +588,7 @@ describe("applyApproved", () => {
     expect(text).toContain("requested revision");
     expect(text).not.toContain("hidden revision");
     expect(listProposals(ws, document.id, "decided").map((proposal) => proposal.id)).toContain(hidden.id);
+    expect(listComments(ws, document.id)).toEqual([]);
   });
 
   it("keeps a proposal retryable until an explicit resolve apply succeeds", async () => {

@@ -120,6 +120,13 @@ export type {
 } from "./mcp-tools.js";
 export type { SessionTurnResult, SessionTurnInput } from "./session-runner.js";
 export { CONTEXT_TIER_PRESETS } from "./session-runner.js";
+export {
+  buildFullDocumentInjection,
+  resolveDocumentMode,
+  stripDocumentInjections,
+  DOCUMENT_FULL_REMOVED_PLACEHOLDER,
+} from "./document-context.js";
+export type { DocumentMode } from "./document-context.js";
 export type { WorkspaceBridge, SessionDocBag } from "./session-tools.js";
 export {
   MAX_CLARIFICATION_ROUNDS,

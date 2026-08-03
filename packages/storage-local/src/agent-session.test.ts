@@ -41,6 +41,7 @@ describe("agent session persistence", () => {
           { role: "assistant", content: "好" },
         ],
         clarificationRounds: 2,
+        documentModeLeanLock: true,
         chatTurns: [
           { role: "user", text: "打开样章" },
           { role: "assistant", text: "好" },
@@ -49,6 +50,8 @@ describe("agent session persistence", () => {
         task: {
           objective: "依据访谈材料修订本节",
           status: "completed",
+          documentId: "doc-1",
+          documentRevision: 7,
           sourcePaths: ["notes/interview.txt"],
           sourceRefs: ["notes/interview.txt#chars=0-120"],
           proposalCount: 2,
@@ -63,6 +66,7 @@ describe("agent session persistence", () => {
       expect(loaded?.documentId).toBe("doc-1");
       expect(loaded?.messages).toHaveLength(2);
       expect(loaded?.clarificationRounds).toBe(2);
+      expect(loaded?.documentModeLeanLock).toBe(true);
       expect(loaded?.chatTurns).toEqual([
         { role: "user", text: "打开样章" },
         { role: "assistant", text: "好" },
@@ -75,6 +79,8 @@ describe("agent session persistence", () => {
       expect(loaded?.task).toMatchObject({
         objective: "依据访谈材料修订本节",
         status: "completed",
+        documentId: "doc-1",
+        documentRevision: 7,
         sourceRefs: ["notes/interview.txt#chars=0-120"],
         proposalCount: 2,
         inspectedDocument: true,
@@ -155,6 +161,39 @@ describe("agent session persistence", () => {
         status: "interrupted",
         currentStep: "正在读取文件…",
       });
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("drops incomplete document bindings from persisted tasks", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-sess-task-binding-"));
+    dirs.push(root);
+    const ws = await openWorkspace(root);
+    try {
+      saveAgentSession(ws, {
+        sessionId: "invalid-task-binding",
+        messages: [],
+        task: {
+          objective: "继续审阅",
+          status: "interrupted",
+          documentId: "doc-1",
+          sourcePaths: [],
+          sourceRefs: [],
+          proposalCount: 0,
+          inspectedDocument: false,
+          consistencyChecked: false,
+          updatedAt: "2026-08-03T00:00:00.000Z",
+        },
+      });
+
+      expect(loadAgentSession(ws)?.task).toMatchObject({
+        objective: "继续审阅",
+        status: "interrupted",
+      });
+      expect(loadAgentSession(ws)?.task?.documentId).toBeUndefined();
+      expect(loadAgentSession(ws)?.task?.documentRevision).toBeUndefined();
     } finally {
       ws.db.close();
       await ws.releaseLock();

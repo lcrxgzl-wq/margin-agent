@@ -9,7 +9,10 @@ import {
 } from "@margin/llm";
 import { runPiAgentLoop, type ToolAuditEvent } from "./pi-loop.js";
 import type { CompactionEvent } from "./compaction.js";
-import { buildEvidenceCacheDirectory } from "./evidence-cache.js";
+import {
+  buildEvidenceCacheDirectory,
+  normalizeAttachedEvidenceCache,
+} from "./evidence-cache.js";
 import { assertPiLoopCompleted } from "./pi-outcome.js";
 import { decideRoute } from "./policy/router.js";
 import { parseOpenIntent, parseReadIntent, resolveOpenPath } from "./policy/open-intent-rule.js";
@@ -28,6 +31,17 @@ import {
 } from "./session-tools.js";
 import { buildClarificationHint, isEditOrRewriteIntent } from "./clarification.js";
 import { formatOutlineHint, type CascadeCandidate } from "./cascade.js";
+import {
+  buildFullDocumentInjection,
+  documentModeNote,
+  documentModeOverflowDemotionNote,
+  documentModeSwitchDemotionNote,
+  estimateTranscriptChars,
+  hadContextOverflow,
+  resolveDocumentMode,
+  stripDocumentInjections,
+  type DocumentMode,
+} from "./document-context.js";
 import type { AgentComment, AgentWorkReport, ReasoningMode, ScanProgressHandler } from "./types.js";
 import type { RemoteMcpApprovalFn, RemoteMcpBridge } from "./mcp-tools.js";
 import {
@@ -143,6 +157,8 @@ export type SessionTurnInput = {
   onProgress?: ScanProgressHandler;
   /** Incremental assistant text (true streaming when available). */
   onDelta?: (chunk: string) => void;
+  /** Replace streamed text when a failed provider attempt is retried. */
+  onDeltaReset?: (text: string) => void;
   /** Abort in-flight Pi turn (e.g. client disconnect). */
   signal?: AbortSignal;
   /** Stable Pi session id for continuity / cache affinity. */
@@ -151,6 +167,10 @@ export type SessionTurnInput = {
   reasoningMode?: ReasoningMode;
   /** User-configured pi session timeout (ms); wins over env/profile fallback. */
   timeoutMs?: number;
+  /** Total attempts for transient provider/transport failures. */
+  retryAttempts?: number;
+  /** Fixed delay between transient retries in milliseconds. */
+  retryDelayMs?: number;
   /** Context budget tier; unset/invalid keeps the current standard behavior. */
   contextTier?: ContextTier;
   /** Automatic context compaction (default true); plumbed like agentTimeoutMs. */
@@ -179,6 +199,8 @@ export type SessionTurnInput = {
   selectedSkills?: string[];
   /** Remote MCP bridge + per-call approval (chat path only; scan passes none). */
   remoteMcp?: { bridge: RemoteMcpBridge; requestApproval: RemoteMcpApprovalFn };
+  /** Session hysteresis: stay lean after an overflow demotion. */
+  documentModeLeanLock?: boolean;
 };
 
 export type SessionTurnResult = {
@@ -191,10 +213,17 @@ export type SessionTurnResult = {
   reviewChecklists?: import("@margin/domain").ReviewChecklistRunDraft[];
   steps: string[];
   opened?: { document: DocumentMeta; blocks: SessionDocBag["blocks"] };
+  documentSwitchOccurred?: boolean;
   written?: { relativePath: string; created: boolean };
   loadedSkills?: Array<{ name: string; contentHash: string }>;
   cascadeOffer?: CascadeCandidate[];
   notes?: string[];
+  /** Fit-first document injection mode used for this turn. */
+  documentMode?: DocumentMode;
+  /** Host should keep subsequent turns in lean until document switch/reset. */
+  documentModeLeanLock?: boolean;
+  /** The Pi loop stopped safely and the host should preserve this task for "continue". */
+  continuationRequired?: boolean;
   workReport?: AgentWorkReport;
   toolAudit?: ToolAuditEvent[];
 };
@@ -243,6 +272,56 @@ function explicitlyRequestedWorkspaceWritePaths(message: string): string[] {
   return [...new Set(paths)];
 }
 
+async function freshEvidenceCache(
+  bridge: WorkspaceBridge,
+  entries: readonly EvidenceCacheEntry[],
+  sourcePaths: readonly string[],
+  onChange?: (entries: EvidenceCacheEntry[]) => void,
+): Promise<EvidenceCacheEntry[]> {
+  const normalized = normalizeAttachedEvidenceCache(entries, sourcePaths);
+  const normalizedChanged = normalized.length !== entries.length ||
+    normalized.some((entry, index) => {
+      const previous = entries[index];
+      return !previous ||
+        previous.sourceRef !== entry.sourceRef ||
+        previous.relativePath !== entry.relativePath ||
+        previous.start !== entry.start ||
+        previous.end !== entry.end ||
+        previous.extractedHash !== entry.extractedHash ||
+        previous.versionHash !== entry.versionHash ||
+        previous.preview !== entry.preview ||
+        previous.readAt !== entry.readAt;
+    });
+  if (!normalized.length) {
+    if (normalizedChanged) onChange?.(normalized);
+    return normalized;
+  }
+
+  const expectedByPath = new Map(
+    normalized.map((entry) => [entry.relativePath, entry.versionHash]),
+  );
+  const stalePaths = new Set<string>();
+  await Promise.all([...expectedByPath].map(async ([relativePath, expectedVersion]) => {
+    try {
+      const current = await bridge.readVersion(relativePath);
+      const currentPath = current.relativePath.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+      if (currentPath !== relativePath || current.versionHash !== expectedVersion) {
+        stalePaths.add(relativePath);
+      }
+    } catch {
+      stalePaths.add(relativePath);
+    }
+  }));
+  if (!stalePaths.size) {
+    if (normalizedChanged) onChange?.(normalized);
+    return normalized;
+  }
+
+  const fresh = normalized.filter((entry) => !stalePaths.has(entry.relativePath));
+  onChange?.(fresh);
+  return fresh;
+}
+
 /** Merge assistant speech with finish_turn.summary into the user-visible reply. */
 export function composeVisibleReply(assistantText: string, finishSummary?: string): string {
   const spoken = assistantText.trim();
@@ -256,7 +335,14 @@ export function composeVisibleReply(assistantText: string, finishSummary?: strin
 }
 
 function extractAssistantText(messages: AgentMessage[]): string {
+  let currentTurnStart = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
+    if ((messages[i] as { role?: string }).role === "user") {
+      currentTurnStart = i;
+      break;
+    }
+  }
+  for (let i = messages.length - 1; i > currentTurnStart; i--) {
     const m = messages[i] as { role?: string; content?: unknown };
     if (m.role !== "assistant") continue;
     const content = m.content;
@@ -303,31 +389,28 @@ export async function runPiSessionTurn(
   const effects: SessionSideEffects = {};
   const selectionIds = (input.selectionBlockIds ?? []).filter(Boolean);
   const cascadeIds = (input.cascadeBlockIds ?? []).filter(Boolean);
-  const tools = createSessionTools(input.bridge, input.bag, drafts, comments, effects, {
-    harnessId: input.harnessId,
-    enforceProfile: true,
-    workspaceWriteApprovedPaths: explicitlyRequestedWorkspaceWritePaths(
-      input.workspaceWriteApprovalMessage ?? input.message,
+  const sourcePaths = [
+    ...new Set(
+      (input.sourcePaths ?? [])
+        .map((item) => item.trim().replace(/\\/g, "/").replace(/^\.\//, ""))
+        .filter(Boolean),
     ),
-    selectionBlockIds: selectionIds,
-    cascadeConfirmedIds: cascadeIds,
-    enforceCascadeGate: selectionIds.length > 0 || cascadeIds.length > 0,
-    cascadeUnlocked: cascadeIds.length > 0,
-    sourcePaths: input.sourcePaths,
-    evidenceCache: input.evidenceCache,
-    onEvidenceCacheChange: input.onEvidenceCacheChange,
-    remoteMcp: input.remoteMcp,
-    disabledSkills: input.disabledSkills,
+  ];
+  const evidenceCache = await freshEvidenceCache(
+    input.bridge,
+    input.evidenceCache ?? [],
+    sourcePaths,
+    input.onEvidenceCacheChange,
+  );
+  const cleanedMessages = stripDocumentInjections(input.messages ?? []);
+  const fullDocumentInjection = buildFullDocumentInjection({
+    blocks: input.bag.blocks,
+    revision: input.bag.revision,
+    relativePath: input.bag.relativePath,
   });
-  const steps: string[] = [];
 
-  const emit = (phase: string, tool?: string) => {
-    if (!isUserFacingPhase(phase)) return;
-    steps.push(phase);
-    input.onProgress?.({ phase, tool });
-  };
-  emit("正在思考…");
-
+  // Lean-side / full-mode shared prompt fragments (everything except documentContext,
+  // outline, and adjacent blocks) must count against the fit budget.
   const selection = input.selectionHint?.trim()
     ? `\n\n用户当前选区${selectionIds.length ? `（blockIds: ${selectionIds.join(", ")}）` : ""}：\n"""\n${input.selectionHint.trim().slice(0, selectionContextChars)}\n"""`
     : selectionIds.length
@@ -336,14 +419,6 @@ export async function runPiSessionTurn(
   const docHint = input.bag.relativePath
     ? `\n当前已打开：${input.bag.relativePath}（${input.bag.blocks.length} 段）`
     : "\n当前未打开文稿。";
-  const outlineHint =
-    input.bag.blocks.length > 0 ? formatOutlineHint(input.bag.blocks, tierPreset.outlineHeadings) : "";
-  const adjacentContext = buildSelectionAdjacentContext(
-    input.bag.blocks,
-    selectionIds,
-    tierPreset.adjacentBlocksPerSide,
-    tierPreset.adjacentBlockChars,
-  );
   const proposalHint = input.proposalHint?.trim()
     ? `\n\n${input.proposalHint.trim()}`
     : "";
@@ -361,13 +436,6 @@ export async function runPiSessionTurn(
     : isEditOrRewriteIntent(input.message) || selectionIds.length
       ? `\n\n[联动] 本轮涉及改稿；若需修订选区外段落，先走联动确认流程。${cascadeSkillHint}`
       : "";
-  const sourcePaths = [
-    ...new Set(
-      (input.sourcePaths ?? [])
-        .map((item) => item.trim().replace(/\\/g, "/").replace(/^\.\//, ""))
-        .filter(Boolean),
-    ),
-  ];
   const sourceSkillHint =
     getHarness(input.harnessId).skills.scope === "all"
       ? `可 load_skill("source-grounded-writing").`
@@ -376,15 +444,73 @@ export async function runPiSessionTurn(
     ? `\n\n[已挂资料，只读] ${sourcePaths.join("、")}。涉及资料的事实/引语须先 read_workspace_file 实际读取再起草；propose_block_edit / propose_text_patch 的 evidence 用 read_workspace_file 返回的 sourceRef 填写。${sourceSkillHint}`
     : "";
   const evidenceDirectory = buildEvidenceCacheDirectory(
-    input.evidenceCache ?? [],
+    evidenceCache,
     sourcePaths,
   );
-  const readthroughHint =
-    input.bag.blocks.length > 0 &&
-    /通读|通篇|从头到尾|全文阅读|结构分析|读一遍|读完整/.test(input.message)
-      ? "\n\n[通读策略] 先用 get_document_outline 建结构，再从 cursor 0:0 连续调用 read_document_blocks，并逐次使用 nextCursor，直到 hasMore=false；不得把抽样说成通读。不要用 read_workspace_file 按 offset 扫已打开文稿。输出清理后按 blockId/cursor 定点续读，完成覆盖后写可见结论并 finish_turn。"
-      : "";
-  const prompt = `${input.message}${docHint}${outlineHint}${proposalHint}${selection}${adjacentContext}${modeHint}${cascadeHint}${sourceHint}${evidenceDirectory ? `\n\n${evidenceDirectory}` : ""}${readthroughHint}`;
+  const turnOverheadChars = [
+    input.message,
+    docHint,
+    proposalHint,
+    selection,
+    modeHint,
+    cascadeHint,
+    sourceHint,
+    evidenceDirectory ? `\n\n${evidenceDirectory}` : "",
+  ].join("").length;
+
+  const contextWindow = typeof model.contextWindow === "number" && model.contextWindow > 0
+    ? model.contextWindow
+    : 0;
+  const modeState: { documentMode: DocumentMode } = {
+    documentMode: resolveDocumentMode({
+      tier: contextTier ?? "standard",
+      contextWindow,
+      documentInjectionChars: fullDocumentInjection.length,
+      transcriptChars: estimateTranscriptChars(cleanedMessages),
+      turnOverheadChars,
+      leanLocked: Boolean(input.documentModeLeanLock),
+    }),
+  };
+  const documentMode = modeState.documentMode;
+  const tools = createSessionTools(input.bridge, input.bag, drafts, comments, effects, {
+    harnessId: input.harnessId,
+    enforceProfile: true,
+    workspaceWriteApprovedPaths: explicitlyRequestedWorkspaceWritePaths(
+      input.workspaceWriteApprovalMessage ?? input.message,
+    ),
+    selectionBlockIds: selectionIds,
+    cascadeConfirmedIds: cascadeIds,
+    enforceCascadeGate: selectionIds.length > 0 || cascadeIds.length > 0,
+    cascadeUnlocked: cascadeIds.length > 0,
+    sourcePaths,
+    evidenceCache,
+    onEvidenceCacheChange: input.onEvidenceCacheChange,
+    remoteMcp: input.remoteMcp,
+    disabledSkills: input.disabledSkills,
+    documentModeState: modeState,
+  });
+  const steps: string[] = [];
+
+  const emit = (phase: string, tool?: string) => {
+    if (!isUserFacingPhase(phase)) return;
+    steps.push(phase);
+    input.onProgress?.({ phase, tool });
+  };
+  emit("正在思考…");
+
+  const outlineHint = modeState.documentMode === "lean" && input.bag.blocks.length > 0
+    ? formatOutlineHint(input.bag.blocks, tierPreset.outlineHeadings)
+    : "";
+  const adjacentContext = modeState.documentMode === "lean"
+    ? buildSelectionAdjacentContext(
+      input.bag.blocks,
+      selectionIds,
+      tierPreset.adjacentBlocksPerSide,
+      tierPreset.adjacentBlockChars,
+    )
+    : "";
+  const documentContext = modeState.documentMode === "full" ? fullDocumentInjection : "";
+  const prompt = `${input.message}${docHint}${outlineHint}${documentContext}${proposalHint}${selection}${adjacentContext}${modeHint}${cascadeHint}${sourceHint}${evidenceDirectory ? `\n\n${evidenceDirectory}` : ""}`;
   // Pi budgets the serialized message, where quotes and control characters
   // are escaped. Size that representation so an accepted current request is
   // never compacted merely because its raw string length looked smaller.
@@ -409,7 +535,7 @@ export async function runPiSessionTurn(
     prompt,
     systemPrompt: systemSkills.prompt,
     tools,
-    messages: input.messages,
+    messages: cleanedMessages,
     model,
     apiKey,
     sessionId: input.sessionId,
@@ -417,6 +543,8 @@ export async function runPiSessionTurn(
     usagePath: "pi-chat",
     maxTurns: maxTurns(profile.limits.maxTurns),
     timeoutMs: input.timeoutMs ?? timeoutMs(profile.limits.timeoutMs),
+    retryAttempts: input.retryAttempts,
+    retryDelayMs: input.retryDelayMs,
     maxContextMessages: tierPreset.contextMessages,
     maxContextChars: requestContextChars,
     toolCompactionFloor: tierPreset.compactionFloor,
@@ -429,11 +557,13 @@ export async function runPiSessionTurn(
     allowedToolNames: tools.map((tool) => tool.name),
     onProgress: emit,
     onDelta: input.onDelta,
+    onDeltaReset: input.onDeltaReset,
     signal: input.signal,
   });
   const recoverableLoopStop =
     result.outcome === "aborted" &&
     result.notes.some((note) => /stopped after (?:\d+ turns|repeated non-progress read)/.test(note));
+  const continuationRequired = recoverableLoopStop && !effects.documentSwitchOccurred;
   if (!recoverableLoopStop) {
     assertPiLoopCompleted(result, "pi session");
   }
@@ -443,11 +573,19 @@ export async function runPiSessionTurn(
   );
   let reply = composeVisibleReply(spoken, effects.finishSummary);
   if (recoverableLoopStop) {
-    const suffix =
-      "\n\n（本轮工具读取已停止。若要继续通读/分析，请直接回复「继续」；我会从已记录的 block/cursor 续接，不再整文重扫。）";
-    reply = reply.trim()
-      ? reply.trim() + suffix
-      : "本轮工具轮次已用尽，尚未写出结论。请回复「继续」，我会基于已读内容归纳。";
+    if (continuationRequired) {
+      const suffix =
+        "\n\n（本轮工具读取已停止。若要继续通读/分析，请直接回复「继续」；我会从已记录的 block/cursor 续接，不再整文重扫。）";
+      reply = reply.trim()
+        ? reply.trim() + suffix
+        : "本轮工具轮次已用尽，尚未写出结论。请回复「继续」，我会基于已读内容归纳。";
+    } else {
+      const suffix =
+        "\n\n（本轮曾切换文稿，旧文稿的读取位置已失效。请针对当前文稿重新提出任务。）";
+      reply = reply.trim()
+        ? reply.trim() + suffix
+        : "本轮曾切换文稿且工具读取已停止。请针对当前文稿重新提出任务。";
+    }
   }
   if (!reply) {
     if (effects.opened) {
@@ -473,20 +611,38 @@ export async function runPiSessionTurn(
     }
   }
 
+  const initialDocumentMode = documentMode;
+  const effectiveDocumentMode = modeState.documentMode;
+  const modeNotes = [...result.notes, documentModeNote(effectiveDocumentMode)];
+  let lockDocumentModeLean = Boolean(input.documentModeLeanLock);
+  if (initialDocumentMode === "full" && hadContextOverflow(result.notes)) {
+    modeNotes.push(documentModeOverflowDemotionNote());
+    lockDocumentModeLean = true;
+  }
+  if (effects.documentSwitchOccurred && initialDocumentMode === "full") {
+    modeState.documentMode = "lean";
+    modeNotes.push(documentModeSwitchDemotionNote());
+    lockDocumentModeLean = true;
+  }
+
   return {
     engine: "pi",
     reply,
-    messages: result.messages,
+    messages: stripDocumentInjections(result.messages),
     proposals: drafts,
     tableCellProposals: effects.tableCellProposals,
     comments,
     reviewChecklists: effects.reviewChecklists,
     steps,
     opened: effects.opened,
+    documentSwitchOccurred: effects.documentSwitchOccurred,
     written: effects.written,
     loadedSkills: effects.loadedSkills,
     cascadeOffer: effects.cascadeOffer,
-    notes: result.notes.length ? result.notes : undefined,
+    notes: modeNotes,
+    documentMode: modeState.documentMode,
+    documentModeLeanLock: lockDocumentModeLean || undefined,
+    continuationRequired: continuationRequired || undefined,
     toolAudit: result.toolAudit,
     workReport: buildWorkReport(effects, steps, drafts.length + (effects.tableCellProposals?.length ?? 0)),
   };
@@ -553,6 +709,7 @@ export async function runOfflineSessionTurn(
       steps,
       notes,
       workReport: buildWorkReport(effects, steps, partial.proposals.length + (partial.tableCellProposals?.length ?? 0)),
+      documentSwitchOccurred: effects.documentSwitchOccurred,
       ...partial,
       reply,
     };
@@ -729,6 +886,7 @@ export async function runOfflineSessionTurn(
         harnessId: input.harnessId,
         instruction,
         timeoutMs: input.timeoutMs,
+        signal: input.signal,
       });
       await call("propose_block_edit", {
         blockId: id,

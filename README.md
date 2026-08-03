@@ -1,7 +1,9 @@
 <p align="center"><img src="brand/logo.svg" width="120" alt="Margin logo"></p>
 <h1 align="center">Margin</h1>
 
-Margin 是一个在本地运行的文档修订 Agent，面向以 Word（.docx）写作的论文作者。
+Margin 是本地优先的文档修订 Agent，面向以 Word（.docx）写作的作者。
+
+模型只对具体选区提出修改提案；作者在画布上逐条 **Y / N / E**（接受 / 拒绝 / 编辑后接受）。只有被接受的提案才写入工作副本——原文不动，全过程留档，文稿不出本机。
 
 ## 解决的问题
 

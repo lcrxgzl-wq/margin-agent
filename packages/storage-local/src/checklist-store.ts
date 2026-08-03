@@ -151,6 +151,63 @@ export function listReviewChecklistHistory(
   });
 }
 
+function persistReviewChecklistRun(
+  ws: Workspace,
+  draft: ReviewChecklistRunDraft,
+): void {
+  ws.db.prepare(
+    `UPDATE review_checklist_runs SET status = 'superseded'
+     WHERE document_id = ? AND checker = ? AND status = 'active'`,
+  ).run(draft.run.documentId, draft.run.checker);
+  ws.db.prepare(
+    `INSERT INTO review_checklist_runs (
+      id, document_id, checker, disclaimer, status, created_at
+    ) VALUES (?, ?, ?, ?, 'active', ?)`,
+  ).run(
+    draft.run.id,
+    draft.run.documentId,
+    draft.run.checker,
+    draft.run.disclaimer,
+    draft.run.createdAt,
+  );
+  const insert = ws.db.prepare(
+    `INSERT INTO review_checklist_items (
+      id, run_id, document_id, block_id, issue_type, label, excerpt, detail,
+      severity, status, heuristic_only, verification, created_at, decided_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, NULL)`,
+  );
+  for (const item of draft.items) {
+    insert.run(
+      item.id,
+      item.runId,
+      item.documentId,
+      item.blockId,
+      item.issueType,
+      item.label,
+      item.excerpt,
+      item.detail,
+      item.severity,
+      item.heuristicOnly ? 1 : 0,
+      item.verification ?? null,
+      item.createdAt,
+    );
+  }
+}
+
+/** Persist a checklist using the transaction already owned by the caller. */
+export function saveReviewChecklistRunWithinTransaction(
+  ws: Workspace,
+  input: ReviewChecklistRunDraft,
+): ReviewChecklistRunDraft {
+  if (!ws.db.isTransaction) {
+    throw new ReviewChecklistValidationError("active transaction required");
+  }
+  initializeReviewChecklistStore(ws);
+  const draft = ReviewChecklistRunDraftSchema.parse(input);
+  persistReviewChecklistRun(ws, draft);
+  return draft;
+}
+
 export function saveReviewChecklistRun(
   ws: Workspace,
   input: ReviewChecklistRunDraft,
@@ -159,43 +216,7 @@ export function saveReviewChecklistRun(
   const draft = ReviewChecklistRunDraftSchema.parse(input);
   ws.db.prepare("BEGIN IMMEDIATE").run();
   try {
-    ws.db.prepare(
-      `UPDATE review_checklist_runs SET status = 'superseded'
-       WHERE document_id = ? AND checker = ? AND status = 'active'`,
-    ).run(draft.run.documentId, draft.run.checker);
-    ws.db.prepare(
-      `INSERT INTO review_checklist_runs (
-        id, document_id, checker, disclaimer, status, created_at
-      ) VALUES (?, ?, ?, ?, 'active', ?)`,
-    ).run(
-      draft.run.id,
-      draft.run.documentId,
-      draft.run.checker,
-      draft.run.disclaimer,
-      draft.run.createdAt,
-    );
-    const insert = ws.db.prepare(
-      `INSERT INTO review_checklist_items (
-        id, run_id, document_id, block_id, issue_type, label, excerpt, detail,
-        severity, status, heuristic_only, verification, created_at, decided_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, NULL)`,
-    );
-    for (const item of draft.items) {
-      insert.run(
-        item.id,
-        item.runId,
-        item.documentId,
-        item.blockId,
-        item.issueType,
-        item.label,
-        item.excerpt,
-        item.detail,
-        item.severity,
-        item.heuristicOnly ? 1 : 0,
-        item.verification ?? null,
-        item.createdAt,
-      );
-    }
+    persistReviewChecklistRun(ws, draft);
     ws.db.prepare("COMMIT").run();
   } catch (error) {
     try { ws.db.prepare("ROLLBACK").run(); } catch { /* ignore */ }

@@ -386,6 +386,7 @@ function upsertDocumentIndex(
         `UPDATE proposals SET status='superseded'
          WHERE document_id=? AND status IN ('draft', 'proposed', 'decided')`,
       ).run(id);
+      ws.db.prepare("DELETE FROM agent_comments WHERE document_id = ?").run(id);
       supersedeActiveReviewChecklists(ws, id);
     }
     ws.db.prepare("COMMIT").run();
@@ -403,12 +404,143 @@ export function openDocument(ws: Workspace, relativePath: string): DocumentMeta 
   const abs = assertInsideWorkspace(ws.root, relativePath);
   const canonicalRelativePath = visibleRelativePath(ws.root, abs);
   if (!fs.existsSync(abs)) throw new Error("file not found");
-  assertSingleLinkFile(abs);
-  assertDocumentFileSize(abs);
-  const raw = fs.readFileSync(abs, "utf8");
-  const hash = contentHash(raw.replace(/\r\n/g, "\n"));
-  const blocks = chunkMarkdown(raw);
-  return upsertDocumentIndex(ws, canonicalRelativePath, hash, blocks);
+  const snapshot = readStableMarkdownDocumentSnapshot(ws, canonicalRelativePath);
+  if (!snapshot) throw new Error("Markdown changed repeatedly while being opened");
+  return upsertDocumentIndex(
+    ws,
+    canonicalRelativePath,
+    snapshot.contentHash,
+    snapshot.blocks,
+  );
+}
+
+const MAX_STABLE_DOCUMENT_READ_ATTEMPTS = 3;
+
+type StableDocumentSnapshot = {
+  contentHash: string;
+  blocks: BlockSnapshot[];
+};
+
+function isMissingFileError(error: unknown): boolean {
+  const code = error && typeof error === "object" && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : "";
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+export function resolveRegisteredDocumentPath(ws: Workspace, relativePath: string): string {
+  const absolutePath = assertInsideWorkspace(ws.root, relativePath);
+  const visible = visibleRelativePath(ws.root, absolutePath);
+  const normalize = (value: string) => {
+    const normalized = value.replace(/\\/g, "/");
+    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  if (normalize(visible) !== normalize(relativePath)) {
+    throw new Error("registered document path target changed");
+  }
+  return absolutePath;
+}
+
+function readRegisteredDocumentBuffer(
+  ws: Workspace,
+  relativePath: string,
+): Buffer | undefined {
+  try {
+    const absolutePath = resolveRegisteredDocumentPath(ws, relativePath);
+    if (!fs.existsSync(absolutePath)) return undefined;
+    assertSingleLinkFile(absolutePath);
+    assertDocumentFileSize(absolutePath);
+    const buffer = fs.readFileSync(absolutePath);
+    const confirmedPath = resolveRegisteredDocumentPath(ws, relativePath);
+    if (!fs.existsSync(confirmedPath)) return undefined;
+    if (!samePathOrFile(absolutePath, confirmedPath)) {
+      throw new Error("registered document path target changed");
+    }
+    return buffer;
+  } catch (error) {
+    if (isMissingFileError(error)) return undefined;
+    throw error;
+  }
+}
+
+function registeredDocumentBufferHash(relativePath: string, buffer: Buffer): string {
+  return /\.docx$/i.test(relativePath)
+    ? docxContentHash(buffer)
+    : contentHash(buffer.toString("utf8").replace(/\r\n/g, "\n"));
+}
+
+function registeredDocumentFileMatchesSnapshot(
+  ws: Workspace,
+  relativePath: string,
+  expectedHash: string,
+): boolean {
+  const buffer = readRegisteredDocumentBuffer(ws, relativePath);
+  return buffer !== undefined &&
+    registeredDocumentBufferHash(relativePath, buffer) === expectedHash;
+}
+
+function readStableMarkdownDocumentSnapshot(
+  ws: Workspace,
+  relativePath: string,
+): StableDocumentSnapshot | undefined {
+  for (let attempt = 0; attempt < MAX_STABLE_DOCUMENT_READ_ATTEMPTS; attempt += 1) {
+    const buffer = readRegisteredDocumentBuffer(ws, relativePath);
+    if (!buffer) return undefined;
+    const snapshot: StableDocumentSnapshot = {
+      contentHash: registeredDocumentBufferHash(relativePath, buffer),
+      blocks: chunkMarkdown(buffer.toString("utf8")),
+    };
+    if (registeredDocumentFileMatchesSnapshot(ws, relativePath, snapshot.contentHash)) {
+      return snapshot;
+    }
+  }
+  return undefined;
+}
+
+async function readStableRegisteredDocumentSnapshot(
+  ws: Workspace,
+  relativePath: string,
+  firstBuffer?: Buffer,
+): Promise<StableDocumentSnapshot | undefined> {
+  const isDocx = /\.docx$/i.test(relativePath);
+  for (let attempt = 0; attempt < MAX_STABLE_DOCUMENT_READ_ATTEMPTS; attempt += 1) {
+    const buffer = attempt === 0 && firstBuffer !== undefined
+      ? firstBuffer
+      : readRegisteredDocumentBuffer(ws, relativePath);
+    if (!buffer) return undefined;
+    const snapshotHash = registeredDocumentBufferHash(relativePath, buffer);
+    let blocks: BlockSnapshot[];
+    try {
+      blocks = isDocx
+        ? await extractDocxBlocks(buffer)
+        : chunkMarkdown(buffer.toString("utf8"));
+    } catch (error) {
+      const latestBuffer = readRegisteredDocumentBuffer(ws, relativePath);
+      if (!latestBuffer) return undefined;
+      const latestHash = registeredDocumentBufferHash(relativePath, latestBuffer);
+      if (latestHash !== snapshotHash) {
+        if (attempt + 1 < MAX_STABLE_DOCUMENT_READ_ATTEMPTS) continue;
+        return undefined;
+      }
+      throw error;
+    }
+
+    const latestBuffer = readRegisteredDocumentBuffer(ws, relativePath);
+    if (!latestBuffer) return undefined;
+    const latestHash = registeredDocumentBufferHash(relativePath, latestBuffer);
+    if (latestHash === snapshotHash) return { contentHash: snapshotHash, blocks };
+  }
+  return undefined;
+}
+
+/** Hash a registered Markdown or DOCX file using the same semantics as its index. */
+export function readRegisteredDocumentContentHash(
+  ws: Workspace,
+  relativePath: string,
+): string {
+  const buffer = readRegisteredDocumentBuffer(ws, relativePath);
+  if (!buffer) throw new Error("file not found");
+  return registeredDocumentBufferHash(relativePath, buffer);
 }
 
 export async function openDocxDocument(ws: Workspace, relativePath: string): Promise<DocumentMeta> {
@@ -418,9 +550,38 @@ export async function openDocxDocument(ws: Workspace, relativePath: string): Pro
   if (!fs.existsSync(abs)) throw new Error("file not found");
   assertSingleLinkFile(abs);
   assertDocumentFileSize(abs);
-  const buffer = fs.readFileSync(abs);
-  const blocks = await extractDocxBlocks(buffer);
-  return upsertDocumentIndex(ws, canonicalRelativePath, docxContentHash(buffer), blocks);
+  const firstBuffer = readRegisteredDocumentBuffer(ws, canonicalRelativePath);
+  if (!firstBuffer) throw new Error("file not found");
+  const firstHash = docxContentHash(firstBuffer);
+  const existing = ws.db.prepare(
+    `SELECT id, revision, content_hash AS contentHash, updated_at AS updatedAt
+     FROM documents WHERE relative_path = ?`,
+  ).get(canonicalRelativePath) as
+    | Pick<DocumentMeta, "id" | "revision" | "contentHash" | "updatedAt">
+    | undefined;
+  if (
+    existing?.contentHash === firstHash &&
+    registeredDocumentFileMatchesSnapshot(ws, canonicalRelativePath, firstHash)
+  ) {
+    return { ...existing, relativePath: canonicalRelativePath };
+  }
+  const snapshot = await readStableRegisteredDocumentSnapshot(
+    ws,
+    canonicalRelativePath,
+    firstBuffer,
+  );
+  if (
+    !snapshot ||
+    !registeredDocumentFileMatchesSnapshot(ws, canonicalRelativePath, snapshot.contentHash)
+  ) {
+    throw new Error("DOCX changed repeatedly while being opened");
+  }
+  return upsertDocumentIndex(
+    ws,
+    canonicalRelativePath,
+    snapshot.contentHash,
+    snapshot.blocks,
+  );
 }
 
 export async function openDocumentFile(ws: Workspace, relativePath: string): Promise<DocumentMeta> {
@@ -434,7 +595,7 @@ export async function openDocumentFile(ws: Workspace, relativePath: string): Pro
 export function readNativeDocx(ws: Workspace, documentId: string): Buffer {
   const document = getDocument(ws, documentId);
   if (!/\.docx$/i.test(document.relativePath)) throw new Error("document is not DOCX");
-  const absolutePath = assertInsideWorkspace(ws.root, document.relativePath);
+  const absolutePath = resolveRegisteredDocumentPath(ws, document.relativePath);
   assertSingleLinkFile(absolutePath);
   assertDocumentFileSize(absolutePath);
   return fs.readFileSync(absolutePath);
@@ -521,6 +682,7 @@ function finalizeNativeSaveJournal(ws: Workspace, journal: NativeSaveJournal): v
       `UPDATE proposals SET status='superseded'
        WHERE document_id=? AND status IN ('draft', 'proposed', 'decided')`,
     ).run(journal.documentId);
+    ws.db.prepare("DELETE FROM agent_comments WHERE document_id = ?").run(journal.documentId);
     supersedeActiveReviewChecklists(ws, journal.documentId);
     deleteNativeSaveJournal(ws, journal.documentId);
     ws.db.prepare("COMMIT").run();
@@ -544,7 +706,7 @@ export async function recoverNativeSaveJournals(ws: Workspace): Promise<void> {
     ) {
       throw new Error("invalid native save journal");
     }
-    const absolutePath = resolveWorkspacePath(ws.root, journal.relativePath);
+    const absolutePath = resolveRegisteredDocumentPath(ws, journal.relativePath);
     if (!fs.existsSync(absolutePath)) {
       deleteNativeSaveJournal(ws, journal.documentId);
       continue;
@@ -592,7 +754,7 @@ async function saveNativeDocxOnce(
     throw new Error("DOCX file is too large (max 50 MiB)");
   }
 
-  const absolutePath = assertInsideWorkspace(ws.root, document.relativePath);
+  const absolutePath = resolveRegisteredDocumentPath(ws, document.relativePath);
   assertDocumentFileSize(absolutePath);
   const previousBuffer = fs.readFileSync(absolutePath);
   if (docxContentHash(previousBuffer) !== document.contentHash) {
@@ -672,49 +834,112 @@ async function saveNativeDocxOnce(
   };
 }
 
-/** Re-index DOCX files changed while the host was stopped or between file/DB commit. */
-export async function reconcileRegisteredDocxDocuments(ws: Workspace): Promise<number> {
-  const rows = ws.db.prepare(
-    `SELECT id, relative_path AS relativePath, revision, content_hash AS contentHash
-     FROM documents WHERE lower(relative_path) LIKE '%.docx'`,
-  ).all() as Array<Pick<DocumentMeta, "id" | "relativePath" | "revision" | "contentHash">>;
-  let reconciled = 0;
-  for (const document of rows) {
-    const absolutePath = assertInsideWorkspace(ws.root, document.relativePath);
-    if (!fs.existsSync(absolutePath)) continue;
-    assertDocumentFileSize(absolutePath);
-    const buffer = fs.readFileSync(absolutePath);
-    const diskHash = docxContentHash(buffer);
-    if (diskHash === document.contentHash) continue;
-    const blocks = await extractDocxBlocks(buffer);
-    if (!blocks.length) continue;
-    const nextRevision = document.revision + 1;
-    const now = new Date().toISOString();
-    ws.db.prepare("BEGIN IMMEDIATE").run();
-    try {
-      ws.db.prepare(`UPDATE documents SET revision=?, content_hash=?, updated_at=? WHERE id=?`)
-        .run(nextRevision, diskHash, now, document.id);
-      ws.db.prepare("DELETE FROM blocks WHERE document_id = ?").run(document.id);
-      const insert = ws.db.prepare(
-        `INSERT INTO blocks (document_id, id, kind, text, ord, content_hash)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      );
-      for (const block of blocks) {
-        insert.run(document.id, block.id, block.kind, block.text, block.order, block.contentHash);
+async function reconcileRegisteredDocument(ws: Workspace, documentId: string): Promise<boolean> {
+  return enqueueDocumentMutation(ws, documentId, async () => {
+    for (let attempt = 0; attempt < MAX_STABLE_DOCUMENT_READ_ATTEMPTS; attempt += 1) {
+      const document = ws.db.prepare(
+      `SELECT id, relative_path AS relativePath, revision, content_hash AS contentHash
+       FROM documents WHERE id = ?`,
+      ).get(documentId) as
+        | Pick<DocumentMeta, "id" | "relativePath" | "revision" | "contentHash">
+        | undefined;
+      if (!document || !/\.(docx|md|markdown)$/i.test(document.relativePath)) return false;
+
+      const firstBuffer = readRegisteredDocumentBuffer(ws, document.relativePath);
+      if (!firstBuffer) return false;
+      const firstHash = registeredDocumentBufferHash(document.relativePath, firstBuffer);
+      if (firstHash === document.contentHash) {
+        if (registeredDocumentFileMatchesSnapshot(
+          ws,
+          document.relativePath,
+          firstHash,
+        )) return false;
+        continue;
       }
-      ws.db.prepare(
-        `UPDATE proposals SET status='superseded'
-         WHERE document_id=? AND status IN ('draft', 'proposed', 'decided')`,
-      ).run(document.id);
-      supersedeActiveReviewChecklists(ws, document.id);
-      ws.db.prepare("COMMIT").run();
-      reconciled += 1;
-    } catch (error) {
-      try { ws.db.prepare("ROLLBACK").run(); } catch { /* ignore */ }
-      throw error;
+      const snapshot = await readStableRegisteredDocumentSnapshot(
+        ws,
+        document.relativePath,
+        firstBuffer,
+      );
+      if (!snapshot || snapshot.contentHash === document.contentHash) return false;
+      if (/\.docx$/i.test(document.relativePath) && !snapshot.blocks.length) return false;
+      if (!registeredDocumentFileMatchesSnapshot(
+        ws,
+        document.relativePath,
+        snapshot.contentHash,
+      )) continue;
+
+      const nextRevision = document.revision + 1;
+      const now = new Date().toISOString();
+      ws.db.prepare("BEGIN IMMEDIATE").run();
+      try {
+        const updated = ws.db.prepare(
+          `UPDATE documents SET revision=?, content_hash=?, updated_at=?
+           WHERE id=? AND revision=? AND content_hash=?`,
+        ).run(
+          nextRevision,
+          snapshot.contentHash,
+          now,
+          document.id,
+          document.revision,
+          document.contentHash,
+        );
+        if (Number(updated.changes ?? 0) !== 1) {
+          ws.db.prepare("ROLLBACK").run();
+          continue;
+        }
+        ws.db.prepare("DELETE FROM blocks WHERE document_id = ?").run(document.id);
+        const insert = ws.db.prepare(
+          `INSERT INTO blocks (document_id, id, kind, text, ord, content_hash)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        );
+        for (const block of snapshot.blocks) {
+          insert.run(document.id, block.id, block.kind, block.text, block.order, block.contentHash);
+        }
+        ws.db.prepare(
+          `UPDATE proposals SET status='superseded'
+           WHERE document_id=? AND status IN ('draft', 'proposed', 'decided')`,
+        ).run(document.id);
+        ws.db.prepare("DELETE FROM agent_comments WHERE document_id = ?").run(document.id);
+        supersedeActiveReviewChecklists(ws, document.id);
+        if (!registeredDocumentFileMatchesSnapshot(
+          ws,
+          document.relativePath,
+          snapshot.contentHash,
+        )) {
+          ws.db.prepare("ROLLBACK").run();
+          continue;
+        }
+        ws.db.prepare("COMMIT").run();
+        return true;
+      } catch (error) {
+        try { ws.db.prepare("ROLLBACK").run(); } catch { /* ignore */ }
+        throw error;
+      }
     }
+    return false;
+  });
+}
+
+/** Re-index registered Markdown and DOCX files changed while the host was stopped. */
+export async function reconcileRegisteredDocuments(ws: Workspace): Promise<number> {
+  const rows = ws.db.prepare(
+    `SELECT id FROM documents
+     WHERE lower(relative_path) LIKE '%.docx'
+        OR lower(relative_path) LIKE '%.md'
+        OR lower(relative_path) LIKE '%.markdown'
+     ORDER BY relative_path ASC`,
+  ).all() as Array<{ id: string }>;
+  let reconciled = 0;
+  for (const row of rows) {
+    if (await reconcileRegisteredDocument(ws, row.id)) reconciled += 1;
   }
   return reconciled;
+}
+
+/** Backward-compatible startup entry point; now reconciles every registered document. */
+export function reconcileRegisteredDocxDocuments(ws: Workspace): Promise<number> {
+  return reconcileRegisteredDocuments(ws);
 }
 
 /** Relative paths of documents registered in the review store (canonical). */
@@ -997,18 +1222,47 @@ export async function writeWorkspaceText(
   const rel = relativePath.replace(/\\/g, "/");
   if (!TEXT_EXT.test(rel)) throw new Error("only md/txt/json/csv can be written");
   if (rel.split("/").some((s) => s.startsWith("."))) throw new Error("hidden paths not allowed");
-  const abs = assertInsideWorkspace(ws.root, rel);
-  const canonicalRelativePath = visibleRelativePath(ws.root, abs);
-  assertSingleLinkFile(abs);
-  const created = !fs.existsSync(abs);
-  fs.mkdirSync(path.dirname(abs), { recursive: true });
-  const text = content.replace(/\r\n/g, "\n");
-  await writeFileAtomic(abs, text, "utf8");
-  return {
-    relativePath: canonicalRelativePath,
-    bytes: Buffer.byteLength(text, "utf8"),
-    created,
-  };
+  const initialPath = assertInsideWorkspace(ws.root, rel);
+  const mutationPath = process.platform === "win32" ? initialPath.toLowerCase() : initialPath;
+  return enqueueDocumentMutation(ws, `path:${mutationPath}`, () => {
+    const absolutePath = assertInsideWorkspace(ws.root, rel);
+    if (!samePathOrFile(initialPath, absolutePath)) {
+      throw new Error("workspace path target changed");
+    }
+    const canonicalRelativePath = visibleRelativePath(ws.root, absolutePath);
+    assertNotRegisteredDocumentWrite(ws, canonicalRelativePath);
+    assertSingleLinkFile(absolutePath);
+    const created = !fs.existsSync(absolutePath);
+    fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+
+    const confirmedPath = assertInsideWorkspace(ws.root, rel);
+    if (!samePathOrFile(absolutePath, confirmedPath)) {
+      throw new Error("workspace path target changed");
+    }
+    assertNotRegisteredDocumentWrite(ws, canonicalRelativePath);
+    const text = content.replace(/\r\n/g, "\n");
+    writeFileAtomic.sync(confirmedPath, text, {
+      encoding: "utf8",
+      tmpfileCreated: () => {
+        const latestPath = assertInsideWorkspace(ws.root, rel);
+        if (!samePathOrFile(confirmedPath, latestPath)) {
+          throw new Error("workspace path target changed");
+        }
+        assertNotRegisteredDocumentWrite(ws, canonicalRelativePath);
+        assertSingleLinkFile(latestPath);
+      },
+    });
+
+    const finalPath = assertInsideWorkspace(ws.root, rel);
+    if (!samePathOrFile(confirmedPath, finalPath)) {
+      throw new Error("workspace path target changed");
+    }
+    return {
+      relativePath: visibleRelativePath(ws.root, finalPath),
+      bytes: Buffer.byteLength(text, "utf8"),
+      created,
+    };
+  });
 }
 
 export async function importDocxDocument(

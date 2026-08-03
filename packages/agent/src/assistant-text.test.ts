@@ -25,6 +25,11 @@ describe("stripLiteralThinkingBlocks", () => {
     const text = "普通回答\nwith <other>literal markup</other> and symbols.";
     expect(stripLiteralThinkingBlocks(text)).toBe(text);
   });
+
+  it("does not shift source indexes when visible Unicode expands on lowercase", () => {
+    expect(stripLiteralThinkingBlocks("İ<thinking>private</thinking>Visible"))
+      .toBe("İVisible");
+  });
 });
 
 describe("LiteralThinkingBlockFilter", () => {
@@ -48,6 +53,16 @@ describe("LiteralThinkingBlockFilter", () => {
       + filter.finish();
 
     expect(visible).toBe("answer");
+  });
+
+  it("keeps Unicode boundaries stable when tags span chunks", () => {
+    const filter = new LiteralThinkingBlockFilter();
+    const visible = filter.push("İ<THI")
+      + filter.push("NKING>private</THINK")
+      + filter.push("ING>Visible")
+      + filter.finish();
+
+    expect(visible).toBe("İVisible");
   });
 
   it("preserves untagged text even when a chunk ends like a tag prefix", () => {

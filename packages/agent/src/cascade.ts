@@ -39,6 +39,8 @@ export type ProposeScope = {
   /** User already confirmed cascade this thread — skip re-scout for confirmed ids. */
   cascadeUnlocked?: boolean;
   gate?: CascadeGate;
+  /** Fit-first document injection mode; full skips outline/search scout ceremony. */
+  documentMode?: "full" | "lean";
 };
 
 export function isPrimaryProposeTarget(blockId: string, scope: ProposeScope): boolean {
@@ -51,8 +53,8 @@ export function isPrimaryProposeTarget(blockId: string, scope: ProposeScope): bo
 }
 
 /**
- * Host gate: primary/selection ok; out-of-scope needs outline+search and
- * cascadeConfirmedIds (or throws so the model offers candidates instead).
+ * Host gate: primary/selection ok; out-of-scope needs cascadeConfirmedIds
+ * (and outline+search scout when not in full documentMode).
  */
 export function assertCanProposeBlock(blockId: string, scope: ProposeScope): void {
   if (isPrimaryProposeTarget(blockId, scope)) return;
@@ -63,13 +65,16 @@ export function assertCanProposeBlock(blockId: string, scope: ProposeScope): voi
 
   const gate = scope.gate;
   const confirmed = new Set(scope.cascadeConfirmedIds ?? []);
+  const fullMode = scope.documentMode === "full";
 
   if (!confirmed.has(blockId)) {
     throw new Error(
-      `选区外提案被拒绝（${blockId}）。请先 get_document_outline + search_blocks，用 offer_cascade 列出相关段，等用户确认「一并改」后再对该 blockId 调用 propose_*。`,
+      fullMode
+        ? `选区外提案被拒绝（${blockId}）。请用 offer_cascade 列出相关段，等用户确认「一并改」后再对该 blockId 调用 propose_*。`
+        : `选区外提案被拒绝（${blockId}）。请先 get_document_outline + search_blocks，用 offer_cascade 列出相关段，等用户确认「一并改」后再对该 blockId 调用 propose_*。`,
     );
   }
-  if (!scope.cascadeUnlocked && (!gate?.outlineCalled || !gate?.searchCalled)) {
+  if (!scope.cascadeUnlocked && !fullMode && (!gate?.outlineCalled || !gate?.searchCalled)) {
     throw new Error(
       `联动提案前须先调用 get_document_outline 与 search_blocks（${blockId}）。`,
     );

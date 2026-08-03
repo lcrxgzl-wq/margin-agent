@@ -165,6 +165,8 @@ export type SkillSummary = {
 export type AgentTask = {
   objective: string;
   status: "running" | "completed" | "interrupted";
+  documentId?: string;
+  documentRevision?: number;
   currentStep?: string;
   sourcePaths: string[];
   sourceRefs: string[];
@@ -295,10 +297,12 @@ export async function decideReviewChecklist(
 export async function translateSelection(
   text: string,
   targetLanguage: "zh-CN" | "en",
+  signal?: AbortSignal,
 ) {
   return api<{ translation: string }>("/api/v1/translate", {
     method: "POST",
     body: JSON.stringify({ text, targetLanguage }),
+    signal,
   });
 }
 
@@ -364,6 +368,10 @@ export type LlmSettingsPublic = {
   reasoningMode?: ReasoningMode;
   /** Pi session timeout in ms; absent means the profile default applies. */
   agentTimeoutMs?: number;
+  /** Total provider attempts; absent means the default (5) applies. */
+  retryAttempts?: number;
+  /** Delay between provider attempts in ms; absent means the default (30s) applies. */
+  retryDelayMs?: number;
   /** Custom inline selection cap; absent means the context tier applies. */
   selectionContextChars?: number;
   /** Context budget tier; absent means the standard tier applies. */
@@ -410,6 +418,8 @@ export async function saveLlmSettings(body: {
   reasoningOptIn?: boolean;
   reasoningMode?: ReasoningMode | null;
   agentTimeoutMs?: number | null;
+  retryAttempts?: number | null;
+  retryDelayMs?: number | null;
   selectionContextChars?: number | null;
   contextTier?: ContextTier | null;
   compactionAuto?: boolean | null;
@@ -734,6 +744,8 @@ export async function chatTurn(body: {
 }) {
   return api<{
     reply: string;
+    conversationReset?: boolean;
+    context?: SessionContextUsage;
     closed?: boolean;
     runId?: string;
     sourcePaths?: string[];
@@ -753,6 +765,7 @@ export async function chatTurn(body: {
 export type ChatStreamEvent =
   | { type: "status"; text: string }
   | { type: "delta"; text: string }
+  | { type: "replace"; text: string }
   | { type: "run"; runId: string }
   | {
       type: "approval_request";
@@ -764,6 +777,8 @@ export type ChatStreamEvent =
   | {
       type: "done";
       reply: string;
+      conversationReset?: boolean;
+      context?: SessionContextUsage;
       runId?: string;
       opened?: { document: DocumentMeta; blocks: Block[] };
       engine?: string;
@@ -781,6 +796,7 @@ export type ChatStreamEvent =
 /** NDJSON chat stream with status/delta/done. */
 export async function chatStream(
   body: {
+    requestId?: string;
     message: string;
     documentId?: string;
     selectionBlockIds?: string[];
@@ -812,7 +828,6 @@ export async function chatStream(
   const reader = r.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
-  let lastDone: Extract<ChatStreamEvent, { type: "done" }> | null = null;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -824,18 +839,20 @@ export async function chatStream(
       if (!t) continue;
       const ev = JSON.parse(t) as ChatStreamEvent;
       onEvent(ev);
-      if (ev.type === "done") lastDone = ev;
+      if (ev.type === "done") {
+        void reader.cancel().catch(() => undefined);
+        return ev;
+      }
       if (ev.type === "error") throw new Error(ev.error);
     }
   }
   if (buf.trim()) {
     const ev = JSON.parse(buf.trim()) as ChatStreamEvent;
     onEvent(ev);
-    if (ev.type === "done") lastDone = ev;
+    if (ev.type === "done") return ev;
     if (ev.type === "error") throw new Error(ev.error);
   }
-  if (!lastDone) throw new Error("chat stream ended without done");
-  return lastDone;
+  throw new Error("chat stream ended without done");
 }
 
 /** One-use decision for a pending remote MCP approval (404 unknown / 410 expired). */
@@ -867,12 +884,19 @@ export function displayText(block: Block): string {
 }
 
 /** GET /api/v1/session payload — shared by boot hydrate and session new/switch. */
+export type SessionContextUsage = {
+  contextWindowTokens: number;
+  usedTokens: number;
+  usageEstimated: boolean;
+};
+
 export type SessionSnapshot = {
   llm?: LlmSettingsPublic;
   llmMode?: "mock" | "byok";
   clarificationRounds?: number;
   sourcePaths?: string[];
   task?: AgentTask;
+  context?: SessionContextUsage;
   opened?: { document: DocumentMeta; blocks: Block[] };
   chat?: {
     turns: Array<{ role: "user" | "assistant" | "system"; text: string; threadId?: string }>;

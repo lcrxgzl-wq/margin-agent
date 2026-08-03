@@ -37,6 +37,7 @@ import type { CanvasFocusRequest } from "./components/canvasTypes";
 import { clampFloatRect, defaultFloatRect, type FloatRect } from "./layoutGeometry";
 import { MarginStoreProvider, useMarginStore, type ReviewThread, type SelectionInput, type ThreadAnchor } from "./store";
 import { useWorkspaceActions } from "./useWorkspaceActions";
+import { executableChatRetry } from "./chatRetry";
 import { polishIntent, translationIntent } from "./selectionEditIntent";
 import { selectionEditUnavailableReason } from "./selectionSafety";
 import { clearChatAfterDirectDocumentOpen, resyncChatAfterAgentDocumentOpen } from "./documentChatSync";
@@ -46,11 +47,14 @@ import {
   shouldPreserveDirtyDocumentOnImport,
 } from "./documentSafety";
 import {
+  openThreadSelectionDisposition,
   proposalMatchesSelection,
   sameSelectionIdentity,
+  sameTranslationSelectionIdentity,
   selectionAnchorAlive,
   selectionOwnedByOpenThread,
   selectionClearlyDivergedFromThread,
+  shouldCancelTranslationForSelectionEvent,
 } from "./selectionIdentity";
 
 const Canvas = lazy(() =>
@@ -130,9 +134,15 @@ function Workspace() {
   const [selectionClearToken, setSelectionClearToken] = useState(0);
   const [translation, setTranslation] = useState<TranslationState | null>(null);
   const translationRequestRef = useRef(0);
-  const clearSelectionEverywhere = () => {
+  const translationAbortRef = useRef<AbortController | null>(null);
+  const cancelTranslation = useCallback(() => {
     translationRequestRef.current += 1;
+    translationAbortRef.current?.abort();
+    translationAbortRef.current = null;
     setTranslation(null);
+  }, []);
+  const clearSelectionEverywhere = () => {
+    cancelTranslation();
     store.clearSelection();
     setSelectionClearToken((value) => value + 1);
   };
@@ -141,6 +151,15 @@ function Workspace() {
   useEffect(() => {
     setSidecarActivity("chat");
   }, [store.doc?.id]);
+  useEffect(() => {
+    cancelTranslation();
+  }, [store.doc?.id, store.doc?.revision, cancelTranslation]);
+  useEffect(() => () => {
+    translationRequestRef.current += 1;
+    const controller = translationAbortRef.current;
+    translationAbortRef.current = null;
+    controller?.abort();
+  }, []);
   useEffect(() => localStorage.setItem("margin_dock_width", String(dockWidth)), [dockWidth]);
   useEffect(() => {
     const persist = window.setTimeout(() => {
@@ -256,6 +275,7 @@ function Workspace() {
     opts?: { keepEmptyMessages?: boolean },
   ) => {
     if (session.llm) storeRef.current.setLlm(session.llm);
+    storeRef.current.setContextUsage(session.context ?? null);
     if (typeof session.clarificationRounds === "number") {
       storeRef.current.setClarificationRounds(session.clarificationRounds);
     }
@@ -455,6 +475,19 @@ function Workspace() {
     : undefined;
   const activeThread = store.threads.find((thread) => thread.id === store.activeThreadId) ?? null;
   const popoverOpen = Boolean(activeDocument && activeThread && !activeThread.collapsed);
+  const threadRetry = activeThread && !store.busy
+    ? executableChatRetry({
+        messages: store.messages,
+        currentDocument: activeDocument
+          ? { id: activeDocument.id, revision: activeDocument.revision }
+          : undefined,
+        documentDirty: store.documentDirty,
+        currentThreadIds: store.threads.map((thread) => thread.id),
+      })
+    : null;
+  const threadRetryMessageId = threadRetry && threadRetry.threadId === activeThread?.id
+    ? threadRetry.errorMessageId
+    : undefined;
   const revealThread = (thread: ReviewThread) => {
     // The popover owns this selection's review actions; keep the sidecar on
     // the global conversation so the same proposal never has two action surfaces.
@@ -508,7 +541,7 @@ function Workspace() {
     const sameSelection = Boolean(
       current.selection.blockId &&
       selection.blockId &&
-      sameSelectionIdentity({
+      sameTranslationSelectionIdentity({
         blockId: current.selection.blockId,
         selectionText: current.selection.text,
         selectionStart: current.selection.selectionStart,
@@ -522,18 +555,21 @@ function Workspace() {
         tableCell: selection.tableCell,
       }),
     );
-    if (!sameSelection && (userInitiated || !selection.anchor || !selection.text.trim())) {
-      translationRequestRef.current += 1;
-      setTranslation(null);
-    }
     const openThread = current.activeThreadId
       ? current.threads.find((candidate) => candidate.id === current.activeThreadId)
       : null;
-    if (
-      openThread &&
-      !openThread.collapsed &&
-      (programmaticThreadId === openThread.id || !userInitiated)
-    ) {
+    const threadDisposition = openThread && !openThread.collapsed
+      ? openThreadSelectionDisposition(openThread, {
+          ...selection,
+          programmaticThreadId,
+          userInitiated,
+        })
+      : "selection";
+    if (threadDisposition === "ignore") return;
+    if (shouldCancelTranslationForSelectionEvent(sameSelection, threadDisposition)) {
+      cancelTranslation();
+    }
+    if (openThread && threadDisposition === "thread") {
       current.setSelection({
         blockId: openThread.anchor.blockId,
         blockIds: openThread.anchor.blockIds,
@@ -569,7 +605,7 @@ function Workspace() {
       }),
     );
     if (thread) current.updateThreadPosition(thread.id, selection.anchor);
-  }, []);
+  }, [cancelTranslation]);
 
   const startTranslation = useCallback(() => {
     const current = storeRef.current;
@@ -577,10 +613,13 @@ function Workspace() {
     const source = current.selection.rawText ?? current.selection.text;
     if (!anchor || !source.trim()) return;
     current.setMenu(null);
+    translationAbortRef.current?.abort();
+    const controller = new AbortController();
+    translationAbortRef.current = controller;
     const requestId = ++translationRequestRef.current;
     const target = translationIntent(source).targetLanguage ?? "zh-CN";
     setTranslation({ anchor: { ...anchor }, source, status: "loading" });
-    void translateSelection(source, target)
+    void translateSelection(source, target, controller.signal)
       .then((data) => {
         if (translationRequestRef.current !== requestId) return;
         setTranslation({
@@ -598,6 +637,11 @@ function Workspace() {
           status: "error",
           error: reason instanceof Error ? reason.message : String(reason),
         });
+      })
+      .finally(() => {
+        if (translationRequestRef.current === requestId && translationAbortRef.current === controller) {
+          translationAbortRef.current = null;
+        }
       });
   }, []);
 
@@ -761,7 +805,9 @@ function Workspace() {
         docTitle={title || undefined}
         documentPath={activeDocument?.relativePath}
         documentId={activeDocument?.id}
+        documentRevision={activeDocument?.revision}
         llmMode={store.llm?.llmMode ?? (store.llm?.provider?.apiKeySet ? "byok" : "mock")}
+        contextUsage={store.contextUsage}
         selectionHint={
           (store.selection.rawText ?? store.selection.text).trim()
             ? (store.selection.rawText ?? store.selection.text).trim().slice(0, 48) + ((store.selection.rawText ?? store.selection.text).length > 48 ? "…" : "")
@@ -780,6 +826,7 @@ function Workspace() {
         onSend={actions.onSend}
         onCancel={actions.canCancel ? actions.cancelCurrentRun : undefined}
         onContinueTask={() => void actions.onSend("继续").catch(actions.messageError)}
+        onRetryChat={(errorMessageId) => void actions.onRetryChat(errorMessageId)}
         onOpenSettings={() => store.setSettingsOpen(true)}
         onOpenSessions={() => setSessionsOpen(true)}
         onOpenDocx={() => setDocxPickerOpen(true)}
@@ -843,6 +890,9 @@ function Workspace() {
         onClose={() => store.setSettingsOpen(false)}
         onSaved={(settings) => {
           store.setLlm(settings);
+          void getSession()
+            .then((session) => storeRef.current.setContextUsage(session.context ?? null))
+            .catch(() => storeRef.current.setContextUsage(null));
         }}
       />
       <SessionMenu
@@ -998,8 +1048,7 @@ function Workspace() {
           actions.dispatchSelection("discuss", store.selection.blockId, store.selection.text, undefined, store.selection.selectionStart, undefined, undefined, store.selection.tableCell, store.selection.blockIds, store.selection.crossTableCells, store.selection.selectionRanges);
         }}
         onMore={() => {
-          translationRequestRef.current += 1;
-          setTranslation(null);
+          cancelTranslation();
           store.setMenu({
             x: store.selection.anchor?.x ?? window.innerWidth / 2,
             y: (store.selection.anchor?.y ?? 120) + 8,
@@ -1016,10 +1065,7 @@ function Workspace() {
       {translation ? (
         <TranslationPopover
           translation={translation}
-          onClose={() => {
-            translationRequestRef.current += 1;
-            setTranslation(null);
-          }}
+          onClose={cancelTranslation}
         />
       ) : null}
       {popoverOpen && activeThread ? (
@@ -1031,6 +1077,7 @@ function Workspace() {
           )}
           comments={store.comments.filter((comment) => comment.blockId === activeThread.anchor.blockId)}
           messages={store.messages.filter((message) => message.threadId === activeThread.id)}
+          retryMessageId={threadRetryMessageId}
           busy={store.busy}
           statusLine={store.statusLine}
           dirty={store.documentDirty}
@@ -1048,6 +1095,7 @@ function Workspace() {
               },
             }).catch(actions.messageError)
           }
+          onRetry={(messageId) => void actions.onRetryChat(messageId)}
           onAccept={async (proposalId) => {
             const wasLast = storeRef.current.proposals.filter(
               (proposal) => proposalMatchesSelection(proposal, activeThread.anchor),

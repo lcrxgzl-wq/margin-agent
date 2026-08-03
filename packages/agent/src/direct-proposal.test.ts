@@ -186,6 +186,40 @@ describe("direct proposal completion", () => {
     expect(budgets).toEqual([8_192, 16_384]);
   });
 
+  it("rejects a direct proposal explicitly truncated by the provider", async () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_API_KEY = "test-key";
+    const recorded: ModelUsageEntry[] = [];
+    configureRequestPolicy({ onUsage: (entry) => recorded.push(entry) });
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      choices: [{
+        finish_reason: "length",
+        message: { content: JSON.stringify({
+          blockId: "b1",
+          after: "Partial revision.",
+          rationale: "Incomplete.",
+          risk: "language",
+          evidence: [],
+        }) },
+      }],
+      usage: { prompt_tokens: 120, completion_tokens: 4096 },
+    })));
+
+    try {
+      await expect(generateDirectProposal({ block }))
+        .rejects.toThrow(/truncated.*token limit/i);
+      expect(recorded).toEqual([
+        expect.objectContaining({
+          path: "quick-edit",
+          input: 120,
+          output: 4096,
+        }),
+      ]);
+    } finally {
+      configureRequestPolicy({ onUsage: undefined });
+    }
+  });
+
   it("sends an OpenAI system message first, policy headers, and records usage", async () => {
     process.env.MARGIN_API_FORMAT = "openai";
     process.env.MARGIN_BASE_URL = "https://provider.test/v1";

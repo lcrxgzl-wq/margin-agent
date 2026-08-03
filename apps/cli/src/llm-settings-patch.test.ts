@@ -208,6 +208,29 @@ describe("reasoning fields", () => {
     ).rejects.toThrow(/agentTimeoutMs|超时/);
   });
 
+  it("threads, persists, and clears transient retry settings", async () => {
+    const before = activeProfile(readLlmSettingsStore(root));
+    const update = buildLlmSettingsUpdate(
+      { retryAttempts: 6, retryDelayMs: 45_000 },
+      before.id,
+    );
+    expect(update).toMatchObject({ retryAttempts: 6, retryDelayMs: 45_000 });
+    expect(update.provider).toBeUndefined();
+
+    await saveLlmSettings(root, update);
+    expect(readLlmSettingsStore(root)).toMatchObject({
+      retryAttempts: 6,
+      retryDelayMs: 45_000,
+    });
+
+    await saveLlmSettings(
+      root,
+      buildLlmSettingsUpdate({ retryAttempts: null, retryDelayMs: null }, before.id),
+    );
+    expect(readLlmSettingsStore(root).retryAttempts).toBeUndefined();
+    expect(readLlmSettingsStore(root).retryDelayMs).toBeUndefined();
+  });
+
   it("threads a custom selection cap without touching the provider patch", () => {
     const update = buildLlmSettingsUpdate({ selectionContextChars: 64_000 }, "custom");
     expect(update.selectionContextChars).toBe(64_000);

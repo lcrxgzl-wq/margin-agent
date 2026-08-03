@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { type Proposal } from "@margin/domain";
+import { type Proposal, type ReviewChecklistRunDraft } from "@margin/domain";
 import {
   Document,
   Packer,
@@ -15,7 +15,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyApproved,
   getDocument,
+  listActiveReviewChecklists,
   listBlocks,
+  listComments,
   listDocumentTimeline,
   openDocxDocument,
   openWorkspace,
@@ -23,9 +25,11 @@ import {
   recoverDecidedProposals,
   recoverNativeSaveJournals,
   reconcileRegisteredDocxDocuments,
+  replaceDocumentComments,
   saveDecision,
   saveNativeDocx,
   saveProposal,
+  saveReviewChecklistRun,
   type Workspace,
 } from "./index.js";
 import { docxContentHash, extractDocxBlocks, readDocxXml } from "./office-docx.js";
@@ -124,6 +128,29 @@ describe("native DOCX storage", () => {
     expect(listBlocks(workspace, document.id)[0]?.text).toBe("Human wins the queue");
   });
 
+  it("rejects a human save when the registered DOCX is retargeted through a symlink", async () => {
+    const { root, workspace, document } = await testWorkspace();
+    const registeredPath = path.join(root, "paper.docx");
+    const originalTarget = path.join(root, "paper-original.docx");
+    const replacementTarget = path.join(root, "paper-replacement.docx");
+    const originalBuffer = fs.readFileSync(registeredPath);
+    fs.renameSync(registeredPath, originalTarget);
+    fs.writeFileSync(replacementTarget, originalBuffer);
+    fs.symlinkSync(replacementTarget, registeredPath, "file");
+
+    await expect(saveNativeDocx(
+      workspace,
+      document.id,
+      document.revision,
+      document.contentHash,
+      await docxFixture("Must not be written"),
+    )).rejects.toThrow("registered document path target changed");
+
+    expect(fs.readFileSync(replacementTarget).equals(originalBuffer)).toBe(true);
+    expect(getDocument(workspace, document.id)).toEqual(document);
+    expect(fs.readdirSync(path.join(root, ".margin", "backups"))).toEqual([]);
+  });
+
   it("does not overwrite an external edit made while preparing a human save", async () => {
     const { root, workspace, document } = await testWorkspace();
     const documentPath = path.join(root, "paper.docx");
@@ -179,6 +206,130 @@ describe("native DOCX storage", () => {
     expect(getDocument(workspace, document.id)).toEqual(document);
   });
 
+  it("rejects Agent apply when the registered DOCX is retargeted through a symlink", async () => {
+    const { root, workspace, document, blocks } = await testWorkspace();
+    const pending = proposal(document.id, blocks[0]!);
+    saveProposal(workspace, pending);
+    saveDecision(workspace, pending.id, "Y");
+    const registeredPath = path.join(root, "paper.docx");
+    const originalTarget = path.join(root, "paper-original.docx");
+    const replacementTarget = path.join(root, "paper-replacement.docx");
+    const originalBuffer = fs.readFileSync(registeredPath);
+    fs.renameSync(registeredPath, originalTarget);
+    fs.writeFileSync(replacementTarget, originalBuffer);
+    fs.symlinkSync(replacementTarget, registeredPath, "file");
+
+    await expect(applyApproved(
+      workspace,
+      document.id,
+      document.revision,
+      document.contentHash,
+    )).rejects.toThrow("registered document path target changed");
+
+    expect(fs.readFileSync(replacementTarget).equals(originalBuffer)).toBe(true);
+    expect(getDocument(workspace, document.id)).toEqual(document);
+    expect(workspace.db.prepare("SELECT status FROM proposals WHERE id = ?").get(pending.id))
+      .toEqual({ status: "decided" });
+    expect(fs.readdirSync(path.join(root, ".margin", "backups"))).toEqual([]);
+  });
+
+  it("retries opening a DOCX that changes while its first snapshot is parsed", async () => {
+    const { root, workspace, document } = await testWorkspace();
+    const documentPath = path.join(root, "paper.docx");
+    const intermediate = await docxFixture("Intermediate open snapshot");
+    const latest = await docxFixture("Latest open snapshot");
+    fs.writeFileSync(documentPath, intermediate);
+    const originalRead = fs.readFileSync.bind(fs);
+    let documentReads = 0;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (String(file) === documentPath && ++documentReads === 2) {
+        fs.writeFileSync(documentPath, latest);
+      }
+      return originalRead(file, options as never);
+    }) as typeof fs.readFileSync);
+
+    const reopened = await openDocxDocument(workspace, "paper.docx");
+
+    expect(documentReads).toBe(5);
+    expect(reopened).toMatchObject({
+      id: document.id,
+      revision: document.revision + 1,
+      contentHash: docxContentHash(latest),
+    });
+    expect(listBlocks(workspace, document.id)[0]?.text).toBe("Latest open snapshot");
+  });
+
+  it("does not parse an unchanged registered DOCX", async () => {
+    const { root, workspace, document, blocks } = await testWorkspace();
+    const documentPath = path.join(root, "paper.docx");
+    const invalidDocx = Buffer.from("deliberately invalid DOCX bytes");
+    const invalidHash = docxContentHash(invalidDocx);
+    fs.writeFileSync(documentPath, invalidDocx);
+    workspace.db.prepare(
+      "UPDATE documents SET content_hash = ? WHERE id = ?",
+    ).run(invalidHash, document.id);
+
+    await expect(openDocxDocument(workspace, "paper.docx")).resolves.toMatchObject({
+      id: document.id,
+      revision: document.revision,
+      contentHash: invalidHash,
+    });
+    await expect(reconcileRegisteredDocxDocuments(workspace)).resolves.toBe(0);
+    expect(listBlocks(workspace, document.id)).toEqual(blocks);
+  });
+
+  it("retries reconciliation when a DOCX changes during parsing", async () => {
+    const { root, workspace, document } = await testWorkspace();
+    const documentPath = path.join(root, "paper.docx");
+    const intermediate = await docxFixture("Intermediate snapshot");
+    const latest = await docxFixture("Latest reconcile snapshot");
+    fs.writeFileSync(documentPath, intermediate);
+    const originalRead = fs.readFileSync.bind(fs);
+    let documentReads = 0;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (String(file) === documentPath && ++documentReads === 3) {
+        fs.writeFileSync(documentPath, latest);
+      }
+      return originalRead(file, options as never);
+    }) as typeof fs.readFileSync);
+
+    await expect(reconcileRegisteredDocxDocuments(workspace)).resolves.toBe(1);
+
+    expect(documentReads).toBe(7);
+    expect(getDocument(workspace, document.id)).toMatchObject({
+      revision: document.revision + 1,
+      contentHash: docxContentHash(latest),
+    });
+    expect(listBlocks(workspace, document.id)[0]?.text).toBe("Latest reconcile snapshot");
+  });
+
+  it("skips reconciliation when a DOCX never reaches a stable snapshot", async () => {
+    const { root, workspace, document, blocks } = await testWorkspace();
+    const documentPath = path.join(root, "paper.docx");
+    const first = await docxFixture("Changing snapshot A");
+    const second = await docxFixture("Changing snapshot B");
+    fs.writeFileSync(documentPath, first);
+    const originalRead = fs.readFileSync.bind(fs);
+    let documentReads = 0;
+    let writeSecond = true;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (String(file) === documentPath) {
+        documentReads += 1;
+        if (documentReads >= 3 && documentReads % 2 === 1) {
+          fs.writeFileSync(documentPath, writeSecond ? second : first);
+          writeSecond = !writeSecond;
+        }
+      }
+      return originalRead(file, options as never);
+    }) as typeof fs.readFileSync);
+
+    await expect(reconcileRegisteredDocxDocuments(workspace)).resolves.toBe(0);
+
+    expect(documentReads).toBe(9);
+    expect(getDocument(workspace, document.id)).toEqual(document);
+    expect(listBlocks(workspace, document.id)).toEqual(blocks);
+  });
+
   it("rejects an oversized registered DOCX before parsing or reconciling it", async () => {
     const { root, workspace, document } = await testWorkspace();
     const largePath = path.join(root, "paper.docx");
@@ -192,6 +343,14 @@ describe("native DOCX storage", () => {
   it("saves a paragraph-only human edit by patching the original OOXML", async () => {
     const { root, workspace, document, blocks: beforeBlocks } = await testWorkspace();
     const edited = await docxFixture("Human edit");
+    replaceDocumentComments(workspace, document.id, [{
+      id: "comment-before-native-save",
+      blockId: beforeBlocks[0]!.id,
+      text: "stale after save",
+      severity: "info",
+      runId: "scan-before-native-save",
+      source: "test",
+    }]);
 
     const result = await saveNativeDocx(
       workspace,
@@ -211,6 +370,7 @@ describe("native DOCX storage", () => {
     expect(beforeBlocks[0]?.id).toMatch(/^ooxml-p-0-/);
     expect(result.blocks[0]?.id).toMatch(/^ooxml-p-0-/);
     expect(fs.readdirSync(path.join(root, ".margin", "backups"))).toHaveLength(1);
+    expect(listComments(workspace, document.id)).toEqual([]);
     await expect(saveNativeDocx(
       workspace,
       document.id,
@@ -308,6 +468,14 @@ describe("native DOCX storage", () => {
     const { root, workspace, document, blocks } = await testWorkspace();
     const pending = proposal(document.id, blocks[0]!);
     saveProposal(workspace, pending);
+    replaceDocumentComments(workspace, document.id, [{
+      id: "comment-before-reconcile",
+      blockId: blocks[0]!.id,
+      text: "stale after reconcile",
+      severity: "info",
+      runId: "scan-before-reconcile",
+      source: "test",
+    }]);
     fs.writeFileSync(path.join(root, "paper.docx"), await docxFixture("Recovered edit"));
 
     await expect(reconcileRegisteredDocxDocuments(workspace)).resolves.toBe(1);
@@ -315,6 +483,113 @@ describe("native DOCX storage", () => {
     expect(listBlocks(workspace, document.id)[0]?.text).toBe("Recovered edit");
     expect(workspace.db.prepare("SELECT status FROM proposals WHERE id = ?")
       .get(pending.id)).toEqual({ status: "superseded" });
+    expect(listComments(workspace, document.id)).toEqual([]);
+  });
+
+  it("rolls back and retries reconciliation when the DOCX changes before commit", async () => {
+    const { root, workspace, document, blocks } = await testWorkspace();
+    const pending = proposal(document.id, blocks[0]!);
+    saveProposal(workspace, pending);
+    replaceDocumentComments(workspace, document.id, [{
+      id: "comment-before-reconcile-commit",
+      blockId: blocks[0]!.id,
+      text: "must survive a rolled-back reconcile",
+      severity: "info",
+      runId: "scan-before-reconcile-commit",
+      source: "test",
+    }]);
+    const checklist: ReviewChecklistRunDraft = {
+      run: {
+        schemaVersion: 1,
+        id: "checklist-before-reconcile-commit",
+        documentId: document.id,
+        checker: "cite_check",
+        disclaimer: "Heuristic citation check.",
+        status: "active",
+        createdAt: "2026-08-01T00:00:01.000Z",
+      },
+      items: [{
+        schemaVersion: 1,
+        id: "checklist-item-before-reconcile-commit",
+        runId: "checklist-before-reconcile-commit",
+        documentId: document.id,
+        blockId: blocks[0]!.id,
+        issueType: "citation.author_year",
+        label: "Citation",
+        excerpt: blocks[0]!.text,
+        detail: "Heuristic detail.",
+        severity: "warn",
+        status: "open",
+        heuristicOnly: true,
+        verification: "not_verified",
+        createdAt: "2026-08-01T00:00:01.000Z",
+      }],
+    };
+    saveReviewChecklistRun(workspace, checklist);
+
+    const documentPath = path.join(root, "paper.docx");
+    const intermediate = await docxFixture("Intermediate reconcile snapshot");
+    const latest = await docxFixture("Changed before reconcile commit");
+    fs.writeFileSync(documentPath, intermediate);
+    const originalRead = fs.readFileSync.bind(fs);
+    let documentReads = 0;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (String(file) === documentPath && ++documentReads === 4) {
+        fs.writeFileSync(documentPath, latest);
+      }
+      return originalRead(file, options as never);
+    }) as typeof fs.readFileSync);
+
+    await expect(reconcileRegisteredDocxDocuments(workspace)).resolves.toBe(1);
+
+    expect(documentReads).toBeGreaterThan(5);
+    expect(docxContentHash(originalRead(documentPath))).toBe(docxContentHash(latest));
+    expect(getDocument(workspace, document.id)).toMatchObject({
+      id: document.id,
+      revision: document.revision + 1,
+      contentHash: docxContentHash(latest),
+    });
+    expect(listBlocks(workspace, document.id)[0]?.text).toBe("Changed before reconcile commit");
+    expect(workspace.db.prepare("SELECT status FROM proposals WHERE id = ?").get(pending.id))
+      .toEqual({ status: "superseded" });
+    expect(listComments(workspace, document.id)).toEqual([]);
+    expect(listActiveReviewChecklists(workspace, document.id)).toEqual([]);
+    expect(workspace.db.isTransaction).toBe(false);
+  });
+
+  it("rolls back reconciliation when the DOCX disappears before commit", async () => {
+    const { root, workspace, document, blocks } = await testWorkspace();
+    const pending = proposal(document.id, blocks[0]!);
+    saveProposal(workspace, pending);
+    replaceDocumentComments(workspace, document.id, [{
+      id: "comment-before-missing-reconcile",
+      blockId: blocks[0]!.id,
+      text: "must survive a missing-file rollback",
+      severity: "info",
+      runId: "scan-before-missing-reconcile",
+      source: "test",
+    }]);
+    const documentPath = path.join(root, "paper.docx");
+    fs.writeFileSync(documentPath, await docxFixture("Changed before disappearing"));
+    const originalRead = fs.readFileSync.bind(fs);
+    let documentReads = 0;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (String(file) === documentPath && ++documentReads === 4) {
+        fs.rmSync(documentPath);
+      }
+      return originalRead(file, options as never);
+    }) as typeof fs.readFileSync);
+
+    await expect(reconcileRegisteredDocxDocuments(workspace)).resolves.toBe(0);
+
+    expect(getDocument(workspace, document.id)).toEqual(document);
+    expect(listBlocks(workspace, document.id)).toEqual(blocks);
+    expect(workspace.db.prepare("SELECT status FROM proposals WHERE id = ?").get(pending.id))
+      .toEqual({ status: "proposed" });
+    expect(listComments(workspace, document.id)).toMatchObject([{
+      id: "comment-before-missing-reconcile",
+    }]);
+    expect(workspace.db.isTransaction).toBe(false);
   });
 
   it("finalizes a human save journal after a crash between file and index commits", async () => {
@@ -355,6 +630,50 @@ describe("native DOCX storage", () => {
     expect(listBlocks(workspace, document.id)[0]?.text).toBe("Recovered human save");
     expect(workspace.db.prepare("SELECT COUNT(*) AS count FROM native_save_journals").get())
       .toEqual({ count: 0 });
+  });
+
+  it("rejects native save journal recovery after the registered DOCX is retargeted", async () => {
+    const { root, workspace, document } = await testWorkspace();
+    const edited = await docxFixture("Retargeted recovery content");
+    const blocks = await extractDocxBlocks(edited);
+    const afterHash = docxContentHash(edited);
+    const now = "2026-01-01T00:00:00.000Z";
+    workspace.db.prepare(
+      `INSERT INTO native_save_journals (
+        document_id, relative_path, before_hash, after_hash, payload_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      document.id,
+      document.relativePath,
+      document.contentHash,
+      afterHash,
+      JSON.stringify({
+        schemaVersion: 1,
+        documentId: document.id,
+        relativePath: document.relativePath,
+        beforeRevision: document.revision,
+        afterRevision: document.revision + 1,
+        beforeHash: document.contentHash,
+        afterHash,
+        updatedAt: now,
+        blocks,
+      }),
+      now,
+    );
+    const registeredPath = path.join(root, "paper.docx");
+    const originalTarget = path.join(root, "paper-original.docx");
+    const replacementTarget = path.join(root, "paper-replacement.docx");
+    fs.renameSync(registeredPath, originalTarget);
+    fs.writeFileSync(replacementTarget, edited);
+    fs.symlinkSync(replacementTarget, registeredPath, "file");
+
+    await expect(recoverNativeSaveJournals(workspace))
+      .rejects.toThrow("registered document path target changed");
+
+    expect(getDocument(workspace, document.id)).toEqual(document);
+    expect(workspace.db.prepare("SELECT COUNT(*) AS count FROM native_save_journals").get())
+      .toEqual({ count: 1 });
+    expect(fs.readFileSync(replacementTarget).equals(edited)).toBe(true);
   });
 
   it("refuses an empty export before replacing a non-empty DOCX", async () => {

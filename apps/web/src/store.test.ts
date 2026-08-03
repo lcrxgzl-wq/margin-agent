@@ -133,6 +133,25 @@ describe("marginReducer document isolation", () => {
     expect(state.messages.at(-1)?.id).toBe("m-149");
   });
 
+  it("stores session context usage independently of document state", () => {
+    const contextUsage = {
+      contextWindowTokens: 128_000,
+      usedTokens: 12_345,
+      usageEstimated: true,
+    };
+    const withUsage = marginReducer(initialMarginState, {
+      type: "setContextUsage",
+      contextUsage,
+    });
+    const afterDocumentOpen = marginReducer(withUsage, {
+      type: "setDocBundle",
+      doc: documentA,
+      blocks: [],
+    });
+
+    expect(afterDocumentOpen.contextUsage).toEqual(contextUsage);
+  });
+
   it("keeps a thread anchor synchronized with its visible selection", () => {
     const state = {
       ...initialMarginState,

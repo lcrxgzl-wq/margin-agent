@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   openWorkspace,
   openDocument,
@@ -13,13 +13,18 @@ import {
   listWorkspaceSourceFiles,
   assertNotRegisteredDocumentWrite,
   exportDocumentDocx,
+  getDocument,
+  listBlocks,
   openDocxDocument,
+  reconcileRegisteredDocuments,
+  reconcileRegisteredDocxDocuments,
   writeWorkspaceText,
 } from "./index.js";
 
 const dirs: string[] = [];
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const d of dirs.splice(0)) {
     try {
       fs.rmSync(d, { recursive: true, force: true });
@@ -158,6 +163,43 @@ describe("workspace text io", () => {
     }
   });
 
+  it("rejects a write when the target becomes registered before its mutation runs", async () => {
+    const root = tmpWorkspace();
+    const target = path.join(root, "draft.md");
+    fs.writeFileSync(target, "original\n", "utf8");
+    const ws = await openWorkspace(root);
+    try {
+      const pendingWrite = writeWorkspaceText(ws, "draft.md", "replacement\n");
+      openDocument(ws, "draft.md");
+
+      await expect(pendingWrite).rejects.toThrow(/canonical document/);
+      expect(fs.readFileSync(target, "utf8")).toBe("original\n");
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("rejects a write when its parent is replaced by an external directory link", async () => {
+    const root = tmpWorkspace();
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "margin-write-race-outside-"));
+    dirs.push(outside);
+    const parent = path.join(root, "notes");
+    fs.mkdirSync(parent);
+    const ws = await openWorkspace(root);
+    try {
+      const pendingWrite = writeWorkspaceText(ws, "notes/escape.md", "blocked\n");
+      fs.renameSync(parent, path.join(root, "notes-original"));
+      linkDirectory(outside, parent);
+
+      await expect(pendingWrite).rejects.toThrow(/escapes|target changed/);
+      expect(fs.existsSync(path.join(outside, "escape.md"))).toBe(false);
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
   it("rejects hidden metadata and aliases to it", async () => {
     const root = tmpWorkspace();
     const ws = await openWorkspace(root);
@@ -272,6 +314,86 @@ describe("workspace text io", () => {
       const second = openDocument(ws, "a.md");
       expect(second.revision).toBe(first.revision);
       expect(second.updatedAt).toBe(sentinel);
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("reconciles a Markdown edit made while the host was stopped", async () => {
+    const root = tmpWorkspace();
+    const firstWorkspace = await openWorkspace(root);
+    const document = openDocument(firstWorkspace, "a.md");
+    firstWorkspace.db.close();
+    await firstWorkspace.releaseLock();
+    fs.writeFileSync(path.join(root, "a.md"), "# changed offline\n\nNew paragraph.\n", "utf8");
+
+    const reopened = await openWorkspace(root);
+    try {
+      expect(getDocument(reopened, document.id)).toEqual(document);
+      await expect(reconcileRegisteredDocxDocuments(reopened)).resolves.toBe(1);
+
+      expect(getDocument(reopened, document.id)).toMatchObject({
+        id: document.id,
+        revision: document.revision + 1,
+      });
+      expect(listBlocks(reopened, document.id).map((block) => block.text)).toEqual([
+        "# changed offline",
+        "New paragraph.",
+      ]);
+      await expect(reconcileRegisteredDocuments(reopened)).resolves.toBe(0);
+    } finally {
+      reopened.db.close();
+      await reopened.releaseLock();
+    }
+  });
+
+  it("retries an unchanged reconciliation snapshot that changes after its first read", async () => {
+    const root = tmpWorkspace();
+    const ws = await openWorkspace(root);
+    try {
+      const document = openDocument(ws, "a.md");
+      const documentPath = path.join(root, "a.md");
+      const originalRead = fs.readFileSync.bind(fs);
+      let documentReads = 0;
+      vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+        if (String(file) === documentPath && ++documentReads === 2) {
+          fs.writeFileSync(documentPath, "# changed after first read\n\nLatest paragraph.\n", "utf8");
+        }
+        return originalRead(file, options as never);
+      }) as typeof fs.readFileSync);
+
+      await expect(reconcileRegisteredDocuments(ws)).resolves.toBe(1);
+
+      expect(documentReads).toBeGreaterThan(2);
+      expect(getDocument(ws, document.id)).toMatchObject({
+        revision: document.revision + 1,
+      });
+      expect(listBlocks(ws, document.id).map((block) => block.text)).toEqual([
+        "# changed after first read",
+        "Latest paragraph.",
+      ]);
+    } finally {
+      ws.db.close();
+      await ws.releaseLock();
+    }
+  });
+
+  it("rejects a registered document path retargeted through a symlink", async () => {
+    const root = tmpWorkspace();
+    const ws = await openWorkspace(root);
+    try {
+      const document = openDocument(ws, "a.md");
+      const registeredPath = path.join(root, "a.md");
+      const originalTarget = path.join(root, "target-a.md");
+      const replacementTarget = path.join(root, "target-b.md");
+      fs.renameSync(registeredPath, originalTarget);
+      fs.writeFileSync(replacementTarget, "# replacement\n", "utf8");
+      fs.symlinkSync(replacementTarget, registeredPath, "file");
+
+      await expect(reconcileRegisteredDocuments(ws))
+        .rejects.toThrow(/registered document path target changed/);
+      expect(getDocument(ws, document.id)).toEqual(document);
     } finally {
       ws.db.close();
       await ws.releaseLock();

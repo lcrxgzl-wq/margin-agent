@@ -13,6 +13,7 @@ import {
   PanelRight,
   PanelRightClose,
   PictureInPicture2,
+  RotateCcw,
   Settings2,
   Square,
   Sun,
@@ -26,8 +27,11 @@ import {
   type Comment,
   type Proposal,
   type ReviewChecklistBundle,
+  type SessionContextUsage,
   type SkillSummary,
 } from "../api";
+import { executableChatRetry, type ChatRetryPayload } from "../chatRetry";
+import { contextUsageCopy } from "../contextUsage";
 import type { CascadeCandidate, ReviewThread } from "../store";
 import { CascadeCard } from "./CascadeCard";
 import { hasMarkdown, Markdown } from "./Markdown";
@@ -47,6 +51,7 @@ export type ChatMessage = {
   threadId?: string;
   /** Skills actually loaded this turn (explicit selection or load_skill), name + hash. */
   loadedSkills?: Array<{ name: string; contentHash: string }>;
+  retry?: ChatRetryPayload;
 };
 
 type Props = {
@@ -57,7 +62,9 @@ type Props = {
   docTitle?: string;
   documentPath?: string;
   documentId?: string;
+  documentRevision?: number;
   llmMode?: "mock" | "byok";
+  contextUsage?: SessionContextUsage | null;
   selectionHint?: string;
   selectionBlockCount?: number;
   sourcePaths?: string[];
@@ -70,6 +77,7 @@ type Props = {
   onSend: (text: string, opts?: { selectedSkills?: string[] }) => void;
   onCancel?: () => void;
   onContinueTask?: () => void;
+  onRetryChat?: (errorMessageId: string) => void;
   onOpenSettings?: () => void;
   onOpenSessions?: () => void;
   onOpenDocx?: () => void;
@@ -111,7 +119,9 @@ export function Chat({
   docTitle,
   documentPath,
   documentId,
+  documentRevision,
   llmMode,
+  contextUsage,
   selectionHint,
   selectionBlockCount = 0,
   sourcePaths = [],
@@ -124,6 +134,7 @@ export function Chat({
   onSend,
   onCancel,
   onContinueTask,
+  onRetryChat,
   onOpenSettings,
   onOpenSessions,
   onOpenDocx,
@@ -311,6 +322,18 @@ export function Chat({
     .filter((m) => !m.threadId && (m.role === "user" || m.text.trim()))
     .slice(-80);
   const showLandingStage = !!landing && visibleMessages.length <= 1 && !busy;
+  const executableRetry = !busy
+    ? executableChatRetry({
+        messages,
+        currentDocument: documentId !== undefined && documentRevision !== undefined
+          ? { id: documentId, revision: documentRevision }
+          : undefined,
+        documentDirty,
+        currentThreadIds: threads.map((thread) => thread.id),
+      })
+    : null;
+  const retryMessageId = executableRetry?.errorMessageId ?? null;
+  const contextCopy = contextUsage ? contextUsageCopy(contextUsage) : null;
   const themeIcon = themeMode === "dark" ? <Moon size={16} /> : themeMode === "light" ? <Sun size={16} /> : <Monitor size={16} />;
   const cycleTheme = () => {
     if (!themeMode || !onThemeModeChange) return;
@@ -387,7 +410,12 @@ export function Chat({
                 onKeyDown={handleComposerKey}
               />
               <div className="composer-footer">
-                <span className="composer-hint">Enter 发送</span>
+                <div className="composer-tools">
+                  {contextCopy ? (
+                    <span className="context-usage" title={contextCopy.title}>{contextCopy.label}</span>
+                  ) : null}
+                  <span className="composer-hint">Enter 发送</span>
+                </div>
                 <button
                   className="icon-button send"
                   type="button"
@@ -457,6 +485,15 @@ export function Chat({
                 ) : null}
                 {m.role === "assistant" && m.task ? (
                   <TaskReceipt task={m.task} onContinue={onContinueTask} />
+                ) : null}
+                {m.id === retryMessageId && onRetryChat ? (
+                  <div className="task-receipt retry" role="status">
+                    <span>请求未完成</span>
+                    <button type="button" onClick={() => onRetryChat(m.id)}>
+                      <RotateCcw size={12} aria-hidden />
+                      重试
+                    </button>
+                  </div>
                 ) : null}
               </div>
             ))}
@@ -543,6 +580,9 @@ export function Chat({
                       {busyElapsedSeconds >= 10 ? ` · ${formatElapsedTime(busyElapsedSeconds)}` : ""}
                     </> : null}
                   </span>
+                  {contextCopy ? (
+                    <span className="context-usage" title={contextCopy.title}>{contextCopy.label}</span>
+                  ) : null}
                 </div>
                 <button
                   className="icon-button send"

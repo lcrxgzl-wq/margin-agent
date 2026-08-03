@@ -34,13 +34,15 @@ export type PaperToolContext = {
   getBlocks: () => BlockSnapshot[];
   getDocumentId: () => string;
   getRevision: () => number;
+  /** Changes whenever the host invalidates the current document snapshot. */
+  getDocumentContextEpoch?: () => number;
   /** Scan primary targets / session selection / confirmed cascade. */
   proposeScope?: ProposeScope;
   /** Shared gate mutated by outline/search/offer tools. */
   cascadeGate?: CascadeGate;
   /** Host collects offer_cascade results. */
   onCascadeOffer?: (candidates: ReturnType<typeof normalizeCascadeOffer>) => void;
-  /** Material paths attached by the host; only these may back proposal evidence. */
+  /** Material paths attached by the host; only these may back retained proposal evidence. */
   sourcePaths?: string[];
   /** Exact sourceRefs returned by read_workspace_file during this turn. */
   getReadSourceRefs?: () => string[];
@@ -79,8 +81,12 @@ async function normalizeEvidenceRefs(
     .filter((item): item is string => typeof item === "string")
     .map((item) => item.trim().replace(/\\/g, "/"))
     .filter(Boolean);
+  const currentRead = new Set(
+    (readSourceRefs ?? []).map(normalizeSourcePath).filter(Boolean),
+  );
   const invalid = refs.filter(
     (ref) =>
+      !currentRead.has(ref) &&
       !allowed.some(
         (sourcePath) =>
           ref === sourcePath || ref.startsWith(`${sourcePath}#`),
@@ -88,15 +94,14 @@ async function normalizeEvidenceRefs(
   );
   if (invalid.length) {
     throw new Error(
-      `Evidence must reference an attached sourcePath: ${invalid.join(", ")}`,
+      `Evidence must reference an attached sourcePath or an exact sourceRef returned by read_workspace_file in this turn: ${invalid.join(", ")}`,
     );
   }
   const unique = [...new Set(refs)];
   if (validateEvidenceRefs) {
     await validateEvidenceRefs(unique);
   } else if (readSourceRefs) {
-    const read = new Set(readSourceRefs.map(normalizeSourcePath));
-    const unread = unique.filter((ref) => !read.has(ref));
+    const unread = unique.filter((ref) => !currentRead.has(ref));
     if (unread.length) {
       throw new Error(
         `Evidence must use a sourceRef returned by read_workspace_file in this turn: ${unread.join(", ")}`,
@@ -452,7 +457,7 @@ export function createCorePaperTools(
     name: "propose_block_edit",
     label: "Propose Block Edit",
     description:
-      "Propose full replacement for one existing block (session draft only; does not apply or persist). Prefer propose_text_patch when only a phrase/sentence changes. Out-of-selection requires user-confirmed cascade targets. Evidence may only use attached source paths and exact sourceRef values read in this session and still hash-valid.",
+      "Propose full replacement for one existing block (session draft only; does not apply or persist). Prefer propose_text_patch when only a phrase/sentence changes. Out-of-selection requires user-confirmed cascade targets. Evidence must use an exact sourceRef read in this turn or a still hash-valid retained sourceRef from an attached source.",
     parameters: Type.Object({
       blockId: Type.String(),
       after: Type.String({ description: "Full replacement markdown" }),
@@ -661,6 +666,15 @@ export function createCorePaperTools(
   };
 
   const proposedTableCells = new Set<string>();
+  let proposedTableCellEpoch = ctx.getDocumentContextEpoch?.() ?? 0;
+  const currentTableProposalCount = () => {
+    const epoch = ctx.getDocumentContextEpoch?.() ?? 0;
+    if (epoch !== proposedTableCellEpoch) {
+      proposedTableCells.clear();
+      proposedTableCellEpoch = epoch;
+    }
+    return proposedTableCells.size;
+  };
   const tableCellTool: AgentTool | null = ctx.getTableCell && ctx.onTableCellProposal
     ? {
         name: "propose_table_cell_edit",
@@ -704,7 +718,7 @@ export function createCorePaperTools(
             risk?: RiskLevel;
             evidence?: string[];
           };
-          if (drafts.length + proposedTableCells.size >= MAX_PROPOSALS) {
+          if (drafts.length + currentTableProposalCount() >= MAX_PROPOSALS) {
             throw new Error(`proposal cap ${MAX_PROPOSALS} reached`);
           }
           const byId = getBlockIndex(blocks);
@@ -806,6 +820,7 @@ export function createCorePaperTools(
       if (!text) throw new Error("text is empty");
       const comment: AgentComment = {
         id: randomUUID(),
+        documentId: ctx.getDocumentId(),
         blockId,
         text,
         severity: normalizedSeverity(params.severity) ?? "info",
@@ -845,7 +860,7 @@ export function createCorePaperTools(
             text: JSON.stringify({
               ok: true,
               summary,
-              proposalCount: drafts.length + proposedTableCells.size,
+              proposalCount: drafts.length + currentTableProposalCount(),
               commentCount: comments.length,
             }),
           },

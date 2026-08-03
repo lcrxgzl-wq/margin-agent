@@ -116,13 +116,66 @@ describe("bounded completion adapter", () => {
       expect(body.messages[1]?.content).toContain("选区：原文");
       expect(body).not.toHaveProperty("tools");
       expect(body).not.toHaveProperty("response_format");
-      return Response.json({ choices: [{ message: { content: "  Translated text.  " } }] });
+      return Response.json({
+        choices: [{
+          finish_reason: "stop",
+          message: {
+            content: "  Translated <thinking>private reasoning</thinking>text.<thinking>unfinished private tail  ",
+          },
+        }],
+      });
     });
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(translateSelection({ text: "原文", targetLanguage: "en" }))
       .resolves.toBe("Translated text.");
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("strips thinking blocks without shifting Unicode output", async () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_BASE_URL = "https://provider.test/v1";
+    process.env.MARGIN_API_KEY = "secret";
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      choices: [{
+        finish_reason: "stop",
+        message: { content: "İ<thinking>secret</thinking>Translated" },
+      }],
+    })));
+
+    await expect(translateSelection({ text: "Original", targetLanguage: "zh-CN" }))
+      .resolves.toBe("İTranslated");
+  });
+
+  it("raises the output budget for long translations and rejects OpenAI truncation", async () => {
+    process.env.MARGIN_API_FORMAT = "openai";
+    process.env.MARGIN_BASE_URL = "https://provider.test/v1";
+    process.env.MARGIN_API_KEY = "secret";
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { max_tokens: number };
+      expect(body.max_tokens).toBe(16_384);
+      return Response.json({
+        choices: [{ finish_reason: "length", message: { content: "Partial translation" } }],
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(translateSelection({ text: "原文".repeat(6_001), targetLanguage: "en" }))
+      .rejects.toThrow(/truncated.*token limit/i);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("rejects Anthropic translations stopped at max_tokens", async () => {
+    process.env.MARGIN_API_FORMAT = "anthropic";
+    process.env.MARGIN_BASE_URL = "https://provider.test/gateway";
+    process.env.MARGIN_API_KEY = "secret";
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      stop_reason: "max_tokens",
+      content: [{ type: "text", text: "Partial translation" }],
+    })));
+
+    await expect(translateSelection({ text: "Original", targetLanguage: "zh-CN" }))
+      .rejects.toThrow(/truncated.*token limit/i);
   });
 
   it("sends policy headers and records token usage on the legacy path", async () => {

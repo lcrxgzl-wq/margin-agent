@@ -86,7 +86,7 @@ describe("compactSession", () => {
 });
 
 describe("saveLlmSettings", () => {
-  it("sends custom timeout and selection context settings", async () => {
+  it("sends retry, timeout and selection-context settings", async () => {
     vi.stubGlobal("location", { href: "http://127.0.0.1/#token=test-token" });
     vi.stubGlobal("localStorage", {
       getItem: () => null,
@@ -102,6 +102,8 @@ describe("saveLlmSettings", () => {
     const { saveLlmSettings } = await import("./api");
     await saveLlmSettings({
       agentTimeoutMs: 1_200_000,
+      retryAttempts: 5,
+      retryDelayMs: 30_000,
       selectionContextChars: 64_000,
     });
 
@@ -110,8 +112,80 @@ describe("saveLlmSettings", () => {
     expect(init.method).toBe("PUT");
     expect(JSON.parse(String(init.body))).toMatchObject({
       agentTimeoutMs: 1_200_000,
+      retryAttempts: 5,
+      retryDelayMs: 30_000,
       selectionContextChars: 64_000,
     });
+  });
+});
+
+describe("chatStream", () => {
+  it("forwards replacement events used to roll back an abandoned retry stream", async () => {
+    vi.stubGlobal("location", { href: "http://127.0.0.1/#token=test-token" });
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => undefined,
+    });
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode([
+          JSON.stringify({ type: "delta", text: "abandoned" }),
+          JSON.stringify({ type: "replace", text: "" }),
+          JSON.stringify({ type: "delta", text: "kept" }),
+          JSON.stringify({ type: "done", reply: "kept" }),
+          "",
+        ].join("\n")));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      statusText: "",
+      body,
+    }));
+    const { chatStream } = await import("./api");
+    const events: Array<{ type: string; text?: string }> = [];
+
+    await expect(chatStream(
+      { message: "test" },
+      (event) => events.push(event as { type: string; text?: string }),
+    )).resolves.toMatchObject({ type: "done", reply: "kept" });
+
+    expect(events.map((event) => [event.type, event.text])).toEqual([
+      ["delta", "abandoned"],
+      ["replace", ""],
+      ["delta", "kept"],
+      ["done", undefined],
+    ]);
+  });
+
+  it("treats done as terminal without waiting for the transport to close", async () => {
+    vi.stubGlobal("location", { href: "http://127.0.0.1/#token=test-token" });
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => undefined,
+    });
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          `${JSON.stringify({ type: "done", reply: "persisted" })}\n`,
+        ));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      statusText: "",
+      body,
+    }));
+    const { chatStream } = await import("./api");
+
+    await expect(chatStream({ message: "test" }, () => undefined))
+      .resolves.toMatchObject({ type: "done", reply: "persisted" });
+    expect(cancelled).toBe(true);
   });
 });
 
@@ -221,13 +295,15 @@ describe("review checklist requests", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const { translateSelection } = await import("./api");
-    await expect(translateSelection("原文", "zh-CN")).resolves.toEqual({
+    const controller = new AbortController();
+    await expect(translateSelection("原文", "zh-CN", controller.signal)).resolves.toEqual({
       translation: "译文",
     });
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/api/v1/translate");
     expect(init.method).toBe("POST");
+    expect(init.signal).toBe(controller.signal);
     expect(JSON.parse(String(init.body))).toEqual({
       text: "原文",
       targetLanguage: "zh-CN",

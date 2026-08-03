@@ -1,7 +1,7 @@
 {
   "name": "margin-agent",
-  "version": "0.4.2",
-  "description": "本地运行的文档修订 Agent：模型对指定段落提出修改提案，作者逐条裁决后写入文稿，全过程留档。",
+  "version": "0.5.0",
+  "description": "本地文档修订 Agent：模型只对选区提提案，作者 Y/N/E 裁决后才写入工作副本；原文不动，全过程留档，文稿不出本机。",
   "license": "MIT",
   "engines": {
     "node": ">=22.19.0"

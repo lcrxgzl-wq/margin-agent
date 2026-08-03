@@ -66,9 +66,11 @@ export type WorkspaceBridge = {
   openDocument: (relativePath: string) => Promise<{
     document: DocumentMeta;
     blocks: BlockSnapshot[];
+    alreadyOpen?: boolean;
   }> | {
     document: DocumentMeta;
     blocks: BlockSnapshot[];
+    alreadyOpen?: boolean;
   };
   /** Paths of review-store documents that must not be overwritten via write_workspace_file. */
   listProtectedDocumentPaths?: () => string[];
@@ -97,6 +99,8 @@ function isProtectedDocumentPath(
 
 export type SessionSideEffects = {
   opened?: { document: DocumentMeta; blocks: BlockSnapshot[] };
+  /** At least one open_document invalidated the active document snapshot in this turn. */
+  documentSwitchOccurred?: boolean;
   written?: { relativePath: string; created: boolean };
   readPath?: string;
   readSourceRefs?: string[];
@@ -130,6 +134,10 @@ export type SessionToolOptions = {
   disabledSkills?: string[];
   /** Remote MCP bridge + per-call approval (chat path only; scan passes none). */
   remoteMcp?: { bridge: RemoteMcpBridge; requestApproval: RemoteMcpApprovalFn };
+  /** Fit-first document injection mode for cascade error copy. */
+  documentMode?: "full" | "lean";
+  /** Mutable mode ref so mid-turn open_document can demote full -> lean. */
+  documentModeState?: { documentMode?: "full" | "lean" };
 };
 
 const DEFAULT_SOURCE_CHUNK_CHARS = 6_000;
@@ -152,6 +160,7 @@ export function createSessionTools(
     typeof harnessIdOrOpts === "string" || harnessIdOrOpts == null
       ? { harnessId: harnessIdOrOpts }
       : harnessIdOrOpts;
+  const documentModeState = opts.documentModeState ?? { documentMode: opts.documentMode };
   const harnessId = opts.harnessId;
   const profile = getHarness(harnessId);
   const permits = (capability: AgentCapability) =>
@@ -164,6 +173,16 @@ export function createSessionTools(
   const sourcePaths = [
     ...new Set((opts.sourcePaths ?? []).map(normalizeSourcePath).filter(Boolean)),
   ];
+  const readCache = new Map<
+    string,
+    { relativePath: string; text: string; bytes: number; versionHash: string }
+  >();
+  const sourceHashCache = new Map<string, string>();
+  const currentTurnEvidence = new Map<
+    string,
+    { relativePath: string; versionHash: string }
+  >();
+  let documentContextEpoch = 0;
   let evidenceCache = normalizeAttachedEvidenceCache(opts.evidenceCache ?? [], sourcePaths);
   const publishEvidenceCache = (entries: EvidenceCacheEntry[]) => {
     evidenceCache = entries;
@@ -173,14 +192,22 @@ export function createSessionTools(
     const refs = evidenceCache
       .filter((entry) => entry.relativePath === relativePath)
       .map((entry) => entry.sourceRef);
-    publishEvidenceCache(removeEvidenceCacheRefs(evidenceCache, refs));
+    if (refs.length) {
+      publishEvidenceCache(removeEvidenceCacheRefs(evidenceCache, refs));
+    }
+    for (const [ref, entry] of currentTurnEvidence) {
+      if (entry.relativePath === relativePath) currentTurnEvidence.delete(ref);
+    }
+    for (const [key, file] of readCache) {
+      if (normalizeSourcePath(file.relativePath) === relativePath) readCache.delete(key);
+    }
+    sourceHashCache.delete(relativePath);
   };
   const validateEvidenceRefs = async (refs: string[]) => {
-    const currentTurnRefs = new Set(effects.readSourceRefs ?? []);
     const probedVersions = new Map<string, string>();
     for (const ref of refs) {
-      if (currentTurnRefs.has(ref)) continue;
-      const entry = evidenceCache.find((candidate) => candidate.sourceRef === ref);
+      const entry = currentTurnEvidence.get(ref) ??
+        evidenceCache.find((candidate) => candidate.sourceRef === ref);
       if (!entry) {
         throw new Error(
           "Evidence must use a sourceRef returned by read_workspace_file in this turn or retained in this session: " + ref,
@@ -209,11 +236,7 @@ export function createSessionTools(
     (opts.workspaceWriteApprovedPaths ?? []).map((item) => normalizeRel(item.trim())),
   );
   const cascadeGate = createCascadeGate();
-  const readCache = new Map<
-    string,
-    { relativePath: string; text: string; bytes: number; versionHash: string }
-  >();
-  const sourceHashCache = new Map<string, string>();
+  const analysisStore = new AnalysisRunStore();
   const listFiles: AgentTool = {
     name: "list_workspace_files",
     label: "List Workspace Files",
@@ -287,6 +310,12 @@ export function createSessionTools(
       const sourceRef = nextOffset > offset
         ? `${canonicalPath}#sha256=${sourceHash}&chars=${offset}-${nextOffset}`
         : undefined;
+      if (sourceRef) {
+        currentTurnEvidence.set(sourceRef, {
+          relativePath: canonicalPath,
+          versionHash: file.versionHash,
+        });
+      }
       if (sourceRef && sourcePaths.includes(canonicalPath)) {
         publishEvidenceCache(mergeEvidenceCacheEntry(evidenceCache, {
           sourceRef,
@@ -380,15 +409,58 @@ export function createSessionTools(
     execute: async (_id, raw) => {
       const params = raw as { relativePath: string };
       const opened = await bridge.openDocument(String(params.relativePath));
+      const documentContextChanged = Boolean(
+        bag.documentId &&
+        (
+          bag.documentId !== opened.document.id ||
+          bag.revision !== opened.document.revision
+        ),
+      );
+      let discardedArtifactCount = 0;
+      let demotedDocumentMode = false;
+      if (documentContextChanged) {
+        documentContextEpoch += 1;
+        effects.documentSwitchOccurred = true;
+        if (documentModeState.documentMode === "full") {
+          documentModeState.documentMode = "lean";
+          demotedDocumentMode = true;
+        }
+        discardedArtifactCount = drafts.length + comments.length +
+          (effects.tableCellProposals?.length ?? 0) +
+          (effects.reviewChecklists?.length ?? 0);
+        drafts.splice(0);
+        comments.splice(0);
+        selectionBlockIds.splice(0);
+        cascadeConfirmedIds.splice(0);
+        sourcePaths.splice(0);
+        currentTurnEvidence.clear();
+        readCache.clear();
+        sourceHashCache.clear();
+        analysisStore.datasets.clear();
+        analysisStore.runs.clear();
+        if (evidenceCache.length) publishEvidenceCache([]);
+        delete effects.readPath;
+        delete effects.readSourceRefs;
+        delete effects.cascadeOffer;
+        delete effects.tableCellProposals;
+        delete effects.reviewChecklists;
+        delete effects.finishSummary;
+        cascadeGate.outlineCalled = false;
+        cascadeGate.searchCalled = false;
+        cascadeGate.offered = [];
+        cascadeGate.cascadeProposeCount = 0;
+      }
       bag.documentId = opened.document.id;
       bag.revision = opened.document.revision;
       bag.relativePath = opened.document.relativePath;
       bag.blocks = opened.blocks;
       const canonicalOpened = normalizeSourcePath(opened.document.relativePath);
-      readCache.delete(canonicalOpened);
-      readCache.delete(normalizeSourcePath(String(params.relativePath)));
-      sourceHashCache.delete(canonicalOpened);
-      invalidateEvidencePath(canonicalOpened);
+      if (!opened.alreadyOpen) {
+        readCache.delete(canonicalOpened);
+        readCache.delete(normalizeSourcePath(String(params.relativePath)));
+        sourceHashCache.delete(canonicalOpened);
+        invalidateEvidencePath(canonicalOpened);
+      }
       effects.opened = opened;
       return {
         content: [
@@ -400,6 +472,15 @@ export function createSessionTools(
               documentId: opened.document.id,
               revision: opened.document.revision,
               blockCount: opened.blocks.length,
+              discardedArtifactCount,
+              alreadyOpen: Boolean(opened.alreadyOpen),
+              ...(demotedDocumentMode
+                ? {
+                    warning:
+                      "mid-turn document switch invalidated the full-document injection from turn start; documentMode demoted to lean. Re-read the newly opened document with outline/read_document_blocks as needed.",
+                    documentMode: "lean",
+                  }
+                : {}),
             }),
           },
         ],
@@ -448,13 +529,12 @@ export function createSessionTools(
     },
   };
 
-  const analysisStore = new AnalysisRunStore();
-
   const paper = createPaperTools(
     {
       getBlocks: () => bag.blocks,
       getDocumentId: () => bag.documentId ?? "",
       getRevision: () => bag.revision,
+      getDocumentContextEpoch: () => documentContextEpoch,
       cascadeGate,
       proposeScope: {
         selectionBlockIds,
@@ -462,6 +542,9 @@ export function createSessionTools(
         enforceCascadeGate,
         cascadeUnlocked,
         gate: cascadeGate,
+        get documentMode() {
+          return documentModeState.documentMode;
+        },
       },
       onCascadeOffer: (candidates) => {
         effects.cascadeOffer = candidates;

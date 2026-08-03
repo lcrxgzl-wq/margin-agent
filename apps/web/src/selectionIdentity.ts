@@ -48,6 +48,17 @@ export function sameSelectionIdentity(
   return left.selectionStart === right.selectionStart && left.selectionText === right.selectionText;
 }
 
+/** Translation is span-scoped even when review proposals are cell-scoped. */
+export function sameTranslationSelectionIdentity(
+  left: SelectionIdentity,
+  right: SelectionIdentity,
+): boolean {
+  if (!sameSelectionIdentity(left, right)) return false;
+  if (!left.tableCell && !right.tableCell) return true;
+  return left.selectionText === right.selectionText &&
+    left.selectionStart === right.selectionStart;
+}
+
 export function selectionAnchorAlive(
   selection: SelectionIdentity,
   blocks: Array<Pick<Block, "id" | "text">>,
@@ -130,6 +141,7 @@ export function selectionClearlyDivergedFromThread(
   selection: {
     blockId: string | null;
     text: string;
+    selectionStart?: number;
     tableCell?: SelectionIdentity["tableCell"];
   },
 ): boolean {
@@ -139,7 +151,41 @@ export function selectionClearlyDivergedFromThread(
   if (threadAddress || selectionAddress) {
     return thread.blockId !== selection.blockId || threadAddress !== selectionAddress;
   }
-  return thread.blockId !== selection.blockId || thread.selectionText !== selection.text;
+  if (thread.blockId !== selection.blockId || thread.selectionText !== selection.text) return true;
+  return thread.selectionStart !== undefined &&
+    selection.selectionStart !== undefined &&
+    thread.selectionStart !== selection.selectionStart;
+}
+
+export type OpenThreadSelectionDisposition = "thread" | "ignore" | "selection";
+
+export function shouldCancelTranslationForSelectionEvent(
+  sameSelection: boolean,
+  disposition: OpenThreadSelectionDisposition,
+): boolean {
+  return !sameSelection && disposition !== "ignore";
+}
+
+/** Decide whether a canvas event repositions the open thread or represents a new selection. */
+export function openThreadSelectionDisposition(
+  thread: { id: string; anchor: SelectionIdentity } | null | undefined,
+  event: {
+    blockId: string | null;
+    text: string;
+    selectionStart?: number;
+    selectionRanges?: SelectionIdentity["selectionRanges"];
+    tableCell?: SelectionIdentity["tableCell"];
+    anchor?: { x: number; y: number } | null;
+    programmaticThreadId?: string;
+    userInitiated?: boolean;
+  },
+): OpenThreadSelectionDisposition {
+  if (!thread) return "selection";
+  if (event.programmaticThreadId === thread.id) return "thread";
+  if (!event.userInitiated && selectionOwnedByOpenThread(thread.anchor, event)) {
+    return "thread";
+  }
+  return event.userInitiated ? "selection" : "ignore";
 }
 
 export function proposalMatchesSelection(

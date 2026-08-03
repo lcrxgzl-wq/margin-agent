@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   archiveAgentSession,
+  getDocument,
   latestAgentCompactionSummary,
   listActiveReviewChecklists,
   listAgentCompactions,
@@ -110,6 +111,8 @@ describe("buildTranscriptPayload", () => {
         task: {
           objective: "continue research",
           status: "running",
+          documentId: document.id,
+          documentRevision: document.revision,
           currentStep: "正在读取文件…",
           sourcePaths: [],
           sourceRefs: [],
@@ -194,6 +197,42 @@ describe("workspace bridge extensions", () => {
           expect.objectContaining({ text: "Native DOCX paragraph" }),
         ]),
       });
+    } finally {
+      workspace.db.close();
+      await workspace.releaseLock();
+    }
+  });
+
+  it("keeps an unchanged active path cached but reindexes an external edit", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-agent-reopen-"));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, "paper.md"), "Original text.\n", "utf8");
+    const workspace = await openWorkspace(root);
+    try {
+      const document = openDocument(workspace, "paper.md");
+      const bag = {
+        documentId: document.id,
+        revision: document.revision,
+        relativePath: document.relativePath,
+        blocks: listBlocks(workspace, document.id),
+      };
+      const bridge = createWorkspaceBridge(workspace, bag);
+      const unchanged = await bridge.openDocument("./paper.md");
+      expect(unchanged.document).toEqual(document);
+      expect(unchanged.blocks).toEqual(bag.blocks);
+      expect(unchanged.alreadyOpen).toBe(true);
+
+      fs.writeFileSync(path.join(root, "paper.md"), "Externally changed text.\n", "utf8");
+
+      const reopened = await bridge.openDocument("./paper.md");
+
+      expect(reopened.document).toMatchObject({
+        id: document.id,
+        revision: document.revision + 1,
+      });
+      expect(reopened.blocks.map((block) => block.text)).toEqual(["Externally changed text."]);
+      expect(reopened.alreadyOpen).toBe(false);
+      expect(getDocument(workspace, document.id)).toEqual(reopened.document);
     } finally {
       workspace.db.close();
       await workspace.releaseLock();
@@ -335,6 +374,56 @@ describe("chat session lifecycle", () => {
     expect(state.sessionId).not.toBe("before");
   });
 
+  it("clears document-scoped context when open_document switches the active document", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-tool-switch-"));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, "first.md"), "# First\n\nPrivate draft.\n", "utf8");
+    fs.writeFileSync(path.join(root, "second.md"), "# Second\n\nFresh draft.\n", "utf8");
+    fs.writeFileSync(path.join(root, "notes.txt"), "private evidence", "utf8");
+    const workspace = await openWorkspace(root);
+    const previousEngine = process.env.MARGIN_ENGINE;
+    process.env.MARGIN_ENGINE = "simple";
+    try {
+      const first = openDocument(workspace, "first.md");
+      const state = createChatAgentState({
+        sessionId: "first-session",
+        agentMessages: [{ role: "user", content: "private transcript" }],
+        clarificationRounds: 2,
+      });
+      syncBagFromDocument(state, first, listBlocks(workspace, first.id));
+      replaceAttachedSources(state, workspace, ["notes.txt"]);
+      state.evidenceCache = [evidenceEntry];
+      const chat = new ChatMemory();
+      chat.remember("user", "private chat memory");
+      chat.remember("assistant", "private answer");
+
+      const result = await runChatAgentTurn({
+        workspace,
+        chat,
+        agentState: state,
+        message: "打开 second.md",
+      });
+
+      expect(result.opened?.document.relativePath).toBe("second.md");
+      expect(state.bag.documentId).toBe(result.opened?.document.id);
+      expect(state.agentMessages).toEqual([]);
+      expect(state.clarificationRounds).toBe(0);
+      expect(state.sourcePaths).toEqual([]);
+      expect(state.evidenceCache).toEqual([]);
+      expect(state.sourceDocumentId).toBe(result.opened?.document.id);
+      expect(state.sessionId).not.toBe("first-session");
+      expect(chat.list()).toEqual([
+        { role: "user", text: "打开 second.md" },
+        { role: "assistant", text: result.reply },
+      ]);
+    } finally {
+      if (previousEngine === undefined) delete process.env.MARGIN_ENGINE;
+      else process.env.MARGIN_ENGINE = previousEngine;
+      workspace.db.close();
+      await workspace.releaseLock();
+    }
+  });
+
   it("recognizes explicit close commands without matching ordinary discussion", () => {
     expect(isCloseDocumentRequest("退出这个word")).toBe(true);
     expect(isCloseDocumentRequest("关闭当前文稿")).toBe(true);
@@ -366,6 +455,30 @@ describe("chat session lifecycle", () => {
 });
 
 describe("chatAgentStateFromSession (session switch)", () => {
+  it("restores documentModeLeanLock from persisted session", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-leanlock-"));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, "paper.md"), "# Title\n\nBody text.\n", "utf8");
+    const workspace = await openWorkspace(root);
+    try {
+      const document = openDocument(workspace, "paper.md");
+      saveAgentSession(workspace, {
+        sessionId: "s-lean-lock",
+        documentId: document.id,
+        messages: [{ role: "user", content: "hi" }],
+        chatTurns: [{ role: "user", text: "hi" }],
+        documentModeLeanLock: true,
+      });
+      const restored = chatAgentStateFromSession(workspace, loadAgentSession(workspace));
+      expect(restored.documentModeLeanLock).toBe(true);
+      const fresh = createChatAgentState();
+      expect(fresh.documentModeLeanLock).toBe(false);
+    } finally {
+      workspace.db.close();
+      await workspace.releaseLock();
+    }
+  });
+
   it("rebuilds agent state from an archived envelope, degrading on a missing document", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-switch-"));
     dirs.push(root);
@@ -532,6 +645,55 @@ describe("rotateChatSessionWithSummary", () => {
       expect(String(note.content)).toContain("主题「润色引言」");
       expect(String(note.content)).toContain("已接受 1、已拒绝 0、已编辑 0");
       expect(loadAgentSessionEnvelope(workspace, "s-old")).not.toBeNull();
+    } finally {
+      try {
+        workspace.db.close();
+      } catch {
+        /* ignore */
+      }
+      await workspace.releaseLock();
+    }
+  });
+
+  it("archives a task-only stale continuation before starting a new session", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-rotate-stale-task-"));
+    dirs.push(root);
+    const paperPath = path.join(root, "paper.md");
+    fs.writeFileSync(paperPath, "Original paragraph.\n", "utf8");
+    const workspace = await openWorkspace(root);
+    try {
+      const document = openDocument(workspace, "paper.md");
+      saveAgentSession(workspace, {
+        sessionId: "s-stale-task",
+        documentId: document.id,
+        messages: [],
+        chatTurns: [],
+        sourcePaths: [],
+        task: {
+          objective: "审阅全文论证",
+          status: "interrupted",
+          documentId: document.id,
+          documentRevision: document.revision,
+          sourcePaths: [],
+          sourceRefs: [],
+          proposalCount: 0,
+          inspectedDocument: false,
+          consistencyChecked: false,
+          updatedAt: "2026-08-03T00:00:00.000Z",
+        },
+      });
+      fs.writeFileSync(paperPath, "Revised paragraph.\n", "utf8");
+      openDocument(workspace, "paper.md");
+      const state = restoreChatAgentState(workspace);
+      expect(state.task).toBeUndefined();
+
+      rotateChatSessionWithSummary(workspace, state, false);
+
+      expect(loadAgentSessionEnvelope(workspace, "s-stale-task")?.task).toMatchObject({
+        objective: "审阅全文论证",
+        status: "interrupted",
+        documentRevision: document.revision,
+      });
     } finally {
       try {
         workspace.db.close();

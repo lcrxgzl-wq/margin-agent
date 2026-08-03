@@ -4,10 +4,14 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { contentHash } from "@margin/domain";
 import {
+  enqueueDocumentMutation,
   listBlocks,
+  listActiveReviewChecklists,
   listComments,
   listProposals,
+  getReviewChecklist,
   openDocument,
+  replaceDocumentComments,
   saveProposal,
   saveReviewChecklistRun,
 } from "@margin/storage-local";
@@ -345,6 +349,36 @@ describe("chat queue serialization (I1)", () => {
     expect(state.agent.bag.documentId).toBe(otherDocument.id);
 
     syncBagFromDocument(state.agent, document, blocks);
+    let releaseChecklistQueue!: () => void;
+    const checklistQueueGate = new Promise<void>((resolve) => {
+      releaseChecklistQueue = resolve;
+    });
+    const queuedChecklistDocumentSwitch = enqueueChat(async () => {
+      await checklistQueueGate;
+      syncBagFromDocument(state.agent, otherDocument, listBlocks(workspace, otherDocument.id));
+    });
+    const queuedChecklistDecision = app.inject({
+      method: "POST",
+      url: "/api/v1/checklists/check-run-2/decisions",
+      headers: { authorization: `Bearer ${state.token}` },
+      payload: { itemIds: ["check-item-2"], kind: "resolve" },
+    });
+    const checklistRespondedEarly = await Promise.race([
+      queuedChecklistDecision.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 100)),
+    ]);
+    expect(checklistRespondedEarly).toBe(false);
+    releaseChecklistQueue();
+    await queuedChecklistDocumentSwitch;
+    const checklistAfterSwitchResponse = await queuedChecklistDecision;
+    expect(checklistAfterSwitchResponse.statusCode).toBe(409);
+    expect(checklistAfterSwitchResponse.json()).toMatchObject({
+      ok: false,
+      reason: "document_mismatch",
+    });
+    expect(getReviewChecklist(workspace, "check-run-2").items[0]?.status).toBe("open");
+
+    syncBagFromDocument(state.agent, document, blocks);
     let releaseImportQueue!: () => void;
     const importQueueGate = new Promise<void>((resolve) => {
       releaseImportQueue = resolve;
@@ -433,5 +467,99 @@ describe("chat queue serialization (I1)", () => {
     expect(finalRun.status).toBe("superseded");
     expect(listProposals(workspace, document.id)).toHaveLength(proposalCountBeforeInFlightRun);
     expect(listComments(workspace, document.id)).toHaveLength(commentCountBeforeInFlightRun);
+
+    syncBagFromDocument(state.agent, document, blocks);
+    replaceDocumentComments(workspace, document.id, [{
+      id: "comment-before-revision-race",
+      blockId: blocks[0]!.id,
+      text: "keep this comment when a scan becomes stale",
+      severity: "info",
+      runId: "before-revision-race",
+      source: "test",
+    }]);
+    saveReviewChecklistRun(workspace, checklistDraft("check-run-3", "check-item-3"));
+    let releaseRevisionScan!: () => void;
+    const revisionScanGate = new Promise<void>((resolve) => {
+      releaseRevisionScan = resolve;
+    });
+    let markRevisionScanStarted!: () => void;
+    const revisionScanStarted = new Promise<void>((resolve) => {
+      markRevisionScanStarted = resolve;
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      markRevisionScanStarted();
+      await revisionScanGate;
+      return Response.json({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              blockId: blocks[0]!.id,
+              after: `${blocks[0]!.text}陈旧扫描结果`,
+              rationale: "same-document revision race test",
+              risk: "language",
+              evidence: [],
+            }),
+          },
+        }],
+      });
+    }));
+    const revisionRunResponse = await app.inject({
+      method: "POST",
+      url: `/api/v1/documents/${document.id}/proposal-runs`,
+      headers: { authorization: `Bearer ${state.token}` },
+      payload: { blockIds: [blocks[0]!.id] },
+    });
+    expect(revisionRunResponse.statusCode).toBe(202);
+    const revisionRunId = revisionRunResponse.json().runId as string;
+    await revisionScanStarted;
+
+    let releaseDocumentMutation!: () => void;
+    const documentMutationGate = new Promise<void>((resolve) => {
+      releaseDocumentMutation = resolve;
+    });
+    let markDocumentMutationStarted!: () => void;
+    const documentMutationStarted = new Promise<void>((resolve) => {
+      markDocumentMutationStarted = resolve;
+    });
+    let revisedDocument!: ReturnType<typeof openDocument>;
+    const pendingDocumentMutation = enqueueDocumentMutation(
+      workspace,
+      document.id,
+      async () => {
+        markDocumentMutationStarted();
+        await documentMutationGate;
+        fs.writeFileSync(path.join(root, "paper.md"), "# 标题\n\n同一文稿的新版本。\n", "utf8");
+        revisedDocument = openDocument(workspace, "paper.md");
+        syncBagFromDocument(state.agent, revisedDocument, listBlocks(workspace, revisedDocument.id));
+      },
+    );
+    await documentMutationStarted;
+    releaseRevisionScan();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(state.runs.get(revisionRunId)?.status).toBe("running");
+    releaseDocumentMutation();
+    await pendingDocumentMutation;
+
+    expect(revisedDocument.id).toBe(document.id);
+    expect(revisedDocument.revision).toBe(document.revision + 1);
+    const proposalCountAfterRevision = listProposals(workspace, document.id).length;
+    const commentsAfterRevision = listComments(workspace, document.id);
+    expect(listActiveReviewChecklists(workspace, document.id)).toEqual([]);
+
+    let revisionRun: { status?: string } = {};
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const statusResponse = await app.inject({
+        method: "GET",
+        url: `/api/v1/proposal-runs/${revisionRunId}`,
+        headers: { authorization: `Bearer ${state.token}` },
+      });
+      revisionRun = statusResponse.json();
+      if (revisionRun.status !== "running") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(revisionRun.status).toBe("superseded");
+    expect(listProposals(workspace, document.id)).toHaveLength(proposalCountAfterRevision);
+    expect(listComments(workspace, document.id)).toEqual(commentsAfterRevision);
+    expect(listActiveReviewChecklists(workspace, document.id)).toEqual([]);
   }, 30_000);
 });

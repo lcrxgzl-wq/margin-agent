@@ -13,6 +13,7 @@ import {
   openDocument,
   openWorkspace,
   saveReviewChecklistRun,
+  saveReviewChecklistRunWithinTransaction,
   type Workspace,
 } from "./index.js";
 
@@ -73,6 +74,21 @@ function draft(
 }
 
 describe("review checklist store", () => {
+  it("rejects transaction-owned persistence before making any writes", async () => {
+    const ws = await workspace();
+    saveReviewChecklistRun(ws, draft("run-1"));
+
+    expect(() => saveReviewChecklistRunWithinTransaction(ws, draft("run-1")))
+      .toThrow(/active transaction required/);
+
+    expect(listActiveReviewChecklists(ws, "doc-1").map((entry) => entry.run.id))
+      .toEqual(["run-1"]);
+    expect(listReviewChecklistHistory(ws, "doc-1").map((entry) => entry.run.status))
+      .toEqual(["active"]);
+    expect(ws.db.prepare("SELECT COUNT(*) AS count FROM review_checklist_items").get())
+      .toEqual({ count: 2 });
+  });
+
   it("creates its migration idempotently and preserves superseded history", async () => {
     const ws = await workspace();
     saveReviewChecklistRun(ws, draft("run-1"));

@@ -47,10 +47,16 @@ export type PaperAgentContext = {
   reasoningOptIn?: boolean;
   /** User-configured request timeout (ms); wins over env/profile fallback. */
   timeoutMs?: number;
+  /** Total attempts for transient provider/transport failures. */
+  retryAttempts?: number;
+  /** Fixed delay between transient retries in milliseconds. */
+  retryDelayMs?: number;
 };
 
 export type AgentComment = {
   id: string;
+  /** Document owning this comment when produced by document tools. */
+  documentId?: string;
   blockId: string;
   text: string;
   severity: "info" | "warn";

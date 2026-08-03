@@ -9,6 +9,7 @@ import {
 import { composeDirectPrompt, getAgentProfile } from "@margin/harness";
 import {
   canonicalizeProviderBaseURL,
+  completionReachedTokenLimit,
   extractUsage,
   marginRequestHeaders,
   reportModelUsage,
@@ -436,8 +437,6 @@ async function requestCompletion(
     } catch {
       throw new Error("LLM endpoint returned invalid JSON");
     }
-    const text = completionText(format, payload);
-    if (!text.trim()) throw new Error("LLM endpoint returned empty text");
     const usage = extractUsage(format, payload);
     if (usage) {
       reportModelUsage({
@@ -447,6 +446,11 @@ async function requestCompletion(
         requestId: headers["X-Client-Request-Id"] ?? "",
       });
     }
+    if (completionReachedTokenLimit(format, payload)) {
+      throw new Error("LLM response was truncated at the output token limit");
+    }
+    const text = completionText(format, payload);
+    if (!text.trim()) throw new Error("LLM endpoint returned empty text");
     return text;
   }
   throw new Error("LLM completion endpoint was not found");

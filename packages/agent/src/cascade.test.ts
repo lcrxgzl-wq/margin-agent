@@ -58,7 +58,27 @@ describe("cascade gate", () => {
         enforceCascadeGate: true,
         gate: createCascadeGate(),
       }),
-    ).toThrow(/选区外提案被拒绝/);
+    ).toThrow(/选区外提案被拒绝.*get_document_outline/);
+  });
+
+  it("in full mode asks for offer_cascade without outline scout ceremony", () => {
+    expect(() =>
+      assertCanProposeBlock("b-abs", {
+        selectionBlockIds: ["b-lit"],
+        enforceCascadeGate: true,
+        documentMode: "full",
+        gate: createCascadeGate(),
+      }),
+    ).toThrow(/选区外提案被拒绝.*offer_cascade/);
+    expect(() =>
+      assertCanProposeBlock("b-abs", {
+        selectionBlockIds: ["b-lit"],
+        cascadeConfirmedIds: ["b-abs"],
+        enforceCascadeGate: true,
+        documentMode: "full",
+        gate: createCascadeGate(),
+      }),
+    ).not.toThrow();
   });
 
   it("allows confirmed cascade after unlock", () => {

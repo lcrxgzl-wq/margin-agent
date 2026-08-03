@@ -68,7 +68,13 @@ vi.mock("@earendil-works/pi-ai/compat", () => ({
   },
 }));
 
-const { runPiAgentLoop, summarizeToolArguments, trimAgentMessages } = await import("./pi-loop.js");
+const {
+  DEFAULT_RETRY_ATTEMPTS,
+  DEFAULT_RETRY_DELAY_MS,
+  runPiAgentLoop,
+  summarizeToolArguments,
+  trimAgentMessages,
+} = await import("./pi-loop.js");
 const { configureRequestPolicy } = await import("@margin/llm");
 
 beforeEach(() => {
@@ -697,6 +703,222 @@ describe("Pi request policy", () => {
     await runToCompletion();
     expect(recorded).toEqual([]);
     configureRequestPolicy({ onUsage: undefined });
+  });
+});
+
+describe("Pi transient retry policy", () => {
+  const assistant = (stopReason: "stop" | "error", errorMessage?: string) => ({
+    role: "assistant",
+    content: [{ type: "text", text: stopReason === "stop" ? "ok" : "" }],
+    stopReason,
+    errorMessage,
+    usage: { totalTokens: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    timestamp: Date.now(),
+  });
+
+  it("defaults to five total attempts separated by thirty seconds", async () => {
+    vi.useFakeTimers();
+    try {
+      const phases: string[] = [];
+      const running = runPiAgentLoop({
+        prompt: "test",
+        systemPrompt: "test",
+        tools: [],
+        model: {},
+        onProgress: (phase) => phases.push(phase),
+        timeoutMs: 180_000,
+      });
+      const instance = mockAgent.instance!;
+      instance.state.messages = [
+        { role: "user", content: "test" },
+        assistant("error", "Connection error"),
+      ];
+      instance.state.errorMessage = "Connection error";
+      mockAgent.continueHook = (agent) => {
+        agent.state.messages = [...agent.state.messages, assistant("stop")];
+      };
+      mockAgent.resolvePrompt?.();
+
+      await vi.advanceTimersByTimeAsync(DEFAULT_RETRY_DELAY_MS - 1);
+      expect(mockAgent.continueCalls).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await running;
+
+      expect(DEFAULT_RETRY_ATTEMPTS).toBe(5);
+      expect(mockAgent.continueCalls).toBe(1);
+      expect(result.outcome).toBe("completed");
+      expect(phases).toEqual(["网络连接波动，30 秒后重试（2/5）"]);
+      expect(instance.state.messages).not.toContainEqual(
+        expect.objectContaining({ errorMessage: "Connection error" }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("honors custom attempts and exhausts only retryable failures", async () => {
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      retryAttempts: 3,
+      retryDelayMs: 0,
+      timeoutMs: 10_000,
+    });
+    const instance = mockAgent.instance!;
+    instance.state.messages = [
+      { role: "user", content: "test" },
+      assistant("error", "fetch failed"),
+    ];
+    instance.state.errorMessage = "fetch failed";
+    mockAgent.continueHook = (agent) => {
+      agent.state.messages = [...agent.state.messages, assistant("error", "HTTP 503 server error")];
+      agent.state.errorMessage = "HTTP 503 server error";
+    };
+    mockAgent.resolvePrompt?.();
+
+    const result = await running;
+
+    expect(mockAgent.continueCalls).toBe(2);
+    expect(result.outcome).toBe("error");
+    expect(result.notes).toContain("transient model error: exhausted 3 attempts");
+  });
+
+  it("replaces partial text from an abandoned streamed attempt", async () => {
+    const deltas: string[] = [];
+    const replacements: string[] = [];
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      retryAttempts: 2,
+      retryDelayMs: 0,
+      onDelta: (chunk) => deltas.push(chunk),
+      onDeltaReset: (text) => replacements.push(text),
+      timeoutMs: 10_000,
+    });
+    const instance = mockAgent.instance!;
+    const failure = assistant("error", "Connection error");
+    instance.state.messages = [{ role: "user", content: "test" }, failure];
+    instance.state.errorMessage = "Connection error";
+    // The provider's partial assistant never receives message_end. pi-core then
+    // emits a second synthetic failure assistant around the terminal error.
+    mockAgent.subscriber?.({ type: "message_start", message: failure });
+    mockAgent.subscriber?.({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "abandoned" },
+    });
+    mockAgent.subscriber?.({ type: "message_start", message: failure });
+    mockAgent.subscriber?.({ type: "message_end", message: failure });
+    mockAgent.continueHook = (agent) => {
+      const success = assistant("stop");
+      mockAgent.subscriber?.({ type: "message_start", message: success });
+      mockAgent.subscriber?.({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "kept" },
+      });
+      mockAgent.subscriber?.({ type: "message_end", message: success });
+      agent.state.messages = [...agent.state.messages, success];
+    };
+    mockAgent.resolvePrompt?.();
+
+    const result = await running;
+
+    expect(deltas).toEqual(["abandoned", "kept"]);
+    expect(replacements).toEqual([""]);
+    expect(result.streamedText).toBe("kept");
+    expect(result.outcome).toBe("completed");
+  });
+
+  it("does not charge transient failures against the logical turn budget", async () => {
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      retryAttempts: 2,
+      retryDelayMs: 0,
+      maxTurns: 2,
+      timeoutMs: 10_000,
+    });
+    const instance = mockAgent.instance!;
+    const failure = assistant("error", "Connection error");
+    instance.state.messages = [{ role: "user", content: "test" }, failure];
+    instance.state.errorMessage = "Connection error";
+    mockAgent.subscriber?.({ type: "turn_end", message: failure });
+    mockAgent.continueHook = (agent) => {
+      const success = {
+        ...assistant("stop"),
+        content: [{ type: "toolCall", id: "tool-1" }],
+      };
+      mockAgent.subscriber?.({ type: "turn_end", message: success });
+      agent.state.messages = [...agent.state.messages, success];
+    };
+    mockAgent.resolvePrompt?.();
+
+    const result = await running;
+
+    expect(result.outcome).toBe("completed");
+    expect(mockAgent.abortCalls).toBe(0);
+  });
+
+  it("does not retry authentication errors", async () => {
+    const running = runPiAgentLoop({
+      prompt: "test",
+      systemPrompt: "test",
+      tools: [],
+      model: {},
+      retryAttempts: 5,
+      retryDelayMs: 0,
+      timeoutMs: 10_000,
+    });
+    const instance = mockAgent.instance!;
+    instance.state.messages = [
+      { role: "user", content: "test" },
+      assistant("error", "HTTP 401 invalid API key"),
+    ];
+    instance.state.errorMessage = "HTTP 401 invalid API key";
+    mockAgent.resolvePrompt?.();
+
+    const result = await running;
+
+    expect(mockAgent.continueCalls).toBe(0);
+    expect(result.outcome).toBe("error");
+  });
+
+  it("aborts immediately during retry backoff", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const running = runPiAgentLoop({
+        prompt: "test",
+        systemPrompt: "test",
+        tools: [],
+        model: {},
+        retryAttempts: 5,
+        retryDelayMs: 30_000,
+        timeoutMs: 180_000,
+        signal: controller.signal,
+      });
+      const instance = mockAgent.instance!;
+      instance.state.messages = [
+        { role: "user", content: "test" },
+        assistant("error", "Connection error"),
+      ];
+      instance.state.errorMessage = "Connection error";
+      mockAgent.resolvePrompt?.();
+      await vi.advanceTimersByTimeAsync(1);
+      controller.abort();
+
+      const result = await running;
+
+      expect(mockAgent.continueCalls).toBe(0);
+      expect(result.outcome).toBe("aborted");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

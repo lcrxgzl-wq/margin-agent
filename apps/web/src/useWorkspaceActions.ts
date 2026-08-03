@@ -5,6 +5,7 @@ import {
   decideReviewChecklist,
   closeDocumentSession,
   exportDocumentDocx,
+  getSession,
   listComments,
   listProposals,
   listReviewChecklists,
@@ -44,6 +45,8 @@ import {
 import { useMarginStore } from "./store";
 import { filterEditableBlockIds, selectionEditUnavailableReason } from "./selectionSafety";
 import { replaceChecklistRun } from "./reviewChecklists";
+import { retryFailedChat, snapshotChatRetrySelection } from "./chatRetry";
+import { refreshSessionContextUsage } from "./sessionContextUsage";
 
 function mid() {
   return crypto.randomUUID();
@@ -89,6 +92,10 @@ export function useWorkspaceActions(options?: {
   const [canCancel, setCanCancel] = useState(false);
   const [pendingMcpApproval, setPendingMcpApproval] = useState<PendingMcpApproval | null>(null);
   storeRef.current = store;
+  const refreshContextUsage = () => refreshSessionContextUsage(
+    getSession,
+    (usage) => storeRef.current.setContextUsage(usage),
+  );
   const assertDocumentClean = async () => {
     if (!storeRef.current.documentDirty) return;
     if (!confirmSaveBeforeContinue(true)) {
@@ -418,6 +425,7 @@ export function useWorkspaceActions(options?: {
       store.setReviewError(null);
       const result = await resolveProposal(document, proposalId, "Y");
       if (!result.ok) throw new Error(result.reason || "apply failed");
+      await refreshContextUsage();
       assertDocumentResponseCurrent(document, generation);
       if (result.document && result.blocks) store.setDocBundle(result.document, result.blocks);
       else await refreshDocument(result.document?.relativePath ?? document.relativePath, {
@@ -448,6 +456,7 @@ export function useWorkspaceActions(options?: {
       store.setReviewError(null);
       const result = await resolveProposal(document, proposalId, "E", editedText);
       if (!result.ok) throw new Error(result.reason || "apply failed");
+      await refreshContextUsage();
       assertDocumentResponseCurrent(document, generation);
       if (result.document && result.blocks) store.setDocBundle(result.document, result.blocks);
       else await refreshDocument(result.document?.relativePath ?? document.relativePath, {
@@ -477,6 +486,7 @@ export function useWorkspaceActions(options?: {
     try {
       store.setReviewError(null);
       await resolveProposal(document, proposalId, "N");
+      await refreshContextUsage();
       await refreshProposals(document.id);
       store.clearSelection();
       store.appendMessage({
@@ -503,6 +513,7 @@ export function useWorkspaceActions(options?: {
     try {
       store.setReviewError(null);
       const result = await resolveProposals(document, store.proposals.map((proposal) => proposal.id));
+      await refreshContextUsage();
       assertDocumentResponseCurrent(document, generation);
       store.setDocBundle(result.document, result.blocks);
       await Promise.all([
@@ -531,9 +542,11 @@ export function useWorkspaceActions(options?: {
     const document = store.doc;
     const count = store.proposals.length;
     const generation = store.beginBusy(`正在拒绝全部（${count}）…`);
+    let contextChanged = false;
     try {
       for (const proposal of store.proposals) {
         await resolveProposal(document, proposal.id, "N");
+        contextChanged = true;
       }
       await refreshProposals(document.id);
       store.appendMessage({
@@ -542,6 +555,7 @@ export function useWorkspaceActions(options?: {
         text: `已拒绝 ${count} 处待确认改动。`,
       });
     } finally {
+      if (contextChanged) await refreshContextUsage();
       store.endBusy(generation);
     }
   };
@@ -628,6 +642,7 @@ export function useWorkspaceActions(options?: {
     const generation = store.beginBusy("正在关闭文稿…");
     try {
       await closeDocumentSession();
+      await refreshContextUsage();
       assertDocumentResponseCurrent(document, generation, discardDirty);
       store.clearDocument();
       store.appendMessage({
@@ -641,10 +656,14 @@ export function useWorkspaceActions(options?: {
     }
   };
   const onSend = async (text: string, opts?: {
+    requestId?: string;
     cascadeBlockIds?: string[];
     /** Structured one-turn Skill ids from the composer @picker. */
     selectedSkills?: string[];
     threadId?: string;
+    sourcePaths?: string[];
+    chatMode?: "direct" | "socratic";
+    harnessId?: string;
     selection?: {
       blockId: string | null;
       blockIds?: string[];
@@ -656,7 +675,7 @@ export function useWorkspaceActions(options?: {
     };
   }) => {
     const selectionContext = opts?.selection ?? store.selection;
-    let chatMode = store.chatMode;
+    let chatMode = opts?.chatMode ?? store.chatMode;
     if (/苏格拉底|追问模式|先别改/.test(text)) {
       chatMode = "socratic";
       store.setChatMode("socratic");
@@ -690,7 +709,20 @@ export function useWorkspaceActions(options?: {
       messageError(error);
       return;
     }
-    store.appendMessage({ id: mid(), role: "user", text, threadId: opts?.threadId });
+    const userMessage = {
+      id: mid(),
+      role: "user" as const,
+      text,
+      threadId: opts?.threadId,
+    };
+    const requestId = opts?.requestId ?? userMessage.id;
+    store.appendMessage(userMessage);
+    let streamedAssistantMessageId: string | undefined;
+    let streamedDocument: Pick<DocumentMeta, "id" | "revision"> | undefined;
+    let requestSourcePaths: string[] | undefined;
+    let requestHarnessId: string | undefined;
+    let chatStreamStarted = false;
+    let chatStreamCompleted = false;
     try {
       const selectedIntent = selectionContext.text.trim()
         ? selectionEditIntent(text, selectionContext.text)
@@ -739,6 +771,7 @@ export function useWorkspaceActions(options?: {
         const generation = store.beginBusy("清空短记忆…");
         try {
           await api("/api/v1/chat/clear", { method: "POST", body: "{}" });
+          await refreshContextUsage();
           store.setMessages([
             { id: mid(), role: "assistant", text: "对话已清空，当前文稿保持打开。" },
           ]);
@@ -751,9 +784,19 @@ export function useWorkspaceActions(options?: {
       }
 
       const requestDocument = storeRef.current.doc;
+      requestSourcePaths = requestDocument
+        ? opts?.sourcePaths !== undefined
+          ? [...opts.sourcePaths]
+          : [...store.sourcePaths]
+        : undefined;
+      requestHarnessId = opts?.harnessId ?? store.llm?.harnessId;
+      streamedDocument = requestDocument
+        ? { id: requestDocument.id, revision: requestDocument.revision }
+        : undefined;
       const generation = store.beginBusy("正在处理…");
       try {
         const assistantId = mid();
+        streamedAssistantMessageId = assistantId;
         let bubbled = false;
         let pendingDelta = "";
         let deltaFrame: number | null = null;
@@ -782,24 +825,27 @@ export function useWorkspaceActions(options?: {
         setCanCancel(true);
         let done: Awaited<ReturnType<typeof chatStream>>;
         try {
+          chatStreamStarted = true;
+          const chatRequest = {
+            requestId,
+            message: text,
+            harnessId: requestHarnessId,
+            documentId: requestDocument?.id,
+            selectionBlockIds: selectionContext.blockIds?.length
+              ? selectionContext.blockIds
+              : selectionContext.blockId
+                ? [selectionContext.blockId]
+                : [],
+            selectionText: selectionContext.text,
+            selectionStart: selectionContext.selectionStart,
+            chatMode,
+            cascadeBlockIds: opts?.cascadeBlockIds,
+            sourcePaths: requestSourcePaths,
+            threadId: opts?.threadId,
+            selectedSkills: opts?.selectedSkills,
+          };
           done = await chatStream(
-            {
-              message: text,
-              harnessId: store.llm?.harnessId,
-              documentId: requestDocument?.id,
-              selectionBlockIds: selectionContext.blockIds?.length
-                ? selectionContext.blockIds
-                : selectionContext.blockId
-                  ? [selectionContext.blockId]
-                  : [],
-              selectionText: selectionContext.text,
-              selectionStart: selectionContext.selectionStart,
-              chatMode,
-              cascadeBlockIds: opts?.cascadeBlockIds,
-              sourcePaths: requestDocument ? store.sourcePaths : undefined,
-              threadId: opts?.threadId,
-              selectedSkills: opts?.selectedSkills,
-            },
+            chatRequest,
             (event) => {
               if (event.type === "status") store.setStatusLine(event.text);
               if (event.type === "approval_request") {
@@ -812,9 +858,17 @@ export function useWorkspaceActions(options?: {
                 });
               }
               if (event.type === "delta" && event.text) queueDelta(event.text);
+              if (event.type === "replace") {
+                if (deltaFrame !== null) window.cancelAnimationFrame(deltaFrame);
+                deltaFrame = null;
+                pendingDelta = "";
+                ensureBubble();
+                store.patchMessage(assistantId, { text: event.text });
+              }
             },
             controller.signal,
           );
+          chatStreamCompleted = true;
         } finally {
           if (activeChatAbortRef.current === controller) {
             activeChatAbortRef.current = null;
@@ -825,6 +879,7 @@ export function useWorkspaceActions(options?: {
           // Stream ended/errored/cancelled: any unresolved approval is closed by the server.
           setPendingMcpApproval(null);
         }
+        if (done.context) store.setContextUsage(done.context);
         if (done.opened || done.closed) {
           assertDocumentResponseCurrent(requestDocument, generation, allowOpenWhileDirty);
         }
@@ -843,12 +898,28 @@ export function useWorkspaceActions(options?: {
         if (done.sourcePaths && !switchedDocument) {
           store.setSourcePaths(done.sourcePaths);
         }
-        ensureBubble();
-        store.patchMessage(assistantId, {
-          text: done.reply,
-          task: done.task,
-          loadedSkills: done.loadedSkills,
-        });
+        if (done.conversationReset) {
+          bubbled = true;
+          store.setThreads([]);
+          store.setMessages([{
+            id: userMessage.id,
+            role: "user",
+            text: userMessage.text,
+          }, {
+            id: assistantId,
+            role: "assistant",
+            text: done.reply,
+            task: done.task,
+            loadedSkills: done.loadedSkills,
+          }]);
+        } else {
+          ensureBubble();
+          store.patchMessage(assistantId, {
+            text: done.reply,
+            task: done.task,
+            loadedSkills: done.loadedSkills,
+          });
+        }
         if (typeof done.clarificationRounds === "number") {
           store.setClarificationRounds(done.clarificationRounds);
         }
@@ -869,6 +940,9 @@ export function useWorkspaceActions(options?: {
         store.endBusy(generation);
       }
     } catch (error) {
+      if (chatStreamStarted && !chatStreamCompleted) {
+        store.setContextUsage(null);
+      }
       if (error instanceof DOMException && error.name === "AbortError") {
           store.appendMessage({
             id: mid(),
@@ -894,9 +968,49 @@ export function useWorkspaceActions(options?: {
             },
           });
       } else {
-        messageError(error);
+        if (chatStreamStarted && !chatStreamCompleted) {
+          store.appendMessage({
+            id: mid(),
+            role: "assistant",
+            text: error instanceof Error ? error.message : String(error),
+            retry: {
+              failedUserMessageId: userMessage.id,
+              failedAssistantMessageId: streamedAssistantMessageId,
+              requestId,
+              text,
+              selectedSkills: opts?.selectedSkills?.length ? [...opts.selectedSkills] : undefined,
+              threadId: opts?.threadId,
+              cascadeBlockIds: opts?.cascadeBlockIds?.length
+                ? [...opts.cascadeBlockIds]
+                : undefined,
+              sourcePaths: requestSourcePaths ? [...requestSourcePaths] : undefined,
+              chatMode,
+              harnessId: requestHarnessId,
+              selection: snapshotChatRetrySelection(selectionContext),
+              documentId: streamedDocument?.id,
+              documentRevision: streamedDocument?.revision,
+            },
+          });
+        } else {
+          messageError(error);
+        }
       }
     }
+  };
+  const onRetryChat = async (errorMessageId: string) => {
+    const current = storeRef.current;
+    await retryFailedChat({
+      messages: current.messages,
+      errorMessageId,
+      currentDocument: current.doc
+        ? { id: current.doc.id, revision: current.doc.revision }
+        : undefined,
+      documentDirty: current.documentDirty,
+      currentThreadIds: current.threads.map((thread) => thread.id),
+      setMessages: store.setMessages,
+      focusThread: current.focusThread,
+      send: onSend,
+    });
   };
   const onCascadeLocalOnly = () => {
     store.setCascadeOffer(null);
@@ -1029,6 +1143,7 @@ export function useWorkspaceActions(options?: {
       );
     },
     onSend,
+    onRetryChat,
     onToggleSourcePath,
     onCascadeLocalOnly,
     onCascadeConfirm,

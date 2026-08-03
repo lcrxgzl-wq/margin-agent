@@ -8,6 +8,18 @@ import {
   agentTimeoutSecondsToMs,
 } from "../../agentTimeout";
 import {
+  AGENT_RETRY_ATTEMPTS_DEFAULT,
+  AGENT_RETRY_ATTEMPTS_MAX,
+  AGENT_RETRY_ATTEMPTS_MIN,
+  AGENT_RETRY_DELAY_DEFAULT_SECONDS,
+  AGENT_RETRY_DELAY_MAX_SECONDS,
+  AGENT_RETRY_DELAY_MIN_SECONDS,
+  retryAttemptsFromInput,
+  retryAttemptsToInput,
+  retryDelayMsToSeconds,
+  retryDelaySecondsToMs,
+} from "../../agentRetry";
+import {
   SELECTION_CONTEXT_MAX_CHARS,
   SELECTION_CONTEXT_MIN_CHARS,
   selectionContextCharsToInput,
@@ -69,6 +81,10 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
   const [savedCompactionAuto, setSavedCompactionAuto] = useState(true);
   const [timeoutInput, setTimeoutInput] = useState("");
   const [savedTimeoutInput, setSavedTimeoutInput] = useState("");
+  const [retryAttemptsInput, setRetryAttemptsInput] = useState("");
+  const [savedRetryAttemptsInput, setSavedRetryAttemptsInput] = useState("");
+  const [retryDelayInput, setRetryDelayInput] = useState("");
+  const [savedRetryDelayInput, setSavedRetryDelayInput] = useState("");
   const [selectionContextInput, setSelectionContextInput] = useState("");
   const [savedSelectionContextInput, setSavedSelectionContextInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -102,6 +118,12 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
         const currentTimeout = agentTimeoutMsToSeconds(settings.agentTimeoutMs);
         setTimeoutInput(currentTimeout);
         setSavedTimeoutInput(currentTimeout);
+        const currentRetryAttempts = retryAttemptsToInput(settings.retryAttempts);
+        setRetryAttemptsInput(currentRetryAttempts);
+        setSavedRetryAttemptsInput(currentRetryAttempts);
+        const currentRetryDelay = retryDelayMsToSeconds(settings.retryDelayMs);
+        setRetryDelayInput(currentRetryDelay);
+        setSavedRetryDelayInput(currentRetryDelay);
         const currentSelectionContext = selectionContextCharsToInput(
           settings.selectionContextChars,
         );
@@ -132,6 +154,8 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
     contextTier !== savedContextTier ||
     compactionAuto !== savedCompactionAuto ||
     timeoutInput !== savedTimeoutInput ||
+    retryAttemptsInput !== savedRetryAttemptsInput ||
+    retryDelayInput !== savedRetryDelayInput ||
     selectionContextInput !== savedSelectionContextInput;
   const harnessDefaultTitle = harnesses.find((h) => h.id === harnessDefaultId)?.title ?? "";
 
@@ -141,6 +165,20 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
     if (agentTimeoutMs === undefined) {
       setError(
         `请求超时需为 ${AGENT_TIMEOUT_MIN_SECONDS}–${AGENT_TIMEOUT_MAX_SECONDS} 的整数秒，或留空使用默认值。`,
+      );
+      return;
+    }
+    const retryAttempts = retryAttemptsFromInput(retryAttemptsInput);
+    if (retryAttempts === undefined) {
+      setError(
+        `重试总尝试数需为 ${AGENT_RETRY_ATTEMPTS_MIN}–${AGENT_RETRY_ATTEMPTS_MAX} 的整数，或留空使用默认值。`,
+      );
+      return;
+    }
+    const retryDelayMs = retryDelaySecondsToMs(retryDelayInput);
+    if (retryDelayMs === undefined) {
+      setError(
+        `重试间隔需为 ${AGENT_RETRY_DELAY_MIN_SECONDS}–${AGENT_RETRY_DELAY_MAX_SECONDS} 的整数秒，或留空使用默认值。`,
       );
       return;
     }
@@ -159,6 +197,8 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
         harnessId: harnessId || null,
         reasoningMode,
         agentTimeoutMs,
+        retryAttempts,
+        retryDelayMs,
         selectionContextChars,
         contextTier,
         compactionAuto,
@@ -169,6 +209,8 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
       setSavedContextTier(contextTier);
       setSavedCompactionAuto(compactionAuto);
       setSavedTimeoutInput(timeoutInput);
+      setSavedRetryAttemptsInput(retryAttemptsInput);
+      setSavedRetryDelayInput(retryDelayInput);
       setSavedSelectionContextInput(selectionContextInput);
       setNotice("已保存 Agent 设置。");
     } catch (reason) {
@@ -296,6 +338,56 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
         </label>
         <small className="settings-field-note">
           压缩前记录会完整存档；关闭后超长对话将退化为直接截断。节省（eco）档位始终不启用摘要。
+        </small>
+      </div>
+
+      <div className="settings-field">
+        <span id="retry-attempts-label">失败重试总尝试数</span>
+        <input
+          type="number"
+          min={AGENT_RETRY_ATTEMPTS_MIN}
+          max={AGENT_RETRY_ATTEMPTS_MAX}
+          step={1}
+          value={retryAttemptsInput}
+          disabled={busy}
+          placeholder={String(AGENT_RETRY_ATTEMPTS_DEFAULT)}
+          onChange={(event) => setRetryAttemptsInput(event.target.value)}
+          aria-labelledby="retry-attempts-label"
+        />
+        <small className="settings-field-note">
+          包含首次请求；留空使用默认 {AGENT_RETRY_ATTEMPTS_DEFAULT} 次
+        </small>
+      </div>
+
+      <div className="settings-field">
+        <span id="retry-delay-label">重试间隔（秒）</span>
+        <input
+          type="number"
+          min={AGENT_RETRY_DELAY_MIN_SECONDS}
+          max={AGENT_RETRY_DELAY_MAX_SECONDS}
+          step={1}
+          value={retryDelayInput}
+          disabled={busy}
+          placeholder={String(AGENT_RETRY_DELAY_DEFAULT_SECONDS)}
+          onChange={(event) => setRetryDelayInput(event.target.value)}
+          aria-labelledby="retry-delay-label"
+        />
+        <div className="preset-row" aria-label="重试间隔快捷值">
+          {[0, 10, 30, 60].map((seconds) => (
+            <button
+              key={seconds}
+              type="button"
+              className={retryDelayInput === String(seconds) ? "chip accent" : "chip"}
+              disabled={busy}
+              aria-pressed={retryDelayInput === String(seconds)}
+              onClick={() => setRetryDelayInput(String(seconds))}
+            >
+              {seconds} 秒
+            </button>
+          ))}
+        </div>
+        <small className="settings-field-note">
+          每次失败后等待多久再请求；留空使用默认 {AGENT_RETRY_DELAY_DEFAULT_SECONDS} 秒
         </small>
       </div>
 

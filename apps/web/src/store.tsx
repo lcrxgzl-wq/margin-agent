@@ -6,6 +6,7 @@ import type {
   LlmSettingsPublic,
   Proposal,
   ReviewChecklistBundle,
+  SessionContextUsage,
 } from "./api";
 import type { SelectionBlockRange } from "@margin/domain";
 import type { ChatMessage } from "./components/Chat";
@@ -95,6 +96,7 @@ export type MarginState = {
   comments: Comment[];
   checklists: ReviewChecklistBundle[];
   llm: LlmSettingsPublic | null;
+  contextUsage: SessionContextUsage | null;
   selection: Selection;
   menu: ContextMenu | null;
   rewritePrompt: RewritePromptState | null;
@@ -148,6 +150,7 @@ type Action =
   | { type: "collapseThread"; threadId: string }
   | { type: "closeThread"; threadId: string }
   | { type: "setLlm"; llm: LlmSettingsPublic | null }
+  | { type: "setContextUsage"; contextUsage: SessionContextUsage | null }
   | { type: "setBootError"; bootError: string | null }
   | { type: "setStatusLine"; statusLine: string }
   | { type: "setChatMode"; chatMode: "direct" | "socratic" }
@@ -166,6 +169,7 @@ export const initialMarginState: MarginState = {
   comments: [],
   checklists: [],
   llm: null,
+  contextUsage: null,
   selection: { blockId: null, text: "", anchor: null },
   menu: null,
   rewritePrompt: null,
@@ -353,6 +357,8 @@ export function marginReducer(state: MarginState, action: Action): MarginState {
       };
     case "setLlm":
       return { ...state, llm: action.llm };
+    case "setContextUsage":
+      return { ...state, contextUsage: action.contextUsage };
     case "setBootError":
       return { ...state, bootError: action.bootError };
     case "setStatusLine":
@@ -438,6 +444,7 @@ type MarginStore = MarginState & {
   collapseThread: (threadId: string) => void;
   closeThread: (threadId: string) => void;
   setLlm: (llm: LlmSettingsPublic | null) => void;
+  setContextUsage: (contextUsage: SessionContextUsage | null) => void;
   setBootError: (bootError: string | null) => void;
   setStatusLine: (statusLine: string) => void;
   setChatMode: (chatMode: "direct" | "socratic") => void;
@@ -493,6 +500,7 @@ export function MarginStoreProvider({ children }: { children: ReactNode }) {
       collapseThread: (threadId) => dispatch({ type: "collapseThread", threadId }),
       closeThread: (threadId) => dispatch({ type: "closeThread", threadId }),
       setLlm: (llm) => dispatch({ type: "setLlm", llm }),
+      setContextUsage: (contextUsage) => dispatch({ type: "setContextUsage", contextUsage }),
       setBootError: (bootError) => dispatch({ type: "setBootError", bootError }),
       setStatusLine: (statusLine) => dispatch({ type: "setStatusLine", statusLine }),
       setChatMode: (chatMode) => dispatch({ type: "setChatMode", chatMode }),

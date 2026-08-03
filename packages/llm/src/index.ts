@@ -144,14 +144,16 @@ async function requestTextCompletion(
   system: string,
   signal?: AbortSignal,
   timeoutMs?: number,
+  options?: { maxTokens?: number; rejectTokenLimit?: boolean },
 ): Promise<string> {
   const format = runtimeFormat();
   const key = runtimeApiKey(format);
   if (!key && !process.env.MARGIN_BASE_URL) throw new Error("LLM is not configured");
   const model = process.env.MARGIN_MODEL || (format === "anthropic" ? "claude-sonnet-4-6" : "gpt-4o-mini");
+  const maxTokens = options?.maxTokens ?? 4096;
   const body = format === "anthropic"
-    ? { model, max_tokens: 4096, system, messages: [{ role: "user", content: prompt }] }
-    : { model, max_tokens: 4096, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] };
+    ? { model, max_tokens: maxTokens, system, messages: [{ role: "user", content: prompt }] }
+    : { model, max_tokens: maxTokens, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] };
   const timeout = AbortSignal.timeout(completionTimeoutMs(timeoutMs));
   const headers = runtimeHeaders(format, key ?? "ollama");
   const response = await fetch(runtimeEndpoint(format), {
@@ -181,6 +183,9 @@ async function requestTextCompletion(
       requestId: headers["X-Client-Request-Id"] ?? "",
     });
   }
+  if (options?.rejectTokenLimit && completionReachedTokenLimit(format, payload)) {
+    throw new Error("LLM response was truncated at the output token limit");
+  }
   const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
   if (format === "anthropic") {
     const content = Array.isArray(record.content) ? record.content : [];
@@ -194,6 +199,41 @@ async function requestTextCompletion(
   const choices = Array.isArray(record.choices) ? record.choices : [];
   const first = choices[0] as { message?: { content?: unknown } } | undefined;
   return typeof first?.message?.content === "string" ? first.message.content.trim() : "";
+}
+
+export function completionReachedTokenLimit(
+  format: "openai" | "anthropic",
+  payload: unknown,
+): boolean {
+  const record = payload && typeof payload === "object"
+    ? payload as Record<string, unknown>
+    : {};
+  if (format === "anthropic") return record.stop_reason === "max_tokens";
+  const choices = Array.isArray(record.choices) ? record.choices : [];
+  const first = choices[0] as { finish_reason?: unknown } | undefined;
+  return first?.finish_reason === "length";
+}
+
+function stripLiteralThinkingBlocks(text: string): string {
+  const openingTag = /<thinking>/gi;
+  const closingTag = /<\/thinking>/gi;
+  let cursor = 0;
+  let inside = false;
+  let visible = "";
+  while (cursor < text.length) {
+    const marker = inside ? closingTag : openingTag;
+    marker.lastIndex = cursor;
+    const match = marker.exec(text);
+    if (!match) {
+      if (!inside) visible += text.slice(cursor);
+      break;
+    }
+    const index = match.index;
+    if (!inside) visible += text.slice(cursor, index);
+    cursor = index + match[0].length;
+    inside = !inside;
+  }
+  return visible;
 }
 
 function parseProposalJson(raw: string): unknown {
@@ -298,6 +338,12 @@ export type TranslateSelectionInput = {
   timeoutMs?: number;
 };
 
+function translationTokenBudget(textLength: number): 4096 | 8192 | 16384 {
+  if (textLength > 12_000) return 16_384;
+  if (textLength > 4_000) return 8_192;
+  return 4_096;
+}
+
 /** Single-shot translation: no session history, no proposals, no document writes. */
 export async function translateSelection(input: TranslateSelectionInput): Promise<string> {
   const text = input.text.trim();
@@ -310,8 +356,14 @@ export async function translateSelection(input: TranslateSelectionInput): Promis
   const target = input.targetLanguage === "en" ? "规范的学术英语" : "简体中文";
   const system = "你是 Margin 的单次翻译助手。只输出译文，不解释，不重复原文，不输出提案或 JSON。";
   const prompt = "请把下面的选区翻译成" + target + "。保留术语、引文、数字、专名与事实，不新增内容。选区：" + text;
-  const completion = await requestTextCompletion(prompt, system, input.signal, input.timeoutMs);
-  const translated = completion.trim();
+  const completion = await requestTextCompletion(
+    prompt,
+    system,
+    input.signal,
+    input.timeoutMs,
+    { maxTokens: translationTokenBudget(text.length), rejectTokenLimit: true },
+  );
+  const translated = stripLiteralThinkingBlocks(completion).trim();
   return translated || "（模型返回为空）";
 }
 

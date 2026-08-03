@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { isContextOverflow } from "@earendil-works/pi-ai";
+import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import {
   Agent,
@@ -41,6 +41,10 @@ export type PiLoopOptions = {
   usagePath?: "pi-chat" | "pi-scan";
   maxTurns?: number;
   timeoutMs?: number;
+  /** Total attempts for transient provider/transport failures; default 5. */
+  retryAttempts?: number;
+  /** Fixed delay between transient retries in milliseconds; default 30000. */
+  retryDelayMs?: number;
   maxContextMessages?: number;
   maxContextChars?: number;
   /** Floor for the final tool/text compaction rung; defaults to 32 (status quo). */
@@ -49,6 +53,8 @@ export type PiLoopOptions = {
   allowedToolNames?: readonly string[];
   onProgress?: (phase: string, tool?: string) => void;
   onDelta?: (chunk: string) => void;
+  /** Replace visible streamed text after abandoning a failed assistant attempt. */
+  onDeltaReset?: (text: string) => void;
   /** Model context window; enables usage-triggered compaction when set. */
   contextWindow?: number;
   /** Context tier; eco never summarizes (prune + trim ladder only). */
@@ -89,7 +95,37 @@ function unfinishedToolStatus(outcome: PiLoopOutcome): "error" | "aborted" {
 
 const DEFAULT_MAX_CONTEXT_MESSAGES = 80;
 const DEFAULT_MAX_CONTEXT_CHARS = 200_000;
+export const DEFAULT_RETRY_ATTEMPTS = 5;
+export const DEFAULT_RETRY_DELAY_MS = 30_000;
 const REDACTED_KEY = /(?:api.?key|authorization|cookie|password|secret|token)/i;
+
+function positiveIntegerOr(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? value
+    : fallback;
+}
+
+function nonNegativeIntegerOr(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0
+    ? value
+    : fallback;
+}
+
+function waitForRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  if (delayMs === 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 function serializedChars(value: unknown): number {
   try {
@@ -325,15 +361,24 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
   ]);
   const turnCap = opts.maxTurns ?? 40;
   const limit = opts.timeoutMs ?? 300_000;
+  const retryAttempts = positiveIntegerOr(opts.retryAttempts, DEFAULT_RETRY_ATTEMPTS);
+  const retryDelayMs = nonNegativeIntegerOr(opts.retryDelayMs, DEFAULT_RETRY_DELAY_MS);
   let turns = 0;
   let outcome: PiLoopOutcome = "completed";
   let streamedText = "";
+  let assistantStreamCheckpoint = 0;
+  let assistantMessageActive = false;
   let thrownError: string | undefined;
   const visibleTextFilter = new LiteralThinkingBlockFilter();
   const emitVisibleText = (text: string) => {
     if (!text) return;
     streamedText += text;
     opts.onDelta?.(text);
+  };
+  const rollbackFailedAssistantStream = () => {
+    if (streamedText.length === assistantStreamCheckpoint) return;
+    streamedText = streamedText.slice(0, assistantStreamCheckpoint);
+    opts.onDeltaReset?.(streamedText);
   };
 
   // Context compaction state (Round A): prune always; summarize when the
@@ -519,9 +564,23 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
   if (opts.signal?.aborted) onExternalAbort();
 
   const unsub = agent.subscribe((event) => {
+    if (event.type === "message_start") {
+      const message = event.message as { role?: string };
+      if (message.role === "assistant") {
+        // pi-core emits a synthetic failure assistant when the provider stream
+        // throws before the partial assistant receives message_end. Keep the
+        // original attempt boundary so retry rollback removes that partial text.
+        if (!assistantMessageActive) assistantStreamCheckpoint = streamedText.length;
+        assistantMessageActive = true;
+      }
+      return;
+    }
     if (event.type === "message_end") {
       const message = event.message as { role?: string; usage?: Partial<ModelUsage> };
-      if (message.role === "assistant") emitVisibleText(visibleTextFilter.finish());
+      if (message.role === "assistant") {
+        emitVisibleText(visibleTextFilter.finish());
+        assistantMessageActive = false;
+      }
       if (message.role === "assistant" && message.usage) {
         usageTotal.input += message.usage.input ?? 0;
         usageTotal.output += message.usage.output ?? 0;
@@ -557,8 +616,19 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
       return;
     }
     if (event.type === "turn_end") {
+      const turnMessage = event.message as {
+        role?: string;
+        stopReason?: string;
+        content?: Array<{ type?: string; id?: string }>;
+      };
+      // Provider/transport failures are request attempts, not logical tool
+      // turns. Counting them can exhaust maxTurns before the recovered turn.
+      if (
+        turnMessage.role === "assistant" &&
+        (turnMessage.stopReason === "error" || turnMessage.stopReason === "aborted")
+      ) return;
       turns += 1;
-      const content = (event.message as { content?: Array<{ type?: string; id?: string }> }).content;
+      const content = turnMessage.content;
       const toolCallIds = Array.isArray(content)
         ? content
             .filter((item) => item.type === "toolCall" && typeof item.id === "string")
@@ -593,6 +663,7 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
     if (!isContextOverflow(last as never, opts.contextWindow)) return;
     overflowRetried = true;
     notes.push("context overflow: compacted transcript and retried once");
+    rollbackFailedAssistantStream();
     // Delete the failed assistant message, compact the transcript, retry once.
     const cleaned = pruneToolOutputs(messages.slice(0, -1)).messages;
     let compacted: AgentMessage[];
@@ -631,10 +702,41 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
     await agent.continue();
   };
 
+  const runPromptWithTransientRetries = async () => {
+    let attempt = 1;
+    await agent.prompt(opts.prompt);
+    while (!combined.signal.aborted) {
+      // Context overflow has its own one-shot compaction path and does not
+      // consume the network retry budget.
+      await maybeRetryOverflowOnce();
+      if (combined.signal.aborted) return;
+      const messages = agent.state.messages as AgentMessage[];
+      const last = messages[messages.length - 1];
+      if (!last || !isRetryableAssistantError(last as never)) return;
+      if (attempt >= retryAttempts) {
+        notes.push(`transient model error: exhausted ${retryAttempts} attempts`);
+        return;
+      }
+
+      attempt += 1;
+      const seconds = retryDelayMs / 1_000;
+      const delayLabel = Number.isInteger(seconds) ? String(seconds) : seconds.toFixed(1);
+      const phase = `网络连接波动，${delayLabel} 秒后重试（${attempt}/${retryAttempts}）`;
+      notes.push(`transient model error: retry ${attempt}/${retryAttempts} after ${retryDelayMs}ms`);
+      opts.onProgress?.(phase);
+      // Keep the user/tool-result boundary and discard only the failed
+      // assistant response. Already completed tools are never replayed.
+      rollbackFailedAssistantStream();
+      agent.state.messages = messages.slice(0, -1) as never;
+      await waitForRetry(retryDelayMs, combined.signal);
+      if (combined.signal.aborted) return;
+      await agent.continue();
+    }
+  };
+
   try {
     if (!combined.signal.aborted) {
-      await agent.prompt(opts.prompt);
-      await maybeRetryOverflowOnce();
+      await runPromptWithTransientRetries();
     }
   } catch (error) {
     if (combined.signal.aborted && outcome === "completed") {
