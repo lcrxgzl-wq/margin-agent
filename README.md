@@ -1,32 +1,49 @@
-<p align="center"><img src="brand/logo.svg" width="120" alt="Margin logo"></p>
+<p align="center">
+  <img src="brand/logo.svg" width="96" alt="Margin logo">
+</p>
+
 <h1 align="center">Margin</h1>
 
-Margin 是本地优先的文档修订 Agent，面向以 Word（.docx）写作的作者。
+<p align="center">
+  <strong>本地优先的 Word 文档修订 Agent</strong><br>
+  开源 · 极简 · BYOK · 文稿不出本机
+</p>
 
-模型只对具体选区提出修改提案；作者在画布上逐条 **Y / N / E**（接受 / 拒绝 / 编辑后接受）。只有被接受的提案才写入工作副本——原文不动，全过程留档，文稿不出本机。
+<p align="center">
+  <a href="https://www.npmjs.com/package/margin-agent"><img alt="npm" src="https://img.shields.io/npm/v/margin-agent.svg"></a>
+  <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <a href="CHANGELOG.md"><img alt="changelog" src="https://img.shields.io/badge/changelog-0.6.1-informational.svg"></a>
+</p>
 
-## 解决的问题
+<p align="center">
+  <img src="brand/social-preview.png" width="640" alt="Margin social preview">
+</p>
 
-用大语言模型修改论文时存在三个问题：模型通常直接输出改写后的全文，作者难以逐条核对改了什么、为什么改；修改过程没有记录，无法回溯；文稿经过第三方云端服务时存在数据外流的顾虑。
+用 AI 辅助写 Word 时，你是否还在对话框和文档之间来回 Ctrl+C / Ctrl+V？或是对着 coding agent 的成块黑盒改动无所适从——它改了什么、为什么改，无法即时查阅、无法逐条反悔？亦或者，你担心未发表的论证在一次次粘贴中被悄悄带离本机？
 
-## 工作方式
+一组朴素的事实：**文稿的所有权是你的。** 你作为自然人，是文档内容的第一负责人。任何工具对正文的改动，都应该经过你；任何改动文稿的行为，都应该发生在你看得见的地方。
 
-Margin 将模型的每次修改限定为一条针对具体选区（一句话、一个段落或一个表格单元格）的修改提案，提案附修改理由与依据。作者在浏览器的文档画布上逐条审阅，选择接受（Y）、拒绝（N）或编辑后接受（E）；只有被接受的提案才写入文档的工作副本，原始文件不被改动。提案、裁决与写入操作全部记录在本地数据库中，可按时间线回看。
+**Margin** 从这一组最小问题出发：运行在你自己电脑上的文档修订 Agent，专为 Word（`.docx`）写作场景设计。它只做一件事——在 AI 时代优化你已形成的文档编辑习惯，作为进入 AGI 时代前的中间方案。
 
-模型 API 由使用者自行配置（OpenAI 兼容或 Anthropic）。文稿与运行记录均保存在本机，不经过其他服务器；未配置 API 时可使用离线模式熟悉操作流程。
+## 提案制，而非覆盖制
 
-## 要求
+Agent 针对你选中的段落给出具体修改，每一处改动以修订标记呈现——改了哪个词、哪句话，修改前后对照一目了然。
 
-- Windows x64 便携版：无需安装 Node.js 或 npm
-- npm 安装：Node.js 22+
-- 源码开发：Node.js 22+、pnpm 11+
+- **Y 接受** — 采用这条建议，写入工作副本  
+- **E 编辑后接受** — 先改成自己认可的表达，再写入  
+- **N 拒绝** — 保留原文  
 
-## 安装（最终用户）
+只有被你接受的提案才会写入工作副本；**原始 `.docx` 不会被改动**。每一次动作记录在工作区本地数据库里，随时可回溯。
 
-Windows x64 用户可从 [GitHub Releases](https://github.com/lcrxgzl-wq/margin-agent/releases) 下载
-`margin-agent-win-x64-vX.Y.Z.zip`，解压后双击“Start Margin.cmd”。程序自带 Node.js；默认工作区是“文档\\Margin”，也可把论文文件夹拖到启动文件上。更新时替换程序目录即可，工作区与 `.margin` 记录不会被删除。
+调用模型时，只有选区和必要上下文会发送给你自己配置的服务商——**用你的钥匙（BYOK）**，走你的账户，没有任何遥测。服务只监听 `127.0.0.1`。
 
-已安装 Node.js 22+ 的用户也可使用 npm：
+## 安装
+
+**Windows x64 便携版**（无需 Node / npm / 管理员权限）
+
+从 [GitHub Releases](https://github.com/lcrxgzl-wq/margin-agent/releases) 下载 `margin-agent-win-x64-vX.Y.Z.zip`，解压后双击 `Start Margin.cmd`。自带 Node 运行时；启动器自动挑选空闲端口。默认工作区为「文档\Margin」，也可把论文文件夹拖到启动文件上。
+
+**npm**（Node.js 22+）
 
 ```bash
 npm i -g margin-agent
@@ -34,74 +51,43 @@ cd /path/to/你的论文目录
 margin-agent
 ```
 
-浏览器会自动打开（服务只监听 127.0.0.1）。在「设置」里配置 OpenAI 兼容或 Anthropic 的 Base URL + Key（BYOK）；未配置时使用离线模式。详见 `docs/USAGE.md`。
+更新：`npm i -g margin-agent@latest`。浏览器会自动打开。在「设置」里配置 OpenAI 兼容或 Anthropic 的 Base URL + Key；未配置时可用离线模式熟悉流程。详见 [`docs/USAGE.md`](docs/USAGE.md)。
 
+## 按需进阶
 
-## 快速开始（MVP）
+- **模型**：任意 OpenAI 兼容 / Anthropic 端点；可调推理强度  
+- **外读资料**：挂载或粘贴本机路径，一次读入 md / txt / json / csv / pdf / docx（提取文本）  
+- **方法（Skills）**：管理写作方法论；聊天框 `@` 按需挂载  
+- **会话**：顶栏新建 / 切换 / 清空；上下文用量可见，约 85% 自动压缩，也可手动压缩  
+- **多工作区**：一篇文稿一个窗口——`MARGIN_PORT=8788 margin-agent`（便携版自动分配端口）
+
+## 与 miwrite
+
+[miwrite](https://miwrite.art/) 网页工作台里「修改是一条待审建议，而不是一键覆盖」的工作方式，来自本开源项目。Margin 适合要完整本地 Agent、文稿与记录都留在自己电脑上的作者；miwrite 适合浏览器里围绕同一份文稿持续读写、审阅与模块化任务。
+
+- 介绍：[从一份 Word 开始，让 AI 围着文稿工作](https://mp.weixin.qq.com/s/OBZ7VNd4YyCmizITaZVDug)  
+- 发布说明：[Margin-agent：Vibe Writing 工作流 · 开源 · 极简 · 本地运行](https://mp.weixin.qq.com/s/9MXSPtXo_J64zqNp0rL6Mw)
+
+## 更新日志
+
+见 [`CHANGELOG.md`](CHANGELOG.md)（自 **v0.6.1** 起维护）。
+
+## 开发
 
 ```bash
-cd E:\margin
 pnpm install
 pnpm test
-pnpm mvp
+pnpm mvp   # 或 pnpm start
 ```
 
-使用：在对话中粘贴 `.docx` 绝对路径导入 → 画布中编辑或选中文字 → Agent 给出修改提案 → Y/N/E 裁决后应用。  
-DOCX 是 Word 主路径的规范文件；Markdown 仅保留旧文稿兼容。人的画布编辑需显式保存，Agent 永远不能直接覆盖正文。
-长期规划：`ROADMAP.md` · 验收标准：`docs/MVP.md`
-
-## 多工作区
-
-每个 CLI 进程只服务一个工作区，默认监听 8787 端口。需要同时处理两个工作区时，打开两个终端，指定不同端口：
-
-```bash
-MARGIN_PORT=8787 margin-agent E:\论文A
-MARGIN_PORT=8788 margin-agent E:\论文B
-```
-
-启动时报 `EADDRINUSE: address already in use 127.0.0.1:8787`，说明 8787 已被占用——通常是已有一个 margin-agent 实例在运行（检查已打开的终端窗口），或上一个进程尚未退出。关掉它，或按上面方式换个端口。便携版启动器会自动挑选空闲端口，无需处理。
-
-## BYOK
-
-```bash
-# OpenAI 兼容
-set OPENAI_API_KEY=sk-...
-set MARGIN_MODEL=gpt-4o-mini
-
-# 或 Ollama
-set MARGIN_BASE_URL=http://127.0.0.1:11434/v1
-set MARGIN_API_KEY=ollama
-set MARGIN_MODEL=llama3.1
-```
-
-未配置 Key 时以离线模式运行（仍可完成导入文档、读取资料和提案审阅的完整流程）；配置后由模型处理对话与提案生成。
-
-## 数据位置
-
-工作区内：
-
-```text
-.margin/margin.db      # 提案 / 裁决 / 应用事件
-.margin/backups/       # 应用前备份
-.margin/workspace.lock
-imports/*.docx         # 外部 Word 原件的工作副本（原文件不修改）
-```
-
-真实 Word 画布门禁（需系统 Edge）：
-
-```powershell
-pnpm gate:office -- "E:\path\paper.docx"
-```
-
-## 架构与规划
-
-- 产品宪法：`MARGIN_PLAN.md`
-- 长程里程碑：`ROADMAP.md`（经 GPT sol 审定：**Go with changes**）
+DOCX 是 Word 主路径的规范文件；人的画布编辑需显式保存，Agent 永远不能直接覆盖正文。规划见 `ROADMAP.md` · `MARGIN_PLAN.md`。
 
 ## 致谢
 
-Agent 壳基于 [pi](https://github.com/earendil-works/pi)（Mario Zechner，MIT）构建；DOCX 适配层部分派生自 canvas-editor 生态（见 `THIRD_PARTY_NOTICES.md`）。
+Agent 壳基于 [pi](https://github.com/earendil-works/pi)（Mario Zechner，MIT）；DOCX 适配层部分派生自 canvas-editor 生态（见 `THIRD_PARTY_NOTICES.md`）。
+
+开发者：MaskedPalmCivet（落尘如雪） · `lcrx.gzl@foxmail.com`
 
 ## 许可
 
-MIT（本地）。云端中转/计费为专有，不在本 Phase。
+MIT（本地）。云端中转 / 计费为专有，不在本仓库范围。

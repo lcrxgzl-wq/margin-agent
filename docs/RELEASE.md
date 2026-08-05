@@ -9,6 +9,10 @@
 
 ## 每次发布
 
+1. 先在根目录 `CHANGELOG.md` 写好本版说明（自 v0.6.1 起维护；面向用户，中文即可）。
+2. 同步根 `README.md` 与 `apps/cli/README.md` 的 changelog badge 版本号（若有）。
+3. 再升版本号并跑门禁：
+
 ```bash
 cd apps/cli && npm version patch --no-git-tag-version && cd ../..  # 或 minor
 pnpm build && pnpm test && pnpm typecheck
@@ -30,13 +34,13 @@ npm view margin-agent                    # 验证已上线
 ### 之后（0.1.1+，OIDC 自动）
 
 ```bash
-git add apps/cli/package.json
+git add CHANGELOG.md README.md apps/cli/README.md apps/cli/package.json
 git commit -m "release: vX.Y.Z"
 git tag vX.Y.Z
 git push && git push --tags
 ```
 
-tag 推送触发 `.github/workflows/publish.yml`：全部门禁（test/typecheck/build/gate:release/gate:install）→ `npm publish --provenance` → Windows x64 便携包门禁 → 创建 GitHub Release 并上传 ZIP 与 SHA-256。Actions 页面绿灯即发布完成。
+tag 推送触发 `.github/workflows/publish.yml`：全部门禁（test/typecheck/build/gate:release/gate:install）→ `npm publish --provenance` → Windows x64 便携包门禁 → 创建 GitHub Release 并上传 ZIP 与 SHA-256。Actions 页面绿灯即发布完成。发布后用 `CHANGELOG.md` 对应章节更新该 tag 的 Release 正文（`gh release edit`）。
 
 ## 验证用户安装
 
