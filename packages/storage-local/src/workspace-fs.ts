@@ -1004,7 +1004,147 @@ export function listMarkdownFiles(ws: Workspace): string[] {
 
 /** Read-only material candidates that can be attached to an agent turn. */
 export function listWorkspaceSourceFiles(ws: Workspace): string[] {
-  return listWorkspaceFilesMatching(ws, /\.(md|markdown|txt|csv|pdf|docx)$/i);
+  return listWorkspaceFilesMatching(ws, /\.(md|markdown|txt|json|csv|pdf|docx)$/i);
+}
+
+const EXTERNAL_SOURCE_LIST_EXT = /\.(md|markdown|txt|json|csv|pdf|docx)$/i;
+const MAX_EXTERNAL_LIST_ENTRIES = 400;
+const MAX_EXTERNAL_RECURSIVE_DEPTH = 4;
+
+export type ExternalDirectoryListing = {
+  path: string;
+  files: string[];
+  directories: string[];
+  truncated: boolean;
+};
+
+/**
+ * Shallow list of an absolute directory for unlimited external reads.
+ * Returns readable material files + child directories (no recursion, no symlinks).
+ */
+export type ListExternalSourceDirectoryOptions = {
+  unlimitedRead?: boolean;
+  recursive?: boolean;
+  extensions?: readonly string[];
+  query?: string;
+};
+
+function normalizeExtensionFilter(extensions?: readonly string[]): Set<string> | null {
+  if (!extensions?.length) return null;
+  const set = new Set<string>();
+  for (const ext of extensions) {
+    const trimmed = ext.trim().toLowerCase();
+    if (!trimmed) continue;
+    set.add(trimmed.startsWith(".") ? trimmed : `.${trimmed}`);
+  }
+  return set.size ? set : null;
+}
+
+function fileMatchesExternalFilters(
+  fileName: string,
+  extFilter: Set<string> | null,
+  queryLower: string,
+): boolean {
+  if (queryLower && !fileName.toLowerCase().includes(queryLower)) return false;
+  if (extFilter) {
+    const lower = fileName.toLowerCase();
+    return [...extFilter].some((ext) => lower.endsWith(ext));
+  }
+  return EXTERNAL_SOURCE_LIST_EXT.test(fileName);
+}
+
+export function listExternalSourceDirectory(
+  ws: Workspace,
+  absolutePath: string,
+  opts?: ListExternalSourceDirectoryOptions,
+): ExternalDirectoryListing {
+  const input = absolutePath.trim();
+  if (!input || (!path.isAbsolute(input) && !path.win32.isAbsolute(input))) {
+    throw new Error("directory path must be absolute");
+  }
+  if (!opts?.unlimitedRead) {
+    throw new Error(
+      "path is outside workspace; unlimited read is off — enable in Agent settings, or unset MARGIN_UNLIMITED=0",
+    );
+  }
+  if (!fs.existsSync(input)) throw new Error("directory not found");
+  const resolved = fs.realpathSync(input);
+  const inside = path.relative(fs.realpathSync(ws.root), resolved);
+  if (!(inside && !inside.startsWith("..") && !path.isAbsolute(inside))) {
+    if (isDeniedExternalPath(resolved)) {
+      throw new Error("refusing to read sensitive path");
+    }
+  }
+  const stat = fs.statSync(resolved);
+  if (!stat.isDirectory()) throw new Error("not a directory");
+
+  const recursive = opts?.recursive === true;
+  const extFilter = normalizeExtensionFilter(opts?.extensions);
+  const queryLower = (opts?.query ?? "").trim().toLowerCase();
+
+  const files: string[] = [];
+  const directories: string[] = [];
+  let truncated = false;
+
+  if (recursive) {
+    type QueueItem = { absDir: string; displayPrefix: string; depth: number };
+    const queue: QueueItem[] = [{ absDir: resolved, displayPrefix: input.replace(/\\/g, "/"), depth: 0 }];
+    while (queue.length && files.length < MAX_EXTERNAL_LIST_ENTRIES) {
+      const { absDir, displayPrefix, depth } = queue.shift()!;
+      const entries = fs.readdirSync(absDir, { withFileTypes: true })
+        .slice()
+        .sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        if (files.length >= MAX_EXTERNAL_LIST_ENTRIES) {
+          truncated = true;
+          break;
+        }
+        if (!entry.name || entry.name === "." || entry.name === "..") continue;
+        if (entry.isSymbolicLink()) continue;
+        const childAbs = path.join(absDir, entry.name);
+        if (isDeniedExternalPath(childAbs)) continue;
+        const display = `${displayPrefix.replace(/\/$/, "")}/${entry.name}`.replace(/\\/g, "/");
+        if (entry.isDirectory()) {
+          if (depth < MAX_EXTERNAL_RECURSIVE_DEPTH) {
+            queue.push({ absDir: childAbs, displayPrefix: display, depth: depth + 1 });
+          }
+        } else if (entry.isFile() && fileMatchesExternalFilters(entry.name, extFilter, queryLower)) {
+          files.push(display);
+        }
+      }
+    }
+    if (queue.length && files.length >= MAX_EXTERNAL_LIST_ENTRIES) truncated = true;
+  } else {
+    const entries = fs.readdirSync(resolved, { withFileTypes: true })
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (files.length + directories.length >= MAX_EXTERNAL_LIST_ENTRIES) {
+        truncated = true;
+        break;
+      }
+      if (!entry.name || entry.name === "." || entry.name === "..") continue;
+      if (entry.isSymbolicLink()) continue;
+      const childAbs = path.join(resolved, entry.name);
+      if (isDeniedExternalPath(childAbs)) continue;
+      const display = path.join(input, entry.name).replace(/\\/g, "/");
+      if (entry.isDirectory()) {
+        directories.push(display);
+      } else if (
+        entry.isFile() &&
+        fileMatchesExternalFilters(entry.name, extFilter, queryLower)
+      ) {
+        files.push(display);
+      }
+    }
+  }
+
+  return {
+    path: input.replace(/\\/g, "/"),
+    files,
+    directories,
+    truncated,
+  };
 }
 
 const TEXT_EXT = /\.(md|markdown|txt|json|csv)$/i;
@@ -1136,6 +1276,12 @@ export async function readWorkspaceSource(
     }
     if (isDeniedExternalPath(resolved)) {
       throw new Error("refusing to read sensitive path");
+    }
+    const externalStat = fs.statSync(resolved);
+    if (externalStat.isDirectory()) {
+      throw new Error(
+        "path is a directory; list it with list_workspace_files({ directory }) then read a concrete file path",
+      );
     }
     assertSingleLinkFile(resolved);
     return readExternalSource(relativePath, resolved);

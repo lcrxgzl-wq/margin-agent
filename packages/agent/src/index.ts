@@ -57,6 +57,7 @@ export { runPiAgentLoop } from "./pi-loop.js";
 export { stripLiteralThinkingBlocks } from "./assistant-text.js";
 export {
   COMPACTION_SUMMARY_PREFIX,
+  COMPACTION_USAGE_RATIO,
   createPiSummarizer,
   findLastContextTokens,
   findSafeCutIndex,
@@ -64,6 +65,7 @@ export {
   orchestrateCompaction,
   pruneToolOutputs,
   PRUNED_TOOL_OUTPUT_PLACEHOLDER,
+  reserveTokensForUsageRatio,
 } from "./compaction.js";
 export type {
   CompactionEvent,

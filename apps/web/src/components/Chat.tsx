@@ -15,6 +15,7 @@ import {
   PictureInPicture2,
   RotateCcw,
   Settings2,
+  Shrink,
   Square,
   Sun,
   X,
@@ -109,6 +110,8 @@ type Props = {
   onHeaderPointerDown?: (event: React.PointerEvent<HTMLElement>) => void;
   themeMode?: "light" | "dark" | "system";
   onThemeModeChange?: (mode: "light" | "dark" | "system") => void;
+  /** Hydrate session after manual context compaction. */
+  onCompactConversation?: () => Promise<void>;
 };
 
 export function Chat({
@@ -162,12 +165,14 @@ export function Chat({
   onHeaderPointerDown,
   themeMode,
   onThemeModeChange,
+  onCompactConversation,
 }: Props) {
   const [draft, setDraft] = useState("");
   const [skillOptions, setSkillOptions] = useState<SkillSummary[]>([]);
   const [pickedSkills, setPickedSkills] = useState<SkillSummary[]>([]);
   const [skillQuery, setSkillQuery] = useState<string | null>(null);
   const [busyElapsedSeconds, setBusyElapsedSeconds] = useState(0);
+  const [compacting, setCompacting] = useState(false);
   const bottom = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const followTail = useRef(true);
@@ -582,6 +587,25 @@ export function Chat({
                   </span>
                   {contextCopy ? (
                     <span className="context-usage" title={contextCopy.title}>{contextCopy.label}</span>
+                  ) : null}
+                  {onCompactConversation ? (
+                    <button
+                      type="button"
+                      className="chip context-compact"
+                      disabled={busy || compacting}
+                      title="压缩上下文（用量约 85% 时也会自动压缩）"
+                      aria-label="压缩上下文"
+                      onClick={() => {
+                        if (compacting || busy) return;
+                        setCompacting(true);
+                        void onCompactConversation()
+                          .catch(() => undefined)
+                          .finally(() => setCompacting(false));
+                      }}
+                    >
+                      <Shrink size={14} strokeWidth={1.8} aria-hidden />
+                      {compacting ? "压缩中…" : "压缩"}
+                    </button>
                   ) : null}
                 </div>
                 <button

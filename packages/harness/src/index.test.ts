@@ -37,7 +37,7 @@ describe("harness", () => {
     expect(getHarness().instructions).toContain("直接 offer_cascade");
     expect(getHarness().instructions).toContain("别讲实现架构");
     expect(getHarness().instructions).toContain("证据底线");
-    expect(getHarness().limits.maxTurns).toBe(40);
+    expect(getHarness().limits.maxTurns).toBe(60);
     expect(getHarness().capabilities).toContain("review.academic");
     expect(getHarness().capabilities).toContain("analysis.tabular");
     expect(getHarness().capabilities).toContain("remote.mcp");
@@ -115,20 +115,29 @@ describe("harness", () => {
     expect(session).not.toMatch(/隔离文件系统|宿主为你当前会话挂载/);
     expect(session).toContain("风格：问题意识清晰、文献对话、克制可辩护");
     expect(session).toContain("禁止 bash");
+    expect(session).toContain("外读已开启");
+    expect(session).toContain("list_workspace_files");
+    expect(session).not.toContain("请把文件放进工作区");
+    expect(session).not.toContain("禁止 bash、工作区外路径");
+    expect(session).not.toMatch(/隔离文件系统|宿主为你当前会话挂载/);
     expect(session).toContain("available_skills");
     expect(session).toContain("argument-revision-zh");
     expect(session.match(/你是 Margin/g)?.length).toBe(1);
-    expect(session).not.toContain("list_workspace_files");
+    expect(session).not.toContain("list_workspace_files(");
     // Full skill body is not inlined — only name/description index.
     expect(session).not.toContain("## 步骤");
     expect(session).not.toContain("与 cite_check");
-    // Core without skills index stays compact; with index still under ~2k.
-    expect(session.length).toBeLessThan(2000);
+    // Core without skills index stays compact; with index still under ~2.1k.
+    expect(session.length).toBeLessThan(2100);
+
+    const sessionOff = composeSystemPrompt("social-science-zh", "session", { unlimitedRead: false });
+    expect(sessionOff).toContain("外读已关闭");
+    expect(sessionOff).toContain("Agent 设置");
 
     const scan = composeSystemPrompt("minimal", "scan");
     expect(scan).toContain("非持久化扫描");
     expect(scan).not.toContain("available_skills");
-    expect(scan.length).toBeLessThan(320);
+    expect(scan.length).toBeLessThan(400);
   });
 
   it("lists academic method skills on the default office profile without auto-inlining them", () => {

@@ -328,6 +328,47 @@ describe("orchestrateCompaction", () => {
     expect(called).toBe(false);
   });
 
+  it("triggers automatic compaction once usage crosses 85% of the window", async () => {
+    const below = await orchestrateCompaction({
+      messages: [
+        userMsg("u1".padEnd(400, "1"), 1),
+        assistantMsg("a1".padEnd(400, "1"), {
+          usage: { totalTokens: 84_000, input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+          timestamp: 2,
+        }),
+        userMsg("u2".padEnd(400, "2"), 3),
+        assistantMsg("a2".padEnd(400, "2"), { timestamp: 4 }),
+        userMsg("latest", 5),
+      ],
+      model: fakeModel,
+      contextWindow: 100_000,
+      tier: "standard",
+      keepRecentTokens: 150,
+      summarizer: async () => "摘要",
+    });
+    expect(below.kind).toBe("skipped");
+    expect(below.kind === "skipped" && below.reason).toBe("below_threshold");
+
+    const above = await orchestrateCompaction({
+      messages: [
+        userMsg("u1".padEnd(400, "1"), 1),
+        assistantMsg("a1".padEnd(400, "1"), {
+          usage: { totalTokens: 86_000, input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+          timestamp: 2,
+        }),
+        userMsg("u2".padEnd(400, "2"), 3),
+        assistantMsg("a2".padEnd(400, "2"), { timestamp: 4 }),
+        userMsg("latest", 5),
+      ],
+      model: fakeModel,
+      contextWindow: 100_000,
+      tier: "standard",
+      keepRecentTokens: 150,
+      summarizer: async () => "摘要",
+    });
+    expect(above.kind).toBe("compacted");
+  });
+
   it("skips when no usage exists yet (never triggers on char estimates)", async () => {
     const outcome = await orchestrateCompaction({
       messages: [userMsg("u".repeat(500_000), 1)],

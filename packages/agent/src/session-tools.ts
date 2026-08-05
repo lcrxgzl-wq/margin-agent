@@ -14,6 +14,7 @@ import {
   loadAvailableSkill,
   type AgentCapability,
 } from "@margin/harness";
+import { mapHostFsError } from "@margin/storage-local";
 import { AnalysisRunStore } from "./data/store.js";
 import { createCascadeGate, type CascadeCandidate } from "./cascade.js";
 import {
@@ -39,6 +40,23 @@ export type SessionDocBag = {
 export type WorkspaceBridge = {
   skillsRoot?: string;
   listSourceFiles: () => string[];
+  /**
+   * Shallow-list an absolute directory when unlimited external reads are on.
+   * Returns readable material files + child directories.
+   */
+  listExternalDirectory?: (
+    absolutePath: string,
+    opts?: {
+      recursive?: boolean;
+      extensions?: string[];
+      query?: string;
+    },
+  ) => {
+    path: string;
+    files: string[];
+    directories: string[];
+    truncated: boolean;
+  };
   readText: (relativePath: string) => Promise<{
     relativePath: string;
     text: string;
@@ -84,6 +102,11 @@ export type WorkspaceBridge = {
 
 function normalizeRel(p: string): string {
   return p.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+function rethrowHostFsError(reason: unknown): never {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  throw new Error(mapHostFsError(message));
 }
 
 function isProtectedDocumentPath(
@@ -140,8 +163,8 @@ export type SessionToolOptions = {
   documentModeState?: { documentMode?: "full" | "lean" };
 };
 
-const DEFAULT_SOURCE_CHUNK_CHARS = 6_000;
-const MAX_SOURCE_CHUNK_CHARS = 12_000;
+/** Only pathological extracts page; normal sources return full extracted text. */
+const MAX_SOURCE_FILE_CHARS = 500_000;
 
 function normalizeSourcePath(relativePath: string): string {
   return normalizeRel(relativePath.trim());
@@ -241,17 +264,73 @@ export function createSessionTools(
     name: "list_workspace_files",
     label: "List Workspace Files",
     description:
-      "List Markdown, text, CSV, PDF, and DOCX material files in the local workspace. Read-only. Also returns the currently attached sourcePaths.",
-    parameters: Type.Object({}),
+      "List Markdown, text, JSON, CSV, PDF, and DOCX material files. Omit directory to list the workspace. When external reads are enabled, pass an absolute directory path to list that folder (optional recursive walk, extension and name filters). Read-only. Also returns the currently attached sourcePaths.",
+    parameters: Type.Object({
+      directory: Type.Optional(
+        Type.String({
+          description:
+            "Absolute directory to list when external reads are enabled; omit for workspace materials",
+        }),
+      ),
+      recursive: Type.Optional(
+        Type.Boolean({
+          description: "When true, walk subdirectories up to depth 4 (external directory only)",
+        }),
+      ),
+      extensions: Type.Optional(
+        Type.Array(Type.String(), {
+          description: 'Optional extension filter, e.g. [".pdf", ".docx"]',
+        }),
+      ),
+      query: Type.Optional(
+        Type.String({
+          description: "Optional case-insensitive substring filter on file basename",
+        }),
+      ),
+    }),
     executionMode: "sequential",
-    execute: async () => {
-      const files = bridge.listSourceFiles();
-      return {
-        content: [
-          { type: "text", text: JSON.stringify({ files, sourcePaths }) },
-        ],
-        details: { count: files.length },
+    execute: async (_id, raw) => {
+      const params = raw as {
+        directory?: unknown;
+        recursive?: unknown;
+        extensions?: unknown;
+        query?: unknown;
       };
+      const directory = typeof params.directory === "string"
+        ? params.directory.trim()
+        : "";
+      if (!directory) {
+        const files = bridge.listSourceFiles();
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ files, sourcePaths }) },
+          ],
+          details: { count: files.length },
+        };
+      }
+      if (!bridge.listExternalDirectory) {
+        throw new Error("external directory listing is not available on this host");
+      }
+      const recursive = params.recursive === true;
+      const extensions = Array.isArray(params.extensions)
+        ? params.extensions.filter((item): item is string => typeof item === "string")
+        : undefined;
+      const query = typeof params.query === "string" ? params.query : undefined;
+      try {
+        const listing = bridge.listExternalDirectory(directory, {
+          recursive,
+          extensions,
+          query,
+        });
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ ...listing, sourcePaths }) },
+          ],
+          details: { count: listing.files.length + listing.directories.length },
+        };
+      } catch (reason) {
+        rethrowHostFsError(reason);
+      }
     },
   };
 
@@ -259,15 +338,18 @@ export function createSessionTools(
     name: "read_workspace_file",
     label: "Read Workspace File",
     description:
-      "Read one bounded extracted-text chunk from md/txt/json/csv/pdf/docx inside the workspace. Prefer this for attached sources (pdf/csv) or closed files. For an already-open document, prefer get_document_outline + get_block/search_blocks instead of paging the whole file by offset. Read-only. Continue with nextOffset while hasMore is true; use sourceRef verbatim in propose_block_edit / propose_text_patch evidence.",
+      "Read the full extracted text of one md/txt/json/csv/pdf/docx source (workspace-relative, or absolute path when external reads are enabled; secret paths refused). Default is the entire file—do not offset-page attached or external sources. Optional offset/limit only for rare pinpoint slices or files larger than the hard ceiling. For the already-open working document, prefer injected full text or get_document_outline / get_block / search_blocks. Read-only. Use returned sourceRef verbatim in propose_block_edit / propose_text_patch evidence.",
     parameters: Type.Object({
-      relativePath: Type.String(),
+      relativePath: Type.String({
+        description:
+          "Workspace-relative path, or an absolute filesystem path when external reads are enabled",
+      }),
       offset: Type.Optional(
-        Type.Number({ description: "Character offset, default 0" }),
+        Type.Number({ description: "Character offset, default 0 (full-file reads start here)" }),
       ),
       limit: Type.Optional(
         Type.Number({
-          description: `Maximum characters for this chunk, default ${DEFAULT_SOURCE_CHUNK_CHARS}, capped at ${MAX_SOURCE_CHUNK_CHARS}`,
+          description: `Optional max characters. Omit to read the rest of the file (capped at ${MAX_SOURCE_FILE_CHARS}).`,
         }),
       ),
     }),
@@ -281,7 +363,11 @@ export function createSessionTools(
       const requestedPath = normalizeSourcePath(String(params.relativePath));
       let file = readCache.get(requestedPath);
       if (!file) {
-        file = await bridge.readText(requestedPath);
+        try {
+          file = await bridge.readText(requestedPath);
+        } catch (reason) {
+          rethrowHostFsError(reason);
+        }
         readCache.set(requestedPath, file);
         readCache.set(normalizeSourcePath(file.relativePath), file);
       }
@@ -299,11 +385,17 @@ export function createSessionTools(
       if (offset > file.text.length) {
         throw new Error(`offset ${offset} exceeds file length ${file.text.length}`);
       }
-      const rawLimit = Number(params.limit ?? DEFAULT_SOURCE_CHUNK_CHARS);
-      if (!Number.isFinite(rawLimit) || rawLimit <= 0) {
-        throw new Error("limit must be a positive number");
+      const remaining = file.text.length - offset;
+      let limit: number;
+      if (params.limit == null) {
+        limit = Math.min(MAX_SOURCE_FILE_CHARS, remaining);
+      } else {
+        const rawLimit = Number(params.limit);
+        if (!Number.isFinite(rawLimit) || rawLimit <= 0) {
+          throw new Error("limit must be a positive number");
+        }
+        limit = Math.min(MAX_SOURCE_FILE_CHARS, Math.floor(rawLimit));
       }
-      const limit = Math.min(MAX_SOURCE_CHUNK_CHARS, Math.floor(rawLimit));
       const nextOffset = Math.min(file.text.length, offset + limit);
       const hasMore = nextOffset < file.text.length;
       const text = file.text.slice(offset, nextOffset);

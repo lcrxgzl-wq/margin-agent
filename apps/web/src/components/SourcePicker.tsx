@@ -14,7 +14,11 @@ function pathKey(relativePath: string): string {
 }
 
 function isSupportedSource(relativePath: string): boolean {
-  return /\.(md|markdown|txt|csv|pdf|docx)$/i.test(relativePath);
+  return /\.(md|markdown|txt|json|csv|pdf|docx)$/i.test(relativePath);
+}
+
+function isSupportedAbsolutePath(rawPath: string): boolean {
+  return isSupportedSource(rawPath.replace(/\\/g, "/"));
 }
 
 export function SourcePicker({ attachedPaths, busy, documentPath, onToggle }: Props) {
@@ -23,6 +27,8 @@ export function SourcePicker({ attachedPaths, busy, documentPath, onToggle }: Pr
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savingPath, setSavingPath] = useState<string | null>(null);
+  const [absoluteDraft, setAbsoluteDraft] = useState("");
+  const [attachError, setAttachError] = useState<string | null>(null);
   const requestId = useRef(0);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -67,6 +73,7 @@ export function SourcePicker({ attachedPaths, busy, documentPath, onToggle }: Pr
     const currentRequest = ++requestId.current;
     setLoading(true);
     setError(null);
+    setAttachError(null);
     void listFiles()
       .then((data) => {
         if (requestId.current === currentRequest) setFiles(data.files);
@@ -119,8 +126,52 @@ export function SourcePicker({ attachedPaths, busy, documentPath, onToggle }: Pr
           {loading ? <p className="source-picker-note">正在读取工作区…</p> : null}
           {error ? <p className="source-picker-note error">{error}</p> : null}
           {!loading && !error && choices.length === 0 ? (
-            <p className="source-picker-note">没有可用的 TXT、Markdown、CSV、PDF 或 DOCX。</p>
+            <p className="source-picker-note">没有可用的 TXT、Markdown、JSON、CSV、PDF 或 DOCX。</p>
           ) : null}
+          <div className="source-picker-absolute">
+            <input
+              type="text"
+              className="source-picker-path-input"
+              placeholder="粘贴本机绝对路径…"
+              value={absoluteDraft}
+              disabled={busy || savingPath !== null}
+              onChange={(event) => {
+                setAbsoluteDraft(event.target.value);
+                setAttachError(null);
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter") return;
+                event.preventDefault();
+                (event.currentTarget.nextElementSibling as HTMLButtonElement | null)?.click();
+              }}
+            />
+            <button
+              type="button"
+              className="source-picker-attach-button"
+              disabled={busy || savingPath !== null || !absoluteDraft.trim()}
+              onClick={() => {
+                const normalized = absoluteDraft.trim().replace(/\\/g, "/");
+                if (!isSupportedAbsolutePath(normalized)) {
+                  setAttachError("仅支持 md/txt/json/csv/pdf/docx 的本机绝对路径。");
+                  return;
+                }
+                setAttachError(null);
+                setSavingPath(normalized);
+                void onToggle(normalized)
+                  .then(() => {
+                    setAbsoluteDraft("");
+                    setOpen(false);
+                  })
+                  .catch((reason) => {
+                    setAttachError(reason instanceof Error ? reason.message : String(reason));
+                  })
+                  .finally(() => setSavingPath(null));
+              }}
+            >
+              附加
+            </button>
+          </div>
+          {attachError ? <p className="source-picker-note error">{attachError}</p> : null}
           {!loading && !error && choices.length ? (
             <ul className="source-picker-list">
               {choices.map((relativePath) => (

@@ -199,6 +199,8 @@ export type SessionTurnInput = {
   selectedSkills?: string[];
   /** Remote MCP bridge + per-call approval (chat path only; scan passes none). */
   remoteMcp?: { bridge: RemoteMcpBridge; requestApproval: RemoteMcpApprovalFn };
+  /** Host unlimited external read switch for system prompt boundary copy. */
+  unlimitedRead?: boolean;
   /** Session hysteresis: stay lean after an overflow demotion. */
   documentModeLeanLock?: boolean;
 };
@@ -441,7 +443,7 @@ export async function runPiSessionTurn(
       ? `可 load_skill("source-grounded-writing").`
       : "";
   const sourceHint = sourcePaths.length
-    ? `\n\n[已挂资料，只读] ${sourcePaths.join("、")}。涉及资料的事实/引语须先 read_workspace_file 实际读取再起草；propose_block_edit / propose_text_patch 的 evidence 用 read_workspace_file 返回的 sourceRef 填写。${sourceSkillHint}`
+    ? `\n\n[已挂资料，只读] ${sourcePaths.join("、")}。涉及资料的事实/引语须先 read_workspace_file 一次读全文再起草（勿 offset 分页）；propose_block_edit / propose_text_patch 的 evidence 用返回的 sourceRef。${sourceSkillHint}`
     : "";
   const evidenceDirectory = buildEvidenceCacheDirectory(
     evidenceCache,
@@ -523,6 +525,7 @@ export async function runPiSessionTurn(
     workspaceSkillsRoot: input.bridge.skillsRoot,
     disabledSkills: input.disabledSkills,
     selectedSkills: input.selectedSkills,
+    unlimitedRead: input.unlimitedRead,
   });
   if (systemSkills.loadedSkills.length) {
     effects.loadedSkills = [
@@ -794,14 +797,13 @@ export async function runOfflineSessionTurn(
         text: string;
         hasMore: boolean;
         nextOffset: number;
+        bytes?: number;
       };
-      const preview = file.text.length > 1200
-        ? `${file.text.slice(0, 1200)}\n…`
-        : file.text;
+      const chars = file.text.length;
       return finish({
-        reply: `已读取 ${file.relativePath}：\n\n${preview}${
-          file.hasMore ? `\n\n还有后续内容（nextOffset: ${file.nextOffset}）。` : ""
-        }`,
+        reply: `已后台读取 ${file.relativePath}（约 ${chars} 字${
+          file.hasMore ? `，还有后续 nextOffset=${file.nextOffset}` : ""
+        }）。内容在工具上下文中，不会整段贴进对话；直接问我要核对或引用的点即可。`,
         proposals: [],
         comments: [],
       });

@@ -11,17 +11,20 @@ import {
 import { Download, FolderOpen, MessageSquare, X } from "lucide-react";
 import {
   api,
+  compactSession,
   isNativeDocx,
   listComments,
   listProposals,
   listReviewChecklists,
   saveSessionThreads,
   translateSelection,
-  getSession,  type Block,
+  getSession,
+  type Block,
   type DocumentMeta,
   type LlmSettingsPublic,
   type SessionReviewThread,
-  type SessionSnapshot,} from "./api";
+  type SessionSnapshot,
+} from "./api";
 import { Chat } from "./components/Chat";
 import { AnchorRail } from "./components/AnchorRail";
 import { McpApprovalDialog } from "./components/McpApprovalDialog";
@@ -866,6 +869,10 @@ function Workspace() {
         onHeaderPointerDown={beginFloatDrag}
         themeMode={themeMode}
         onThemeModeChange={setThemeMode}
+        onCompactConversation={async () => {
+          await compactSession();
+          await applySessionSnapshot(await getSession());
+        }}
       />
         {!landing && layoutMode === "float" ? <div className="sidecar-float-resizer" aria-hidden onPointerDown={beginFloatResize} /> : null}
       </div>

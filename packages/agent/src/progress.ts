@@ -2,15 +2,15 @@
 export function toolPhaseLabel(toolName: string): string {
   switch (toolName) {
     case "get_document_outline":
-      return "正在阅读大纲…";
+      return "后台：正在阅读大纲…";
     case "list_blocks":
-      return "正在浏览段落…";
+      return "后台：正在浏览段落…";
     case "read_document_blocks":
-      return "正在通读文稿…";
+      return "后台：正在通读文稿…";
     case "get_block":
-      return "正在阅读选中段落…";
+      return "后台：正在阅读段落…";
     case "search_blocks":
-      return "正在检索段落…";
+      return "后台：正在检索段落…";
     case "offer_cascade":
       return "正在整理联动候选…";
     case "propose_block_edit":
@@ -28,25 +28,25 @@ export function toolPhaseLabel(toolName: string): string {
     case "finish_turn":
       return ""; // lifecycle — hide from UI
     case "list_workspace_files":
-      return "正在列出工作区文稿…";
+      return "后台：正在列出资料…";
     case "read_workspace_file":
-      return "正在读取文件…";
+      return "后台：正在读取资料…";
     case "write_workspace_file":
-      return "正在写入文件…";
+      return "正在写入工作区文件…";
     case "open_document":
       return "正在打开文稿…";
     case "load_skill":
-      return "正在加载写作技能…";
+      return "后台：正在加载方法…";
     case "inspect_tabular_file":
-      return "正在检查数据表…";
+      return "后台：正在检查数据表…";
     case "run_table_analysis":
-      return "正在运行数据分析…";
+      return "后台：正在运行数据分析…";
     case "get_analysis_result":
-      return "正在读取分析结果…";
+      return "后台：正在读取分析结果…";
     case "propose_block_edit_from_results":
       return "正在把结果写入修订提案…";
     default:
-      return toolName ? `正在${toolName}…` : "";
+      return toolName ? `后台：正在${toolName}…` : "";
   }
 }
 
@@ -60,7 +60,7 @@ export function isUserFacingPhase(phase: string): boolean {
     return false;
   }
   if (/启动|完成（/i.test(t) && t.length < 24) {
-    return !/起草|打开|列出|读取|写入|修订|侧注|检查/.test(t);
+    return !/起草|打开|列出|读取|写入|修订|侧注|检查|后台/.test(t);
   }
   return true;
 }

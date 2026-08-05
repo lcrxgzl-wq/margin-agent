@@ -359,7 +359,7 @@ export async function runPiAgentLoop(opts: PiLoopOptions): Promise<PiLoopResult>
     "get_block",
     "read_workspace_file",
   ]);
-  const turnCap = opts.maxTurns ?? 40;
+  const turnCap = opts.maxTurns ?? 60;
   const limit = opts.timeoutMs ?? 300_000;
   const retryAttempts = positiveIntegerOr(opts.retryAttempts, DEFAULT_RETRY_ATTEMPTS);
   const retryDelayMs = nonNegativeIntegerOr(opts.retryDelayMs, DEFAULT_RETRY_DELAY_MS);

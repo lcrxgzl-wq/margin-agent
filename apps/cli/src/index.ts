@@ -436,10 +436,11 @@ async function main() {
   }>();
   const readSourceExcerpt = async (relativePath: string) => {
     const cacheKey = workspacePathComparisonKey(relativePath.replace(/\\/g, "/"));
-    const version = readWorkspaceSourceVersion(workspace, relativePath);
+    const unlimitedRead = isUnlimitedReadEnabled(workspacePath);
+    const version = readWorkspaceSourceVersion(workspace, relativePath, { unlimitedRead });
     const cached = sourceExcerptCache.get(cacheKey);
     if (cached?.versionHash === version.versionHash) return cached;
-    const source = await readWorkspaceSource(workspace, relativePath);
+    const source = await readWorkspaceSource(workspace, relativePath, { unlimitedRead });
     const entry = {
       versionHash: source.versionHash,
       relativePath: source.relativePath.replace(/\\/g, "/"),
@@ -1257,9 +1258,28 @@ async function main() {
         relativePath,
       ]),
     );
+    const unlimited = isUnlimitedReadEnabled(workspacePath);
     const sourcePaths: string[] = [];
     for (const relativePath of requestedSourcePaths) {
       const normalized = relativePath.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+      if (!normalized) continue;
+      const absolute = path.isAbsolute(normalized) || path.win32.isAbsolute(normalized);
+      if (absolute) {
+        if (!unlimited) {
+          return reply.code(400).send({
+            error: "path is outside workspace; unlimited read is off — enable in Agent settings, or unset MARGIN_UNLIMITED=0",
+          });
+        }
+        try {
+          readWorkspaceSourceVersion(workspace, normalized, { unlimitedRead: true });
+        } catch (error) {
+          return reply.code(400).send({
+            error: error instanceof Error ? error.message : `source file not found or unsupported: ${normalized}`,
+          });
+        }
+        if (!sourcePaths.includes(normalized)) sourcePaths.push(normalized);
+        continue;
+      }
       const canonical = availableSources.get(workspacePathComparisonKey(normalized));
       if (!canonical) return reply.code(400).send({ error: `source file not found or unsupported: ${normalized}` });
       if (!sourcePaths.includes(canonical)) sourcePaths.push(canonical);
@@ -1302,17 +1322,28 @@ async function main() {
     const expectedHash = match[2];
     const start = Number(match[3]);
     const end = Number(match[4]);
-    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start || end - start > 12_000) {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start || end - start > 500_000) {
       return reply.code(400).send({ error: "invalid source range" });
     }
     try {
       const requestedPath = match[1]!.replace(/\\/g, "/");
-      const canonicalPath = new Map(
-        listWorkspaceSourceFiles(workspace).map((relativePath) => [
-          workspacePathComparisonKey(relativePath),
-          relativePath,
-        ]),
-      ).get(workspacePathComparisonKey(requestedPath));
+      const absolute = path.isAbsolute(requestedPath) || path.win32.isAbsolute(requestedPath);
+      let canonicalPath: string | undefined;
+      if (absolute) {
+        if (!isUnlimitedReadEnabled(workspacePath)) {
+          return reply.code(400).send({
+            error: "path is outside workspace; unlimited read is off — enable in Agent settings, or unset MARGIN_UNLIMITED=0",
+          });
+        }
+        canonicalPath = requestedPath;
+      } else {
+        canonicalPath = new Map(
+          listWorkspaceSourceFiles(workspace).map((relativePath) => [
+            workspacePathComparisonKey(relativePath),
+            relativePath,
+          ]),
+        ).get(workspacePathComparisonKey(requestedPath));
+      }
       if (!canonicalPath) return reply.code(400).send({ error: "source file not found or unsupported" });
       const source = await readSourceExcerpt(canonicalPath);
       if (expectedHash && source.contentHash !== expectedHash) {

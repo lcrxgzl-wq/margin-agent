@@ -279,7 +279,7 @@ describe("Pi runtime boundaries", () => {
     expect(mockAgent.abortCalls).toBe(1);
   });
 
-  it("uses 40 turns by default and stops only when another tool turn would be required", async () => {
+  it("uses 60 turns by default and stops only when another tool turn would be required", async () => {
     const running = runPiAgentLoop({
       prompt: "test",
       systemPrompt: "test",
@@ -287,7 +287,7 @@ describe("Pi runtime boundaries", () => {
       model: {},
       timeoutMs: 10_000,
     });
-    for (let turn = 1; turn < 40; turn += 1) {
+    for (let turn = 1; turn < 60; turn += 1) {
       mockAgent.subscriber?.({
         type: "turn_end",
         message: { content: [{ type: "toolCall", id: `call-${turn}` }] },
@@ -297,12 +297,12 @@ describe("Pi runtime boundaries", () => {
     }
     mockAgent.subscriber?.({
       type: "turn_end",
-      message: { content: [{ type: "toolCall", id: "call-40" }] },
+      message: { content: [{ type: "toolCall", id: "call-60" }] },
       toolResults: [{}],
     });
     await expect(running).resolves.toMatchObject({
       outcome: "aborted",
-      notes: ["stopped after 40 turns"],
+      notes: ["stopped after 60 turns"],
     });
   });
 

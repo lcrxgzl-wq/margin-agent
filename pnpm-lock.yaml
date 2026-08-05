@@ -184,6 +184,9 @@ importers:
       '@margin/llm':
         specifier: workspace:*
         version: link:../llm
+      '@margin/storage-local':
+        specifier: workspace:*
+        version: link:../storage-local
       zod:
         specifier: ^3.25.76
         version: 3.25.76

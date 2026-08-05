@@ -114,10 +114,11 @@ export function hasCapability(
 
 /** Shared skeleton: identity + immutable contract. Pack-invariant. */
 const CORE_CONTRACT = `你是 Margin：本地文档写作与修订 Agent，与人共创，由人裁决。
-对用户：短说、可行动；别讲实现架构。找不到就列工作区可见项，或请把文件放进工作区。
+对用户：短说、可行动；别讲实现架构；不要否认本机绝对路径可读，也不要把路径讲成抽象沙箱。工具读入的资料是后台上下文：对用户可见回复只写结论与必要短引，不要整段粘贴原文，除非用户明确要求预览。
+路径：相对路径优先；用户给本机绝对路径就直接读取；给的是目录则先列出再读具体文件（外读关闭/密钥路径报错再简短说明）。不要要求先拷进工作区；找不到相对路径再列工作区可见资料。资料一次读全文（极大才截断）；勿 offset 分页。
 编辑契约：正文只经 propose_* 提案，等人 Accept/CAS 定稿；不要声称已直接改好。
 微观优先：用户选中句子/段落时，选区是第一现场，优先在选区内提案。改稿指令用短中文；通读/结构分析等长回答写在可见回复正文（可分段续写），禁止把长文只塞进 finish_turn.summary。
-通读：已有 [Margin 文稿全文]…[/Margin 文稿全文] 则以其为准，勿再 outline+cursor 通读（除非用户要求重读或仅剩移除占位）。否则先 get_document_outline；用户要通读全文时从 0:0 连续 read_document_blocks 并用 nextCursor 至 hasMore=false；勿把抽样当通读，勿用 read_workspace_file 扫已打开文稿。清理后按 blockId/cursor 续读，完成覆盖后写结论并 finish_turn。
+通读：已有 [Margin 文稿全文]…[/Margin 文稿全文] 则以其为准，勿再 outline+cursor 通读（除非用户要求重读或仅剩移除占位）。否则先 get_document_outline；用户要通读全文时从 0:0 连续 read_document_blocks 并用 nextCursor 至 hasMore=false；勿把抽样当通读，勿用读取工具扫已打开文稿。清理后按 blockId/cursor 续读，完成覆盖后写结论并 finish_turn。
 证据先行：涉及文稿/资料内容时先用工具实际读取，不要凭记忆或文件名作答，不要假装已打开。
 寻址：段落地址是不可变 blockId；用户说"第几页/第几段"时用 outline+search_blocks 对齐后再提案。
 协作澄清：改稿指令过模糊时可尖锐追问；同一改稿线程最多 3 轮，满则按假设提案。
@@ -138,8 +139,8 @@ function composePersona(constraints: HarnessConstraints): string {
 }
 
 const DEFAULT_LIMITS: AgentProfile["limits"] = {
-  // 通读/结构分析需要有界批量读取；20 轮易在读档阶段耗尽。
-  maxTurns: 40,
+  // lean 通读/结构分析要多轮 read_document_blocks；40 仍易在读档阶段耗尽。
+  maxTurns: 60,
   timeoutMs: 300_000,
   maxContextMessages: 80,
   maxContextChars: 200_000,
@@ -241,16 +242,24 @@ export function listHarnesses(): Harness[] {
  * Capability boundary only — tool names live in the tool schema (Pi style).
  * Keep this appendix short.
  */
-export function runtimeToolAppendix(harness: Harness, mode: "session" | "scan"): string {
+export function runtimeToolAppendix(
+  harness: Harness,
+  mode: "session" | "scan",
+  opts?: Pick<ComposeSystemPromptOptions, "unlimitedRead">,
+): string {
   const optional = [
     hasCapability(harness, "review.academic") ? "学术检查" : "",
     hasCapability(harness, "analysis.tabular") ? "表格分析" : "",
   ].filter(Boolean);
   const pack = optional.length ? `本 profile 已启用：${optional.join("、")}。` : "";
+  const unlimitedOn = opts?.unlimitedRead !== false;
+  const readBoundary = unlimitedOn
+    ? "外读已开启：可读工作区相对路径与本机绝对路径；给目录则 list_workspace_files 后读具体文件。"
+    : "外读已关闭：资料仅限工作区相对路径；读本机绝对路径请在 Agent 设置中开启外读。";
   if (mode === "scan") {
-    return `本轮为非持久化扫描（结果由服务落库）。${pack}禁止 bash / 任意 FS / 直接 apply。按需调用工具，无固定流程。`;
+    return `本轮为非持久化扫描（结果由服务落库）。${pack}禁止 bash / 任意写盘 / 直接 apply。按需调用工具，无固定流程。${readBoundary}`;
   }
-  return `${pack}禁止 bash、工作区外路径、直接 apply。打开文稿后才能用段落工具。计算数字须经 resultRef 绑定提案。对用户别讲实现架构。`;
+  return `${pack}禁止 bash、写工作区外、直接 apply。${readBoundary}打开文稿后才能用段落工具。计算数字须经 resultRef 绑定提案。对用户别讲实现架构。`;
 }
 
 export type ComposeSystemPromptOptions = {
@@ -260,6 +269,8 @@ export type ComposeSystemPromptOptions = {
   disabledSkills?: readonly string[];
   /** Explicit one-turn Skills (structured ids): inlined into the prompt, bounded, visible errors. */
   selectedSkills?: readonly string[];
+  /** Host unlimited external read switch; default treated as ON when omitted. */
+  unlimitedRead?: boolean;
 };
 
 const MAX_SESSION_SKILL_CHARS = 24_000;
@@ -277,7 +288,7 @@ export function composeSystemPromptDetailed(
   const harness = getHarness(harnessId);
   const includeSkills =
     opts?.includeSkills ?? (mode === "session" && harness.skills.scope !== "none");
-  let prompt = `${harness.instructions}\n风格：${harness.styleHint}\n\n${runtimeToolAppendix(harness, mode)}`;
+  let prompt = `${harness.instructions}\n风格：${harness.styleHint}\n\n${runtimeToolAppendix(harness, mode, opts)}`;
   const selected = [...new Set((opts?.selectedSkills ?? []).map((name) => name.toLowerCase()))];
   if (selected.length && harness.skills.scope === "none") {
     throw new Error("当前 Agent 模式不允许使用 Skill");

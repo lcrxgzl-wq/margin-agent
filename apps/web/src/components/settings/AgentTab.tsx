@@ -351,6 +351,7 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
         </label>
         <small className="settings-field-note">
           压缩前记录会完整存档；关闭后超长对话将退化为直接截断。节省（eco）档位始终不启用摘要。
+          自动压缩在上下文用量超过窗口约 85% 时触发；对话栏也可手动压缩。自定义兼容模型上下文按最高 256k 计。
         </small>
       </div>
 

@@ -118,6 +118,7 @@ describe("workspace text io", () => {
         "a.md",
         "cases.csv",
         "interview.txt",
+        "settings.json",
       ]);
     } finally {
       try {

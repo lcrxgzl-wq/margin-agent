@@ -18,6 +18,9 @@ describe("parseExplicitLocalDocxPath", () => {
         '"E:\\academic\\spviolence\\sport value.docx" 打开这个，我们开始工作',
       ),
     ).toBe("E:\\academic\\spviolence\\sport value.docx");
+    expect(
+      parseExplicitLocalDocxPath("帮我打开 E:\\academic\\a\\b.docx 并总结"),
+    ).toBe("E:\\academic\\a\\b.docx");
   });
 
   it("rejects relative paths, other formats, and ambiguous paths", () => {

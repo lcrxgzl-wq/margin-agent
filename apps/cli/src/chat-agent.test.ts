@@ -478,6 +478,31 @@ describe("chat session lifecycle", () => {
       await workspace.releaseLock();
     }
   });
+
+  it("attaches absolute external paths when unlimited-read is on", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-attach-ext-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "margin-outside-attach-"));
+    dirs.push(root, outside);
+    const target = path.join(outside, "external.txt");
+    fs.writeFileSync(target, "external evidence", "utf8");
+    const workspace = await openWorkspace(root);
+    const previous = process.env.MARGIN_UNLIMITED;
+    try {
+      delete process.env.MARGIN_UNLIMITED;
+      const state = createChatAgentState();
+      const normalized = target.replace(/\\/g, "/");
+      replaceAttachedSources(state, workspace, [target]);
+      expect(state.sourcePaths).toEqual([normalized]);
+
+      process.env.MARGIN_UNLIMITED = "0";
+      expect(() => replaceAttachedSources(state, workspace, [target])).toThrow(/outside workspace/);
+    } finally {
+      if (previous === undefined) delete process.env.MARGIN_UNLIMITED;
+      else process.env.MARGIN_UNLIMITED = previous;
+      workspace.db.close();
+      await workspace.releaseLock();
+    }
+  });
 });
 
 describe("chatAgentStateFromSession (session switch)", () => {

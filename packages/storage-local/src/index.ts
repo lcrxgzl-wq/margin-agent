@@ -1,4 +1,5 @@
 export * from "./workspace-fs.js";
+export { mapHostFsError } from "./external-read-errors.js";
 export * from "./review-store.js";
 export * from "./checklist-store.js";
 export * from "./llm-config/index.js";

@@ -680,6 +680,21 @@ describe("attached source tools", () => {
       "data/cases.csv",
     ]);
 
+    const full = await byName.read_workspace_file!.execute("read-full", {
+      relativePath: "notes/interview.txt",
+    });
+    const fullJson = JSON.parse(
+      full.content.find((item) => item.type === "text")!.text,
+    );
+    expect(fullJson).toMatchObject({
+      text: "甲乙丙丁戊己庚辛",
+      offset: 0,
+      nextOffset: 8,
+      hasMore: false,
+      attached: true,
+    });
+    expect(fullJson.sourceRef).toMatch(/^notes\/interview\.txt#sha256=[a-f0-9]+&chars=0-8$/);
+
     const first = await byName.read_workspace_file!.execute("read-1", {
       relativePath: "notes/interview.txt",
       offset: 0,
@@ -836,5 +851,112 @@ describe("finish_turn summary host wiring", () => {
       summary: "拒稿点一：摘要承诺未被方法章兑现。",
     });
     expect(effects.finishSummary).toBe("拒稿点一：摘要承诺未被方法章兑现。");
+  });
+});
+
+describe("list_workspace_files", () => {
+  it("lists workspace materials by default and absolute directories when provided", async () => {
+    const tools = createSessionTools(
+      {
+        listSourceFiles: () => ["notes.txt"],
+        listExternalDirectory: (absolutePath) => ({
+          path: absolutePath.replace(/\\/g, "/"),
+          files: [`${absolutePath.replace(/\\/g, "/")}/a.pdf`],
+          directories: [`${absolutePath.replace(/\\/g, "/")}/notes`],
+          truncated: false,
+        }),
+        readText: () => ({ relativePath: "", text: "", bytes: 0 }),
+        writeText: async () => ({ relativePath: "", bytes: 0, created: false }),
+        openDocument: async () => {
+          throw new Error("unused");
+        },
+      },
+      {
+        documentId: "doc-1",
+        revision: 1,
+        relativePath: "paper.md",
+        blocks: [],
+      },
+      [],
+      [],
+      {},
+    );
+    const list = tools.find((tool) => tool.name === "list_workspace_files")!;
+
+    const workspace = JSON.parse(
+      ((await list.execute("list-ws", {})).content[0] as { text: string }).text,
+    );
+    expect(workspace.files).toEqual(["notes.txt"]);
+
+    const external = JSON.parse(
+      ((await list.execute("list-ext", {
+        directory: "E:/academic/spviolence/park",
+      })).content[0] as { text: string }).text,
+    );
+    expect(external.path).toBe("E:/academic/spviolence/park");
+    expect(external.files).toEqual(["E:/academic/spviolence/park/a.pdf"]);
+    expect(external.directories).toEqual(["E:/academic/spviolence/park/notes"]);
+  });
+
+  it("passes recursive list options to the host bridge", async () => {
+    const seen: Array<{ recursive?: boolean; extensions?: string[]; query?: string }> = [];
+    const tools = createSessionTools(
+      {
+        listSourceFiles: () => [],
+        listExternalDirectory: (_absolutePath, opts) => {
+          seen.push(opts ?? {});
+          return {
+            path: "E:/data",
+            files: ["E:/data/a.pdf"],
+            directories: [],
+            truncated: false,
+          };
+        },
+        readText: () => ({ relativePath: "", text: "", bytes: 0, versionHash: "v" }),
+        writeText: async () => ({ relativePath: "", bytes: 0, created: false }),
+        openDocument: async () => {
+          throw new Error("unused");
+        },
+      },
+      { documentId: "doc-1", revision: 1, relativePath: "paper.md", blocks: [] },
+      [],
+      [],
+      {},
+    );
+    const list = tools.find((tool) => tool.name === "list_workspace_files")!;
+    await list.execute("list-rec", {
+      directory: "E:/data",
+      recursive: true,
+      extensions: [".pdf"],
+      query: "report",
+    });
+    expect(seen).toEqual([
+      { recursive: true, extensions: [".pdf"], query: "report" },
+    ]);
+  });
+
+  it("maps host filesystem errors to actionable Chinese", async () => {
+    const tools = createSessionTools(
+      {
+        listSourceFiles: () => [],
+        readText: () => {
+          throw new Error(
+            "path is outside workspace; unlimited read is off — enable in Agent settings, or unset MARGIN_UNLIMITED=0",
+          );
+        },
+        writeText: async () => ({ relativePath: "", bytes: 0, created: false }),
+        openDocument: async () => {
+          throw new Error("unused");
+        },
+      },
+      { documentId: "doc-1", revision: 1, relativePath: "paper.md", blocks: [] },
+      [],
+      [],
+      {},
+    );
+    const read = tools.find((tool) => tool.name === "read_workspace_file")!;
+    await expect(read.execute("read", { relativePath: "E:/secret.env" })).rejects.toThrow(
+      /外读已关闭/,
+    );
   });
 });

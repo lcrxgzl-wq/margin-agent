@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   openWorkspace,
   readWorkspaceSource,
+  listExternalSourceDirectory,
   type Workspace,
 } from "./index.js";
 
@@ -185,7 +186,7 @@ describe("unlimited external reads", () => {
     ).rejects.toThrow(/file not found/);
 
     await expect(readWorkspaceSource(workspace, outside, UNLIMITED)).rejects.toThrow(
-      /not a file/,
+      /path is a directory/,
     );
 
     const large = path.join(outside, "large.txt");
@@ -200,5 +201,47 @@ describe("unlimited external reads", () => {
     await expect(readWorkspaceSource(workspace, binary, UNLIMITED)).rejects.toThrow(
       /only md\/txt\/json\/csv\/pdf\/docx can be read/,
     );
+  });
+
+  it("lists an external directory's readable files and child folders", async () => {
+    const { outside, workspace } = await setup();
+    const park = path.join(outside, "park");
+    const nested = path.join(park, "notes");
+    fs.mkdirSync(nested, { recursive: true });
+    fs.writeFileSync(path.join(park, "a.pdf"), "%PDF", "utf8");
+    fs.writeFileSync(path.join(park, "readme.txt"), "hello", "utf8");
+    fs.writeFileSync(path.join(park, "skip.bin"), "x", "utf8");
+    fs.writeFileSync(path.join(nested, "inner.md"), "inner", "utf8");
+
+    expect(() => listExternalSourceDirectory(workspace, park)).toThrow(/unlimited read is off/);
+
+    const listing = listExternalSourceDirectory(workspace, park, UNLIMITED);
+    expect(listing.path.replace(/\\/g, "/")).toBe(park.replace(/\\/g, "/"));
+    expect(listing.files.map((f) => path.basename(f)).sort()).toEqual(["a.pdf", "readme.txt"]);
+    expect(listing.directories.map((d) => path.basename(d))).toEqual(["notes"]);
+    expect(listing.truncated).toBe(false);
+  });
+
+  it("recursively lists external files with extension and query filters", async () => {
+    const { outside, workspace } = await setup();
+    const park = path.join(outside, "park");
+    const nested = path.join(park, "notes");
+    fs.mkdirSync(nested, { recursive: true });
+    fs.writeFileSync(path.join(park, "a.pdf"), "%PDF", "utf8");
+    fs.writeFileSync(path.join(park, "readme.txt"), "hello", "utf8");
+    fs.writeFileSync(path.join(nested, "inner-report.pdf"), "%PDF", "utf8");
+    fs.writeFileSync(path.join(nested, "other.md"), "md", "utf8");
+
+    const shallow = listExternalSourceDirectory(workspace, park, UNLIMITED);
+    expect(shallow.files.map((f) => path.basename(f)).sort()).toEqual(["a.pdf", "readme.txt"]);
+
+    const recursive = listExternalSourceDirectory(workspace, park, {
+      ...UNLIMITED,
+      recursive: true,
+      extensions: [".pdf"],
+      query: "report",
+    });
+    expect(recursive.files.map((f) => path.basename(f))).toEqual(["inner-report.pdf"]);
+    expect(recursive.directories).toEqual([]);
   });
 });

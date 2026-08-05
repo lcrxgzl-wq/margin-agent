@@ -19,6 +19,20 @@ export type ContextTierName = "eco" | "standard" | "max";
 
 export type CompactionReason = "threshold" | "overflow" | "manual";
 
+/** Auto-compact when usage exceeds this fraction of the model context window. */
+export const COMPACTION_USAGE_RATIO = 0.85;
+
+/** Reserve tokens so shouldCompact fires at COMPACTION_USAGE_RATIO. */
+export function reserveTokensForUsageRatio(
+  contextWindow: number,
+  ratio: number = COMPACTION_USAGE_RATIO,
+): number {
+  if (!(contextWindow > 0) || !(ratio > 0 && ratio < 1)) {
+    return DEFAULT_COMPACTION_SETTINGS.reserveTokens;
+  }
+  return Math.max(1, Math.floor(contextWindow * (1 - ratio)));
+}
+
 export type CompactionEvent = {
   /** Idempotency key minted at compaction time; hosts dedupe settles on it. */
   eventId: string;
@@ -81,7 +95,7 @@ export function prunedToolOutputPlaceholder(
           sourceRef ? `sourceRef=${sourceRef}` : "",
           nextOffset ? `nextOffset=${nextOffset}` : "",
         ].filter(Boolean);
-        return `[旧工具输出已清理属正常。${parts.join("；")}。不要重扫全文]`;
+        return `[旧工具输出已清理属正常。${parts.join("；")}。需要时再 read_workspace_file 读全文；勿默认 offset 分页]`;
       }
     } catch {
       /* fall through to the generic placeholder */
@@ -343,6 +357,7 @@ export async function orchestrateCompaction(
   input: OrchestrateCompactionInput,
 ): Promise<CompactionOutcome> {
   const reserveTokens = input.reserveTokens ?? DEFAULT_COMPACTION_SETTINGS.reserveTokens;
+  const thresholdReserve = input.reserveTokens ?? reserveTokensForUsageRatio(input.contextWindow);
   const keepRecentTokens = input.keepRecentTokens ?? keepRecentTokensForTier(input.tier);
   const { messages: pruned, reclaimed } = pruneToolOutputs(input.messages);
 
@@ -358,7 +373,7 @@ export async function orchestrateCompaction(
     if (
       !shouldCompact(contextTokens, input.contextWindow, {
         enabled: true,
-        reserveTokens,
+        reserveTokens: thresholdReserve,
         keepRecentTokens,
       })
     ) {

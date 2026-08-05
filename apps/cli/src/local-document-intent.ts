@@ -15,6 +15,22 @@ function normalizeAbsoluteDocxPath(candidate: string): string | null {
   return path.normalize(value);
 }
 
+/** Collect absolute .docx paths embedded in a single-line message. */
+function embeddedAbsoluteDocxPaths(message: string): string[] {
+  const found = new Set<string>();
+  const winPattern = /[A-Za-z]:[\\/](?:[^"“”'\s，。；;！？!?\n]|\/|\\)+?\.docx\b/gi;
+  for (const match of message.matchAll(winPattern)) {
+    const normalized = normalizeAbsoluteDocxPath(match[0]);
+    if (normalized) found.add(normalized);
+  }
+  const posixPattern = /(?:^|[\s，。；;！？!?])(\/(?:[^/\s"“”'，。；;！？!?\n]|\/)+?\.docx\b)/gi;
+  for (const match of message.matchAll(posixPattern)) {
+    const normalized = normalizeAbsoluteDocxPath(match[1] ?? match[0]);
+    if (normalized) found.add(normalized);
+  }
+  return [...found];
+}
+
 function quotedDocxPaths(message: string): string[] {
   const matches = new Set<string>();
   for (const [left, right] of WRAPPING_QUOTES) {
@@ -43,6 +59,10 @@ export function parseExplicitLocalDocxPath(message: string): string | null {
   const quoted = quotedDocxPaths(candidate);
   if (quoted.length === 1) return quoted[0];
   if (quoted.length > 1 || candidate.includes("\n")) return null;
+
+  const embedded = embeddedAbsoluteDocxPaths(candidate);
+  if (embedded.length === 1) return embedded[0];
+  if (embedded.length > 1) return null;
 
   candidate = candidate.replace(/^(?:请\s*)?(?:打开|导入|读取|处理|open|import)\s*/i, "").trim();
   return normalizeAbsoluteDocxPath(candidate);

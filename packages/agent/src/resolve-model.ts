@@ -135,7 +135,9 @@ export function resolveRuntimeModel(modelOverride?: string): ResolvedRuntimeMode
   if (!builtin) {
     model.reasoning = false;
     model.input = ["text"];
-    model.contextWindow = Math.min(template.contextWindow || 128_000, 128_000);
+    // Custom / OpenAI-compatible gateways often expose 200k–256k windows; keep a
+    // hard ceiling so compaction and fit-first budgets stay honest.
+    model.contextWindow = Math.min(template.contextWindow || 256_000, 256_000);
     model.maxTokens = Math.min(template.maxTokens || 8_192, 8_192);
     model.thinkingLevelMap = undefined;
     model.compat = undefined;

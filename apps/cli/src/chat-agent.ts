@@ -31,6 +31,7 @@ import {
   latestAgentCompactionSummary,
   listBlocks,
   listWorkspaceSourceFiles,
+  listExternalSourceDirectory,
   listRegisteredDocumentPaths,
   loadAgentSession,
   loadAgentSessionEnvelope,
@@ -220,6 +221,17 @@ export function replaceAttachedSources(
     normalizedRequested.length === state.sourcePaths.length &&
     normalizedRequested.every((value, index) => value === state.sourcePaths[index]?.replace(/\\/g, "/"))
   ) {
+    const unlimited = isUnlimitedReadEnabled(workspace.root);
+    for (const value of normalizedRequested) {
+      if (
+        (path.isAbsolute(value) || path.win32.isAbsolute(value)) &&
+        !unlimited
+      ) {
+        throw new Error(
+          "path is outside workspace; unlimited read is off — enable in Agent settings, or unset MARGIN_UNLIMITED=0",
+        );
+      }
+    }
     state.evidenceCache = normalizeAttachedEvidenceCache(state.evidenceCache, state.sourcePaths);
     return;
   }
@@ -229,12 +241,38 @@ export function replaceAttachedSources(
       relativePath,
     ]),
   );
+  const unlimited = isUnlimitedReadEnabled(workspace.root);
   const sourcePaths: string[] = [];
   for (const requested of normalizedRequested) {
     const normalized = requested
       .replace(/\\/g, "/")
       .replace(/^\.\//, "");
     if (!normalized) continue;
+    const absolute =
+      path.isAbsolute(normalized) || path.win32.isAbsolute(normalized);
+    if (absolute) {
+      if (!unlimited) {
+        throw new Error(
+          "path is outside workspace; unlimited read is off — enable in Agent settings, or unset MARGIN_UNLIMITED=0",
+        );
+      }
+      try {
+        readWorkspaceSourceVersion(workspace, normalized, { unlimitedRead: true });
+      } catch (reason) {
+        throw new Error(
+          reason instanceof Error
+            ? reason.message
+            : `source file not found or unsupported: ${normalized}`,
+        );
+      }
+      if (!sourcePaths.includes(normalized)) {
+        if (sourcePaths.length >= MAX_SOURCE_PATHS) {
+          throw new Error(`too many attached sources (max ${MAX_SOURCE_PATHS})`);
+        }
+        sourcePaths.push(normalized);
+      }
+      continue;
+    }
     const relativePath = available.get(workspacePathComparisonKey(normalized));
     if (!relativePath) {
       throw new Error(`source file not found or unsupported: ${normalized}`);
@@ -258,6 +296,13 @@ export function createWorkspaceBridge(
   return {
     skillsRoot: path.join(workspace.root, ".margin", "skills"),
     listSourceFiles: () => listWorkspaceSourceFiles(workspace),
+    listExternalDirectory: (absolutePath, listOpts) =>
+      listExternalSourceDirectory(workspace, absolutePath, {
+        unlimitedRead: isUnlimitedReadEnabled(workspace.root),
+        recursive: listOpts?.recursive,
+        extensions: listOpts?.extensions,
+        query: listOpts?.query,
+      }),
     readText: (relativePath) =>
       readWorkspaceSource(workspace, relativePath, {
         unlimitedRead: isUnlimitedReadEnabled(workspace.root),
@@ -271,7 +316,20 @@ export function createWorkspaceBridge(
       return writeWorkspaceText(workspace, relativePath, content);
     },
     openDocument: async (relativePath) => {
-      const normalizedPath = relativePath.replace(/\\/g, "/").replace(/^\.\//, "");
+      const trimmed = relativePath.trim();
+      const normalizedPath = trimmed.replace(/\\/g, "/").replace(/^\.\//, "");
+      const absolute =
+        path.isAbsolute(trimmed) || path.win32.isAbsolute(trimmed);
+      if (absolute && /\.docx$/i.test(normalizedPath)) {
+        if (!isUnlimitedReadEnabled(workspace.root)) {
+          throw new Error(
+            "外读已关闭，无法直接打开工作区外的 DOCX；请在 Agent 设置中开启外读，或先把文件放入工作区。",
+          );
+        }
+        const { document } = await importExternalDocxDocument(workspace, path.normalize(trimmed));
+        const blocks = listBlocks(workspace, document.id);
+        return { document, blocks, alreadyOpen: false };
+      }
       const activePath = activeDocument?.relativePath
         ?.replace(/\\/g, "/")
         .replace(/^\.\//, "");
@@ -816,6 +874,7 @@ export async function runChatAgentTurn(opts: {
         clarificationRound,
         signal: opts.signal,
         documentModeLeanLock: agentState.documentModeLeanLock,
+        unlimitedRead: isUnlimitedReadEnabled(workspace.root),
         onProgress: (ev) => {
           if (agentState.task) {
             agentState.task.currentStep = ev.phase;

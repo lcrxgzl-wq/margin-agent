@@ -151,9 +151,11 @@ textarea {
 
 .canvas-pane,
 .chat-pane {
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .canvas-pane {
@@ -1006,8 +1008,10 @@ textarea {
 
 .messages {
   flex: 1;
+  min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 1rem;
@@ -1022,6 +1026,7 @@ textarea {
 .turn {
   display: grid;
   gap: 0.3rem;
+  min-width: 0;
   max-width: 100%;
   animation: in 0.3s ease both;
 }
@@ -1048,11 +1053,13 @@ textarea {
 }
 
 .bubble {
+  min-width: 0;
   max-width: min(100%, 34rem);
   padding: 0.6rem 0.8rem;
   border: 0;
   border-radius: 8px;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   word-break: break-word;
   font-size: 0.92rem;
   line-height: 1.62;
@@ -1282,6 +1289,57 @@ textarea {
 
 .source-picker-note.error {
   color: var(--warn);
+}
+
+.source-picker-absolute {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.35rem;
+  min-width: 0;
+  padding: 0.35rem 0.45rem 0.45rem;
+}
+
+.source-picker-path-input {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.4rem 0.5rem;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 0.75rem;
+}
+
+.source-picker-path-input:focus {
+  outline: 1px solid var(--accent);
+  border-color: var(--accent);
+}
+
+.source-picker-path-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.source-picker-attach-button {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.35rem 0.55rem;
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 0.72rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.source-picker-attach-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.source-picker-attach-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .proposal-evidence {
@@ -1522,6 +1580,21 @@ textarea {
   font-size: 0.68rem;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+.context-compact {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex: 0 0 auto;
+  min-height: 1.6rem;
+  padding: 0 0.45rem;
+  font-size: 0.68rem;
+}
+
+.context-compact:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .busy-dot {
@@ -2294,7 +2367,8 @@ textarea {
 .settings-panel {
   width: min(440px, 100%);
   max-height: min(92vh, 820px);
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   background: var(--paper);
   border: 1px solid var(--line);
   border-radius: 16px;
@@ -2302,6 +2376,7 @@ textarea {
   box-shadow: var(--shadow);
   display: grid;
   gap: 1rem;
+  min-width: 0;
 }
 
 .settings-panel.wide {
@@ -3929,6 +4004,7 @@ textarea {
   background: var(--mist);
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
   font-size: 0.82em;
+  overflow-wrap: anywhere;
 }
 
 .md pre {
@@ -4280,6 +4356,7 @@ a:focus-visible {
 
 .settings-hub-body > [role="tabpanel"] {
   display: grid;
+  min-width: 0;
 }
 
 .settings-hub-body > [role="tabpanel"][hidden] {
@@ -4289,6 +4366,7 @@ a:focus-visible {
 .settings-tab-body {
   display: grid;
   gap: 1rem;
+  min-width: 0;
   padding-bottom: 1.25rem;
 }
 
@@ -4360,23 +4438,32 @@ a:focus-visible {
 
 .settings-field-inline {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 0.5rem;
+  min-width: 0;
 }
 
 .settings-field-inline input[type="checkbox"] {
   flex: 0 0 auto;
+  margin-top: 0.15rem;
+}
+
+.settings-field-inline > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .reasoning-mode-list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(120px, 100%), 1fr));
   gap: 0.5rem;
+  min-width: 0;
 }
 
 .reasoning-mode {
   display: grid;
   gap: 0.15rem;
+  min-width: 0;
   padding: 0.55rem 0.65rem;
   border: 1px solid var(--line);
   border-radius: 10px;
