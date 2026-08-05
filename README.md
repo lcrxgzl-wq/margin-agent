@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="brand/logo.svg" width="96" alt="Margin logo">
+  <img src="https://raw.githubusercontent.com/lcrxgzl-wq/margin-agent/master/brand/logo.svg" width="96" alt="Margin logo">
 </p>
 
 <h1 align="center">Margin</h1>
@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="brand/social-preview.png" width="640" alt="Margin social preview">
+  <img src="https://raw.githubusercontent.com/lcrxgzl-wq/margin-agent/master/brand/social-preview.png" width="640" alt="Margin social preview">
 </p>
 
 用 AI 辅助写 Word 时，你是否还在对话框和文档之间来回 Ctrl+C / Ctrl+V？或是对着 coding agent 的成块黑盒改动无所适从——它改了什么、为什么改，无法即时查阅、无法逐条反悔？亦或者，你担心未发表的论证在一次次粘贴中被悄悄带离本机？
