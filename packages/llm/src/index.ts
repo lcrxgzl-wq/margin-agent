@@ -353,7 +353,7 @@ export async function translateSelection(input: TranslateSelectionInput): Promis
   if (!apiKey && !baseURL) {
     return "离线模式未启用翻译；配置模型后可使用单次翻译。";
   }
-  const target = input.targetLanguage === "en" ? "规范的学术英语" : "简体中文";
+  const target = input.targetLanguage === "en" ? "规范英语" : "简体中文";
   const system = "你是 Margin 的单次翻译助手。只输出译文，不解释，不重复原文，不输出提案或 JSON。";
   const prompt = "请把下面的选区翻译成" + target + "。保留术语、引文、数字、专名与事实，不新增内容。选区：" + text;
   const completion = await requestTextCompletion(

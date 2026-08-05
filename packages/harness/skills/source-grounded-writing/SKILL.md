@@ -1,7 +1,6 @@
 ---
 name: source-grounded-writing
 description: 来源落地写作：区分原文事实、用户材料与模型推断；缺引文时占位，禁止假文献/假 DOI/假访谈。
-packs: academic
 ---
 
 # 来源落地写作

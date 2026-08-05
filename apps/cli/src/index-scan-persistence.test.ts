@@ -54,7 +54,7 @@ describe("scan result persistence", () => {
     }
   });
 
-  it("rolls back proposals and comments when checklist persistence fails", async () => {
+  it("rolls back proposals and comments when scan artifact persistence fails", async () => {
     savedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
     savedArgv = process.argv;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-scan-atomic-"));
@@ -109,10 +109,10 @@ describe("scan result persistence", () => {
     }]);
 
     const prepare = workspace.db.prepare.bind(workspace.db);
-    let checklistInsertCount = 0;
+    let proposalInsertCount = 0;
     const prepareSpy = vi.spyOn(workspace.db, "prepare").mockImplementation((sql: string) => {
-      if (/INSERT INTO review_checklist_runs/.test(sql) && ++checklistInsertCount === 2) {
-        throw new Error("injected checklist persistence failure");
+      if (/INSERT INTO proposals/.test(sql) && ++proposalInsertCount === 2) {
+        throw new Error("injected proposal persistence failure");
       }
       return prepare(sql);
     });
@@ -132,7 +132,7 @@ describe("scan result persistence", () => {
 
     expect(state.runs.get(runId)).toMatchObject({
       status: "error",
-      error: "injected checklist persistence failure",
+      error: "injected proposal persistence failure",
     });
     expect(listProposals(workspace, document.id)).toMatchObject([{
       id: "proposal-before-scan",

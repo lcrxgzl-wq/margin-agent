@@ -79,6 +79,9 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
   const [savedContextTier, setSavedContextTier] = useState<ContextTier>("standard");
   const [compactionAuto, setCompactionAuto] = useState(true);
   const [savedCompactionAuto, setSavedCompactionAuto] = useState(true);
+  const [unlimitedRead, setUnlimitedRead] = useState(true);
+  const [savedUnlimitedRead, setSavedUnlimitedRead] = useState(false);
+  const [unlimitedReadFromEnv, setUnlimitedReadFromEnv] = useState(false);
   const [timeoutInput, setTimeoutInput] = useState("");
   const [savedTimeoutInput, setSavedTimeoutInput] = useState("");
   const [retryAttemptsInput, setRetryAttemptsInput] = useState("");
@@ -115,6 +118,10 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
         const currentCompactionAuto = settings.compactionAuto !== false;
         setCompactionAuto(currentCompactionAuto);
         setSavedCompactionAuto(currentCompactionAuto);
+        const currentUnlimited = settings.unlimitedRead !== false;
+        setUnlimitedRead(currentUnlimited);
+        setSavedUnlimitedRead(currentUnlimited);
+        setUnlimitedReadFromEnv(settings.unlimitedReadFromEnv === true);
         const currentTimeout = agentTimeoutMsToSeconds(settings.agentTimeoutMs);
         setTimeoutInput(currentTimeout);
         setSavedTimeoutInput(currentTimeout);
@@ -153,6 +160,7 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
     reasoningMode !== savedReasoningMode ||
     contextTier !== savedContextTier ||
     compactionAuto !== savedCompactionAuto ||
+    unlimitedRead !== savedUnlimitedRead ||
     timeoutInput !== savedTimeoutInput ||
     retryAttemptsInput !== savedRetryAttemptsInput ||
     retryDelayInput !== savedRetryDelayInput ||
@@ -202,12 +210,15 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
         selectionContextChars,
         contextTier,
         compactionAuto,
+        unlimitedRead,
       });
       onSaved?.(settings);
       setSavedHarnessId(harnessId);
       setSavedReasoningMode(reasoningMode);
       setSavedContextTier(contextTier);
       setSavedCompactionAuto(compactionAuto);
+      setSavedUnlimitedRead(unlimitedRead);
+      setUnlimitedReadFromEnv(settings.unlimitedReadFromEnv === true);
       setSavedTimeoutInput(timeoutInput);
       setSavedRetryAttemptsInput(retryAttemptsInput);
       setSavedRetryDelayInput(retryDelayInput);
@@ -241,7 +252,9 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
             </option>
           ))}
         </select>
-        <small className="settings-field-note">决定提案与讨论使用的 Agent 档位</small>
+        <small className="settings-field-note">
+          默认全工具可用。档位主要调语气与默认方法；「中文社科论文修订」保留为更强学术语气包（默认内联论证/文献 Skill）。
+        </small>
       </label>
 
       <div className="settings-field" role="radiogroup" aria-label="推理强度">
@@ -338,6 +351,25 @@ export function AgentTab({ open, onSaved, onCloseLocked }: Props) {
         </label>
         <small className="settings-field-note">
           压缩前记录会完整存档；关闭后超长对话将退化为直接截断。节省（eco）档位始终不启用摘要。
+        </small>
+      </div>
+
+      <div className="settings-field">
+        <span>工作区外读取</span>
+        <label className="settings-field-inline">
+          <input
+            type="checkbox"
+            checked={unlimitedReadFromEnv || unlimitedRead}
+            disabled={busy || unlimitedReadFromEnv}
+            onChange={(event) => setUnlimitedRead(event.target.checked)}
+            aria-label="允许读取工作区外路径"
+          />
+          <span>允许通过绝对路径读取工作区外资料（默认开启）</span>
+        </label>
+        <small className="settings-field-note">
+          {unlimitedReadFromEnv
+            ? "已由启动参数 --unlimited / MARGIN_UNLIMITED=1 开启；设置页此项暂不可关。"
+            : "关闭后仅可读工作区内文件。写入仍只限工作区；外部 DOCX 仍需导入工作副本。"}
         </small>
       </div>
 

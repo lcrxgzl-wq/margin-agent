@@ -8,7 +8,6 @@ import type { BlockSnapshot, SelectionBlockRange } from "@margin/domain";
 import { contentHash, MAX_SELECTION_BLOCKS } from "@margin/domain";
 import { generateProposal } from "@margin/llm";
 import { getHarness } from "@margin/harness";
-import { createReviewChecklistRuns } from "./academic.js";
 import { generateDirectProposal } from "./direct-proposal.js";
 import { runPiBlockScan } from "./pi-runner.js";
 import { hasRuntimeCredentials } from "./resolve-model.js";
@@ -251,7 +250,7 @@ async function runDirectBlockProposal(
     operation: ctx.tableCell ? undefined : output.operation,
     tableCell: ctx.tableCell ? { ...ctx.tableCell, after: output.after } : undefined,
   };
-  const reviewChecklists = createReviewChecklistRuns(ctx.documentId, [block]);
+  const reviewChecklists = undefined;
   emit("完成（1 处提案）");
   const notes = ctx.selectedSkills?.length && !hasRuntimeCredentials()
     ? [`explicit skills not applied offline (configure a model): ${ctx.selectedSkills.join(", ")}`]
@@ -371,7 +370,7 @@ async function runDirectMultiBlockProposal(
       operation: output.operation,
     });
   }
-  const reviewChecklists = createReviewChecklistRuns(ctx.documentId, selected);
+  const reviewChecklists = undefined;
   emit(`完成（${proposals.length} 处提案）`);
   const notes = ctx.selectedSkills?.length && !hasRuntimeCredentials()
     ? [`explicit skills not applied offline (configure a model): ${ctx.selectedSkills.join(", ")}`]
@@ -431,7 +430,7 @@ export async function runSimpleBlockScan(
     });
   }
 
-  const reviewChecklists = createReviewChecklistRuns(ctx.documentId, selected);
+  const reviewChecklists = undefined;
   emit(`完成（${proposals.length} 处提案）`);
 
   return { engine: "simple", proposals, comments: [], reviewChecklists, steps };

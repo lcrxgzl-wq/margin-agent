@@ -76,6 +76,29 @@ describe("MCP approval registry", () => {
     expect(registry.resolve(current.approvalId, "allow").status).toBe("ok");
     await current.wait;
   });
+  it("rememberForSession auto-allows later calls of the same server+tool", async () => {
+    const registry = createMcpApprovalRegistry();
+    const first = registry.request(baseInput);
+    expect(registry.resolve(first.approvalId, "allow", { rememberForSession: true }).status)
+      .toBe("ok");
+    await first.wait;
+    expect(registry.isTrusted("sess-1", "mcp-aaaaaaaaaaaa", "lookup")).toBe(true);
+
+    // Later run in the same session skips the UI when Host checks isTrusted.
+    expect(registry.isTrusted("sess-1", "mcp-aaaaaaaaaaaa", "other")).toBe(false);
+    expect(registry.isTrusted("sess-2", "mcp-aaaaaaaaaaaa", "lookup")).toBe(false);
+  });
+
+  it("session-switch clears trust; mid-session supersede does not", () => {
+    const registry = createMcpApprovalRegistry();
+    const first = registry.request(baseInput);
+    expect(registry.resolve(first.approvalId, "allow", { rememberForSession: true }).status)
+      .toBe("ok");
+    registry.denyAllForSession("sess-1", "superseded");
+    expect(registry.isTrusted("sess-1", "mcp-aaaaaaaaaaaa", "lookup")).toBe(true);
+    registry.denyAllForSession("sess-1", "session-switch");
+    expect(registry.isTrusted("sess-1", "mcp-aaaaaaaaaaaa", "lookup")).toBe(false);
+  });
 });
 
 describe("approval gate × registry: remote call counts", () => {

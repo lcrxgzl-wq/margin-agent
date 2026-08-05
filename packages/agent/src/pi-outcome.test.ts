@@ -284,7 +284,7 @@ describe("Pi loop outcome handling", () => {
     await turn("social-science-zh");
 
     expect(prompts[0]).toContain("已挂资料");
-    expect(prompts[0]).not.toContain('load_skill("source-grounded-writing")');
+    expect(prompts[0]).toContain('load_skill("source-grounded-writing")');
     expect(prompts[1]).toContain('load_skill("source-grounded-writing")');
   });
 
@@ -307,13 +307,12 @@ describe("Pi loop outcome handling", () => {
     await turn("minimal");
     await turn("social-science-zh");
 
-    // office-zh: socratic (academic) hidden, cascade (core) visible
-    expect(prompts[0]).not.toContain('load_skill("socratic-revision-zh")');
+    // office-zh / social-science-zh: full skill pointers
+    expect(prompts[0]).toContain('load_skill("socratic-revision-zh")');
     expect(prompts[0]).toContain('load_skill("cascade-consistency-zh")');
     // minimal: no skill pointers at all
     expect(prompts[1]).not.toContain('load_skill("socratic-revision-zh")');
     expect(prompts[1]).not.toContain('load_skill("cascade-consistency-zh")');
-    // social-science-zh: both visible
     expect(prompts[2]).toContain('load_skill("socratic-revision-zh")');
     expect(prompts[2]).toContain('load_skill("cascade-consistency-zh")');
   });

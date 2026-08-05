@@ -1,7 +1,6 @@
 ---
 name: socratic-revision-zh
 description: 改稿协作澄清：指令模糊时尖锐追问（同一改稿线程最多 3 轮），满则按假设提案；也用于显式苏格拉底模式。
-packs: academic
 ---
 
 # 苏格拉底式修订（协作澄清）

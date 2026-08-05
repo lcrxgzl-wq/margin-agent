@@ -82,12 +82,27 @@ try {
   if (run.engine !== "simple") throw new Error(`expected simple engine, got ${run.engine}`);
   if (run.commentCount !== 0) throw new Error("automatic heuristic comments must stay disabled");
 
-  const { runs: checklists } = await api(
+  const { runs: checklistsBeforeAsk } = await api(
     `/api/v1/documents/${opened.document.id}/checklists`,
   );
+  if (checklistsBeforeAsk?.length) {
+    throw new Error(`scan must not auto-inject checklists, got ${JSON.stringify(checklistsBeforeAsk)}`);
+  }
+
+  await api("/api/v1/chat", {
+    method: "POST",
+    body: JSON.stringify({ message: "检查引用和语体风格" }),
+  });
+  let checklists;
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    const payload = await api(`/api/v1/documents/${opened.document.id}/checklists`);
+    checklists = payload.runs;
+    if (checklists?.length) break;
+  }
   const checkerNames = checklists?.map((entry) => entry.run.checker).sort();
   if (JSON.stringify(checkerNames) !== JSON.stringify(["cite_check", "style_lint"])) {
-    throw new Error(`expected cite/style checklists, got ${JSON.stringify(checkerNames)}`);
+    throw new Error(`expected cite/style checklists after ask, got ${JSON.stringify(checkerNames)}`);
   }
   const citeRun = checklists.find((entry) => entry.run.checker === "cite_check");
   if (!citeRun?.run.disclaimer.includes("形态学通过 ≠ 文献真实存在")) {

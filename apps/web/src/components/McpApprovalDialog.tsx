@@ -4,12 +4,15 @@ import { formatMcpApprovalArgs, type PendingMcpApproval } from "../mcpApproval";
 
 type Props = {
   approval: PendingMcpApproval | null;
-  onDecision: (decision: "allow" | "deny") => Promise<void> | void;
+  onDecision: (
+    decision: "allow" | "deny",
+    opts?: { rememberForSession?: boolean },
+  ) => Promise<void> | void;
 };
 
 /**
- * Per-call remote MCP approval. Exactly two decisions — 允许一次 / 拒绝;
- * no remember-forever. Undecided requests auto-deny after 60s server-side.
+ * Remote MCP approval. 拒绝 / 允许一次 / 本会话允许此工具.
+ * Undecided requests auto-deny after 60s server-side.
  */
 export function McpApprovalDialog({ approval, onDecision }: Props) {
   const [posting, setPosting] = useState(false);
@@ -29,10 +32,10 @@ export function McpApprovalDialog({ approval, onDecision }: Props) {
 
   if (!approval) return null;
 
-  const decide = (decision: "allow" | "deny") => {
+  const decide = (decision: "allow" | "deny", opts?: { rememberForSession?: boolean }) => {
     if (posting) return;
     setPosting(true);
-    void Promise.resolve(onDecision(decision)).finally(() => setPosting(false));
+    void Promise.resolve(onDecision(decision, opts)).finally(() => setPosting(false));
   };
 
   return (
@@ -51,7 +54,7 @@ export function McpApprovalDialog({ approval, onDecision }: Props) {
         <div className="mcp-approval-body">
           <p>
             Agent 请求调用远程服务器「{approval.serverName}」的只读工具「{approval.tool}」。
-            批准仅本次调用生效；60 秒内未选择将自动拒绝，拒绝不会发起任何网络请求。
+            60 秒内未选择将自动拒绝；拒绝不会发起任何网络请求。
           </p>
           <pre className="mcp-approval-args">{formatMcpApprovalArgs(approval.args)}</pre>
         </div>
@@ -67,11 +70,19 @@ export function McpApprovalDialog({ approval, onDecision }: Props) {
           </button>
           <button
             type="button"
-            className="btn send"
+            className="btn ghost"
             disabled={posting}
             onClick={() => decide("allow")}
           >
             允许一次
+          </button>
+          <button
+            type="button"
+            className="btn send"
+            disabled={posting}
+            onClick={() => decide("allow", { rememberForSession: true })}
+          >
+            本会话允许
           </button>
         </div>
       </div>

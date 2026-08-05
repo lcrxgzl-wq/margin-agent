@@ -197,6 +197,15 @@ describe("remote MCP profile gate in session tools", () => {
     requestApproval: async () => "deny" as const,
   };
 
+  it("mounts namespaced MCP tools for office-zh (remote.mcp + per-call)", () => {
+    const tools = createSessionTools(bridgeStub, bag, [], [], {}, {
+      harnessId: "office-zh",
+      enforceProfile: true,
+      remoteMcp: mcp,
+    });
+    expect(tools.some((tool) => tool.name === "mcp__mcp-aaaaaaaaaaaa__lookup")).toBe(true);
+  });
+
   it("mounts namespaced MCP tools for social-science-zh (remote.mcp + per-call)", () => {
     const tools = createSessionTools(bridgeStub, bag, [], [], {}, {
       harnessId: "social-science-zh",
@@ -204,15 +213,6 @@ describe("remote MCP profile gate in session tools", () => {
       remoteMcp: mcp,
     });
     expect(tools.some((tool) => tool.name === "mcp__mcp-aaaaaaaaaaaa__lookup")).toBe(true);
-  });
-
-  it("does not mount MCP tools for office-zh (approvals.remoteMcp = never)", () => {
-    const tools = createSessionTools(bridgeStub, bag, [], [], {}, {
-      harnessId: "office-zh",
-      enforceProfile: true,
-      remoteMcp: mcp,
-    });
-    expect(tools.some((tool) => tool.name.startsWith("mcp__"))).toBe(false);
   });
 
   it("does not mount MCP tools when the bridge is not provided (scan path)", () => {

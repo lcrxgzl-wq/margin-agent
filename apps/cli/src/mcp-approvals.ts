@@ -44,6 +44,10 @@ type PendingApproval = {
 
 export const MCP_APPROVAL_EXPIRY_MS = 60_000;
 
+function trustKey(serverId: string, tool: string): string {
+  return `${serverId}\0${tool}`;
+}
+
 function hashArgs(args: unknown): string {
   try {
     return createHash("sha256").update(JSON.stringify(args) ?? "").digest("hex").slice(0, 12);
@@ -73,16 +77,16 @@ function auditEntry(
 }
 
 /**
- * Per-call remote MCP approvals. Key = {workspaceRoot, sessionId, runId,
- * toolCallId} minted into a one-use approvalId; each pending request expires
- * (deny) after 60s and is denied on cancel/disconnect/supersede via the
- * denyAll hooks. Resolution deletes the entry, so replay fails.
+ * Per-call remote MCP approvals with optional session trust.
+ * Trust is keyed by sessionId + serverId + tool and cleared only on session switch.
  */
 export function createMcpApprovalRegistry(opts?: { expiryMs?: number }) {
   const expiryMs = opts?.expiryMs ?? MCP_APPROVAL_EXPIRY_MS;
   const pending = new Map<string, PendingApproval>();
   /** Recently expired ids (bounded) so the route can answer 410 vs 404. */
   const expiredIds: string[] = [];
+  /** sessionId → trusted serverId\\0tool keys for the rest of that chat session. */
+  const sessionTrust = new Map<string, Set<string>>();
 
   const settle = (
     approvalId: string,
@@ -103,7 +107,16 @@ export function createMcpApprovalRegistry(opts?: { expiryMs?: number }) {
     if (expiredIds.length > 200) expiredIds.splice(0, expiredIds.length - 200);
   };
 
+  const clearSessionTrust = (sessionId: string) => {
+    sessionTrust.delete(sessionId);
+  };
+
   return {
+    /** True when this session already allowed this server+tool earlier. */
+    isTrusted(sessionId: string, serverId: string, tool: string): boolean {
+      return sessionTrust.get(sessionId)?.has(trustKey(serverId, tool)) === true;
+    },
+
     /** Mint a one-use approval bound to workspace/session/run/toolCall. */
     request(input: McpApprovalRequestInput): {
       approvalId: string;
@@ -135,14 +148,29 @@ export function createMcpApprovalRegistry(opts?: { expiryMs?: number }) {
       return { approvalId, wait };
     },
 
-    /** One-use resolution; replay / cross-run reuse of an id fails. */
+    /**
+     * One-use resolution; replay / cross-run reuse of an id fails.
+     * When allow + rememberForSession, later calls of the same server+tool auto-allow.
+     */
     resolve(
       approvalId: string,
       decision: McpApprovalDecision,
+      opts?: { rememberForSession?: boolean },
     ): { status: "ok"; audit: McpApprovalAuditEntry } | { status: "expired" | "unknown" } {
-      const audit = settle(approvalId, decision, "user");
-      if (audit) return { status: "ok", audit };
-      return { status: expiredIds.includes(approvalId) ? "expired" : "unknown" };
+      const entry = pending.get(approvalId);
+      const reason = opts?.rememberForSession && decision === "allow"
+        ? "user-session"
+        : "user";
+      const audit = settle(approvalId, decision, reason);
+      if (!audit) {
+        return { status: expiredIds.includes(approvalId) ? "expired" : "unknown" };
+      }
+      if (decision === "allow" && opts?.rememberForSession && entry) {
+        const set = sessionTrust.get(entry.input.sessionId) ?? new Set<string>();
+        set.add(trustKey(entry.input.serverId, entry.input.tool));
+        sessionTrust.set(entry.input.sessionId, set);
+      }
+      return { status: "ok", audit };
     },
 
     /** Deny every pending approval of a run (cancel, disconnect, abort). */
@@ -156,7 +184,10 @@ export function createMcpApprovalRegistry(opts?: { expiryMs?: number }) {
       return audits;
     },
 
-    /** Deny every pending approval of a session (superseding run, reset). */
+    /**
+     * Deny every pending approval of a session (superseding run, reset).
+     * Session trust is cleared only on session-switch, not mid-session supersede.
+     */
     denyAllForSession(sessionId: string, reason = "superseded"): McpApprovalAuditEntry[] {
       const audits: McpApprovalAuditEntry[] = [];
       for (const [approvalId, entry] of [...pending.entries()]) {
@@ -164,8 +195,11 @@ export function createMcpApprovalRegistry(opts?: { expiryMs?: number }) {
         const audit = settle(approvalId, "deny", reason);
         if (audit) audits.push(audit);
       }
+      if (reason === "session-switch") clearSessionTrust(sessionId);
       return audits;
     },
+
+    clearSessionTrust,
 
     pendingCount(): number {
       return pending.size;

@@ -1,7 +1,6 @@
 ---
 name: argument-revision-zh
 description: 中文学术段落修订：定位主张—证据—推理断点，做最小可辩护改动。用于选区重写、论证诊断、段落润色。
-packs: academic
 ---
 
 # 论证修订（中文社科）

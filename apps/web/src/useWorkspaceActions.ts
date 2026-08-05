@@ -1068,13 +1068,16 @@ export function useWorkspaceActions(options?: {
     }
   };
 
-  const resolvePendingMcpApproval = async (decision: "allow" | "deny") => {
+  const resolvePendingMcpApproval = async (
+    decision: "allow" | "deny",
+    opts?: { rememberForSession?: boolean },
+  ) => {
     const pending = pendingMcpApproval;
     setPendingMcpApproval(null);
     if (!pending) return;
     // Fail closed: if the decision never reaches the server, the pending
     // approval expires to deny after 60s and zero remote calls happen.
-    await resolveMcpApproval(pending.approvalId, decision).catch(() => undefined);
+    await resolveMcpApproval(pending.approvalId, decision, opts).catch(() => undefined);
   };
 
   return {

@@ -48,7 +48,7 @@ export function buildClarificationHint(input: {
   const max = input.maxRounds ?? MAX_CLARIFICATION_ROUNDS;
   const used = clampClarificationRound(input.clarificationRound);
   const remaining = Math.max(0, max - used);
-  // socratic-revision-zh is an academic-pack skill: only skillScope "all" can load it.
+  // socratic-revision-zh is loadable on skillScope "all" (academic profile).
   const socraticPointer =
     getHarness(input.harnessId).skills.scope === "all"
       ? `可 load_skill("socratic-revision-zh").`
@@ -61,7 +61,7 @@ export function buildClarificationHint(input: {
   const budget = `澄清预算 ${used}/${max}（本线程还可追问 ${remaining} 轮）。`;
 
   if (input.chatMode === "socratic") {
-    return `\n\n[模式=苏格拉底追问] ${budget} 先提 1–2 个尖锐问题澄清问题意识/证据/限定；用户说「改吧/可以改了/直接改」或预算将尽时收敛并提案。禁止空泛追问与无限循环。${socraticPointer}`;
+    return `\n\n[模式=苏格拉底追问] ${budget} 先提 1–2 个尖锐问题澄清目标/证据/限定；用户说「改吧/可以改了/直接改」或预算将尽时收敛并提案。禁止空泛追问与无限循环。${socraticPointer}`;
   }
 
   return `\n\n[协作澄清] ${budget} 用户要求重写/编辑时：若指令过模糊、无法得到可验收结果，可先问 1–2 个尖锐问题；够具体则直接 propose_*。禁止无限追问；预算用尽必须提案。${socraticPointer}`;

@@ -1125,7 +1125,7 @@ export async function readWorkspaceSource(
   if (path.isAbsolute(relativePath) || path.win32.isAbsolute(relativePath)) {
     if (!opts?.unlimitedRead) {
       throw new Error(
-        "path is outside workspace; start with --unlimited (or MARGIN_UNLIMITED=1) to allow external reads",
+        "path is outside workspace; unlimited read is off — enable in Agent settings, or unset MARGIN_UNLIMITED=0",
       );
     }
     if (!fs.existsSync(relativePath)) throw new Error("file not found");
@@ -1167,7 +1167,7 @@ export function readWorkspaceSourceVersion(
   if (path.isAbsolute(relativePath) || path.win32.isAbsolute(relativePath)) {
     if (!opts?.unlimitedRead) {
       throw new Error(
-        "path is outside workspace; start with --unlimited (or MARGIN_UNLIMITED=1) to allow external reads",
+        "path is outside workspace; unlimited read is off — enable in Agent settings, or unset MARGIN_UNLIMITED=0",
       );
     }
     if (!fs.existsSync(relativePath)) throw new Error("file not found");

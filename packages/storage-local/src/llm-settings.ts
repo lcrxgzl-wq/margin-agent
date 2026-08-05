@@ -73,6 +73,10 @@ function normalizeCompactionAuto(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+function normalizeUnlimitedRead(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
 export type LlmProviderProfile = {
   id: string;
   name: string;
@@ -107,6 +111,8 @@ export type LlmSettingsStore = {
   contextTier?: ContextTier;
   /** Automatic context compaction; undefined falls back to true (on). */
   compactionAuto?: boolean;
+  /** Allow absolute-path reads outside the workspace; absent/undefined defaults ON. Writes stay closed. */
+  unlimitedRead?: boolean;
 };
 
 /** @deprecated flat shape — migrated on read */
@@ -146,6 +152,10 @@ export type LlmSettingsPublic = {
   contextTier?: ContextTier;
   /** Present only when the user toggled automatic context compaction. */
   compactionAuto?: boolean;
+  /** Present when toggled; absent means default ON. */
+  unlimitedRead?: boolean;
+  /** True when the process was started with --unlimited / MARGIN_UNLIMITED=1. */
+  unlimitedReadFromEnv?: boolean;
   ccSwitch?: {
     detected: boolean;
     proxyBaseURL?: string;
@@ -367,6 +377,7 @@ export function readLlmSettingsStore(root: string): LlmSettingsStore {
     const selectionContextChars = normalizeSelectionContextChars(raw.selectionContextChars);
     const contextTier = normalizeContextTier(raw.contextTier);
     const compactionAuto = normalizeCompactionAuto(raw.compactionAuto);
+    const unlimitedRead = normalizeUnlimitedRead(raw.unlimitedRead);
     return {
       activeId,
       providers,
@@ -378,6 +389,7 @@ export function readLlmSettingsStore(root: string): LlmSettingsStore {
       selectionContextChars,
       contextTier,
       compactionAuto,
+      unlimitedRead,
     };
   } catch {
     return defaultStore();
@@ -505,6 +517,8 @@ export function publicLlmSettings(
     selectionContextChars: store.selectionContextChars,
     contextTier: store.contextTier,
     compactionAuto: store.compactionAuto,
+    unlimitedRead: store.unlimitedRead,
+    unlimitedReadFromEnv: process.env.MARGIN_UNLIMITED === "1",
     ccSwitch,
   };
 }
@@ -531,6 +545,8 @@ export type SaveLlmSettingsInput = {
   contextTier?: ContextTier | null;
   /** Set automatic context compaction; null clears back to the default (on). */
   compactionAuto?: boolean | null;
+  /** Set unlimited external reads; null clears back to the default (off). */
+  unlimitedRead?: boolean | null;
 };
 
 export async function writeLlmSettingsStore(
@@ -557,6 +573,7 @@ export async function writeLlmSettingsStore(
     selectionContextChars: store.selectionContextChars,
     contextTier: store.contextTier,
     compactionAuto: store.compactionAuto,
+    unlimitedRead: store.unlimitedRead,
     providers: store.providers.map((p, i) => {
       validateProviderBaseURL(p.baseURL || "");
       return normalizeProfile(p, i);
@@ -736,6 +753,18 @@ export async function saveLlmSettings(
     }
   }
 
+  if (input.unlimitedRead !== undefined) {
+    if (input.unlimitedRead === null) {
+      store = { ...store, unlimitedRead: undefined };
+    } else {
+      const unlimitedRead = normalizeUnlimitedRead(input.unlimitedRead);
+      if (unlimitedRead === undefined) {
+        throw new Error("unlimitedRead 必须是布尔值");
+      }
+      store = { ...store, unlimitedRead };
+    }
+  }
+
   return writeLlmSettingsStore(root, store);
 }
 
@@ -773,6 +802,13 @@ export function loadAndApplyLlmSettings(root: string): LlmSettingsStore {
   const active = activeProfile(store);
   applyProfile(active);
   return store;
+}
+
+/** Effective unlimited-read gate. Default ON; settings or MARGIN_UNLIMITED=0 can turn it off. Writes stay closed. */
+export function isUnlimitedReadEnabled(root: string): boolean {
+  if (process.env.MARGIN_UNLIMITED === "0") return false;
+  if (process.env.MARGIN_UNLIMITED === "1") return true;
+  return readLlmSettingsStore(root).unlimitedRead !== false;
 }
 
 export function defaultLlmSettings(): LlmSettings {

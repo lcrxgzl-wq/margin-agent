@@ -66,7 +66,11 @@ describe("direct proposal completion", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const proposal = await generateDirectProposal({ block, instruction: "Make it concise." });
+    const proposal = await generateDirectProposal({
+      block,
+      instruction: "Make it concise.",
+      harnessId: "social-science-zh",
+    });
 
     expect(proposal.after).toBe("Revised.");
     expect(fetchMock).toHaveBeenCalledOnce();
@@ -247,7 +251,7 @@ describe("direct proposal completion", () => {
     await expect(generateDirectProposal({ block })).resolves.toMatchObject({ blockId: "b1" });
     const messages = requestBody?.messages as Array<{ role?: string; content?: string }>;
     expect(messages[0]?.role).toBe("system");
-    expect(messages[0]?.content).toContain("禁止编造文献");
+    expect(messages[0]?.content).toContain("禁止编造政策文号");
     expect(messages[1]?.role).toBe("user");
     expect(messages[1]?.content).toContain("Original paragraph.");
     expect(sentHeaders?.get("user-agent")).toBe("margin-agent/0.2.0-test");

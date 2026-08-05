@@ -1,6 +1,6 @@
 # Margin 0.1 使用说明
 
-Margin 是本地学术写作 Agent。对话负责理解任务和调用受控工具，画布负责正文与审阅；Agent 不直接 apply 正文。
+Margin 是本地文档修订 Agent。对话负责理解任务和调用受控工具，画布负责正文与审阅；Agent 不直接 apply 正文。
 
 ## 打开文稿和资料
 
@@ -48,4 +48,4 @@ Key 只保存在当前工作区的 `.margin/llm-settings.json`，不会发送到
 
 服务只监听 `127.0.0.1`，API 需要启动时生成的 Bearer token。工作区路径、DOCX 大小、写入路径和并发保存均由 Host 校验；原始外部 DOCX 保留在原位置，工作副本写入工作区 `imports/`。
 
-启动时加 `--unlimited`（或设环境变量 `MARGIN_UNLIMITED=1`）可开启 unlimited 读取：agent 可以通过绝对路径读取工作区外的文本资料（md/txt/json/csv/pdf/docx），大小上限与密钥黑名单（`.env`、`.ssh`、`*.pem` 等，大小写不敏感、符号链接解析后判定）仍然生效。写入边界不变：外部文件永远不会变成可写文档，外部 DOCX 仍只能导入工作副本。注意：外部资料内容会进入模型上下文，勿用此模式挂载不可信来源。
+默认允许 agent 通过绝对路径读取工作区外的文本资料（md/txt/json/csv/pdf/docx）。可在设置 → Agent →「工作区外读取」关闭，或设 `MARGIN_UNLIMITED=0`。大小上限与密钥黑名单（`.env`、`.ssh`、`*.pem` 等，大小写不敏感、符号链接解析后判定）仍然生效。写入边界不变：外部文件永远不会变成可写文档，外部 DOCX 仍只能导入工作副本。

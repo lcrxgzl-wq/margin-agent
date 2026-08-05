@@ -11,6 +11,7 @@ export {
   publicLlmSettings,
   activeProfile,
   isLoopbackBaseURL,
+  isUnlimitedReadEnabled,
   CC_SWITCH_PLACEHOLDER_KEY,
   PROVIDER_PRESETS,
   type LlmSettings,

@@ -68,7 +68,7 @@ describe("source byte versions", () => {
     fs.writeFileSync(normal, "ok", "utf8");
     fs.writeFileSync(secret, "secret", "utf8");
 
-    expect(() => readWorkspaceSourceVersion(workspace, normal)).toThrow(/--unlimited/);
+    expect(() => readWorkspaceSourceVersion(workspace, normal)).toThrow(/unlimited read is off/);
     expect(readWorkspaceSourceVersion(workspace, normal, { unlimitedRead: true }).versionHash)
       .toMatch(/^[a-f0-9]{64}$/);
     expect(() => readWorkspaceSourceVersion(workspace, secret, { unlimitedRead: true }))

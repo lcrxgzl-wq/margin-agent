@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Proposal } from "@margin/domain";
 import { composeSystemPrompt, getAgentProfile } from "@margin/harness";
-import { createReviewChecklistRuns } from "./academic.js";
 import { runPiAgentLoop } from "./pi-loop.js";
 import { assertPiLoopCompleted } from "./pi-outcome.js";
 import { createPaperTools } from "./pi-tools.js";
@@ -109,7 +108,7 @@ export async function runPiBlockScan(
     notes.push("pi finished with zero proposals");
   }
 
-  const reviewChecklists = createReviewChecklistRuns(ctx.documentId, selected);
+  const reviewChecklists = undefined;
 
   emit(drafts.length ? `完成（${drafts.length} 处提案）` : "完成（无提案）");
 

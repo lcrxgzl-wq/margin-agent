@@ -165,6 +165,7 @@ describe("propose_block_edit_from_results", () => {
       drafts,
       [],
       {
+        harnessId: "social-science-zh",
         extras: {
           analysisStore: store,
           readText: () => ({ relativePath: "data/x.csv", text: csv, bytes: csv.length }),
@@ -210,6 +211,7 @@ describe("propose_block_edit_from_results", () => {
       drafts,
       [],
       {
+        harnessId: "social-science-zh",
         extras: {
           analysisStore: store,
           readText: () => ({ relativePath: "data/x.csv", text: csv, bytes: csv.length }),

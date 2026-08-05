@@ -10,7 +10,7 @@ Margin（npm 包 `margin-agent`）：本地运行的文档修订 Agent。模型�
 - `apps/web` — React 19 + Vite 前端（画布、聊天、审阅面板）
 - `packages/domain` — Proposal / Decision / ApplyEvent 契约
 - `packages/agent` — 会话编排、pi 工具、direct-proposal
-- `packages/harness` — 人格/约束/skills（social-science-zh、office-zh、minimal 三档）
+- `packages/harness` — 人格/约束/skills（默认 office-zh；可选 social-science-zh、minimal）
 - `packages/llm` — BYOK 连接层（OpenAI 兼容 / Anthropic）
 - `packages/storage-local` — workspace-fs（安全边界）、office-docx（DOCX 读写）、SQLite
 - `brand/` — logo 与品牌资产（草稿在 brand/drafts/）
@@ -32,7 +32,7 @@ Margin（npm 包 `margin-agent`）：本地运行的文档修订 Agent。模型�
 2. **混排行尾**：多个源文件是 lone `\r` 混排（workspace-fs.ts、README.md 等）。Edit 工具多行块常匹配失败；可靠做法是临时 node 脚本做字节级编辑（正则容忍 `\r?\n`），用完删除。不要全局重写行尾。
 3. **GNU tar**：Windows 下 tar 把 `E:\` 盘符当远程主机，必须 `--force-local`。
 4. **npm publish 需要真实 TTY**：账号 2FA 是安全密钥（webauthn，无 TOTP），agent 侧无法模拟（winpty 也不行）。手动发布由用户在自己终端执行 `cd apps/cli && npm publish`；常规发布走 tag 自动管线（见下）。
-5. **工作区边界**：`resolveWorkspacePath`（workspace-fs.ts:97）拒绝绝对路径与 `..` 逃逸；读取旁路仅在 `--unlimited` / `MARGIN_UNLIMITED=1` 时开启（密钥黑名单在 realpath 后检查）。**写路径没有任何旁路，不要加。**
+5. **工作区边界**：`resolveWorkspacePath`（workspace-fs.ts:97）拒绝绝对路径与 `..` 逃逸；工作区外读取默认开启，可在设置或 `MARGIN_UNLIMITED=0` 关闭（密钥黑名单在 realpath 后检查）。**写路径没有任何旁路，不要加。**
 6. **canvas-editor 0.9.137**：无原生 track-changes。注入原语 `getKeywordRangeList` → `executeSetRange` → `executeInsertElementList(isSubmitHistory:false)`；禁止 `executeSetValue` 注入；流坐标与元素下标有漂移，用 `probeStreamDrift()` 校正。
 
 ## 发布

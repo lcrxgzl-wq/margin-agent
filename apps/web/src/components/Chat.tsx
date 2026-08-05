@@ -393,9 +393,9 @@ export function Chat({
       {showLandingStage ? (
         <div className="landing-stage">
           <div className="chat-hero">
-            <p className="hero-eyebrow">本地写作 Agent</p>
+            <p className="hero-eyebrow">本地文档修订 Agent</p>
             <h1 className="brand">Margin</h1>
-            <p className="hero-line">打开文稿，讨论论证，修订逐条由你裁决——定稿由你接受。</p>
+            <p className="hero-line">打开文稿，边聊边改；修订逐条由你裁决——定稿由你接受。</p>
           </div>
           <div className="composer-wrap landing-composer">
             <div className={`composer-card${busy ? " busy" : ""}`}>

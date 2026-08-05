@@ -1,19 +1,19 @@
 # Margin Paper Agent 架构规划（v0.2 执行稿）
 
-> GPT sol 审定：**Go with changes**（2026-07-18）  
+> GPT sol 审定：**Go with changes**（2026-07-18）
 > 下文已吸收强制修改点。
 
 ## 裁决摘要（强制）
 
 1. **执行前选路，执行后不重跑**：有凭据时开放任务只运行一次 Pi；无凭据或 `MARGIN_ENGINE=simple` 才在启动前选择离线流程。Pi 超时/失败直接报错，禁止用第二套 planner 重放。
-2. **工具副作用**：前八个工具不持久化、不 apply；评论工具名 **`propose_block_comment`**（仅写入本次 ScanRun）；`finish_scan` 只终止。  
-3. **提案契约**：Draft 含 `blockId` + `baseRevision` + `baseHash` + after/rationale；host 持久化后不可变；Apply 仅 CAS。  
-4. **`cite_check`**：每条结果必须 `heuristic_only: true` + `verification: "not_verified"`；文案声明未验证真伪。  
+2. **工具副作用**：前八个工具不持久化、不 apply；评论工具名 **`propose_block_comment`**（仅写入本次 ScanRun）；`finish_scan` 只终止。
+3. **提案契约**：Draft 含 `blockId` + `baseRevision` + `baseHash` + after/rationale；host 持久化后不可变；Apply 仅 CAS。
+4. **`cite_check`**：每条结果必须 `heuristic_only: true` + `verification: "not_verified"`；文案声明未验证真伪。
 5. **验收**：工具单测 + 无凭据预选离线 + Pi 失败不重放；不得把离线执行冒充 Pi。
 
 ## 产品命题
 
-Margin Agent = 只提案、不擅自改稿的块级审阅运行时（Git for papers）。  
+Margin Agent = 只提案、不擅自改稿的块级审阅运行时（Git for papers）。
 不 fork `pi-coding-agent`；云端无此 Agent。
 
 ## 分层
@@ -39,8 +39,8 @@ Host 命令（apply/reject/…）不可见 → `PaperAgentRuntime` → 九工具
 
 ## Profile、提示词与模块化（2026-07 重构后现状）
 
-- **AgentProfile 三档**：`social-science-zh`（默认）/ `office-zh` / `minimal`。每档只组合 instructions、model、capabilities、skills、limits、approvals；未知 id 直接拒绝。`minimal` 的 Pi 工具面仅保留块读取、提案与结束。
+- **AgentProfile 三档**：`office-zh`（默认，全工具）/ `social-science-zh`（更强学术语气与默认方法 Skill）/ `minimal`（刻意瘦身）。每档组合 instructions、capabilities、skills、limits、approvals；未知 id 直接拒绝。`minimal` 的 Pi 工具面仅保留块读取、提案与结束。
 - **三条执行路径**：纯列文件/打开命令走 Host；选区重写/翻译/润色走单次 Quick Edit；开放任务只走一次 Pi。三者共用同一 profile 编译器，Quick Edit 可用 `@skill-name` 显式内联已导入 Skill。
-- **skills 两层归属**：SKILL.md frontmatter 可选 `packs:`（缺省 core）；索引与 `load_skill` 按 profile 的 skills.scope 过滤。bundled：argument-revision-zh / socratic-revision-zh / source-grounded-writing（academic）、fill-table-from-csv（data-analysis）、cascade-consistency-zh / format-tidy-zh（core）。
+- **skills 两层归属**：SKILL.md frontmatter 可选 `packs:`（缺省 core）；索引与 `load_skill` 按 profile 的 skills.scope 过滤。默认档 `scope=all`，方法 Skill 均可选用；`social-science-zh` 会把论证/文献类 Skill 默认内联。bundled：argument-revision-zh / socratic-revision-zh / source-grounded-writing、fill-table-from-csv、cascade-consistency-zh / format-tidy-zh。检查与表格分析工具默认可用；远程 MCP 默认按次批准。
 - **工具面**：上节"九工具"是扫描期原始面；会话面已扩展（open_document / read_workspace_file / propose_* / offer_cascade / load_skill 等，见 `packages/agent/src/session-tools.ts`）。
 - **运行时边界**：Pi 用 `transformContext` 按完整用户轮次裁剪消息和工具输出；`beforeToolCall` 二次验权，`afterToolCall` 产出脱敏审计。远程 MCP 配置与输入 schema 可保留，但在 Host 完成逐次参数确认前不向模型暴露调用工具。

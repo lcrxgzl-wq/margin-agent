@@ -75,10 +75,7 @@ describe("paper agent adapter", () => {
       expect(result.engine).toBe("simple");
       expect(result.proposals.length).toBeGreaterThan(0);
       expect(result.comments).toEqual([]);
-      expect(result.reviewChecklists?.map((entry) => entry.run.checker)).toEqual([
-        "cite_check",
-        "style_lint",
-      ]);
+      expect(result.reviewChecklists ?? []).toEqual([]);
       expect(result.steps?.length).toBeGreaterThan(0);
       expect(phases.length).toBeGreaterThan(0);
       expect(phases[0]).toContain("读取");
@@ -330,6 +327,7 @@ describe("paper tools", () => {
       },
       drafts,
       comments,
+      { harnessId: "social-science-zh" },
     );
     expect(tools.map((t) => t.name)).toEqual([
       "get_document_outline",

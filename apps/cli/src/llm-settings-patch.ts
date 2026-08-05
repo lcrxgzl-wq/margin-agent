@@ -35,6 +35,8 @@ export type LlmSettingsPutBody = {
   contextTier?: "eco" | "standard" | "max" | null;
   /** Automatic context compaction; null clears back to the default (on). */
   compactionAuto?: boolean | null;
+  /** Unlimited external reads; null clears back to the default (off). */
+  unlimitedRead?: boolean | null;
 };
 
 /**
@@ -76,6 +78,7 @@ export function buildLlmSettingsUpdate(
     selectionContextChars: body.selectionContextChars,
     contextTier: body.contextTier,
     compactionAuto: body.compactionAuto,
+    unlimitedRead: body.unlimitedRead,
     provider: Object.keys(defined).length
       ? { ...defined, id: activeProviderId }
       : undefined,

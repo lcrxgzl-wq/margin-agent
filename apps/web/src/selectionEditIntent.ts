@@ -20,7 +20,7 @@ export function translationIntent(
     ? {
         operation: "translate",
         targetLanguage,
-        instruction: "将所选文本翻译成规范的学术英语，准确保留术语、引文、数字和事实，不新增内容。",
+        instruction: "将所选文本翻译成规范英语，准确保留术语、引文、数字和事实，不新增内容。",
       }
     : {
         operation: "translate",
@@ -31,7 +31,7 @@ export function translationIntent(
 
 export const polishIntent: SelectionEditIntent = {
   operation: "polish",
-  instruction: "润色所选文本，使表达准确、克制、符合学术写作习惯；保持原意、事实和引文，不新增证据。",
+  instruction: "润色所选文本，使表达准确、清楚、克制；保持原意、事实和引文，不新增证据。",
 };
 
 export function selectionEditIntent(text: string, selectionText = ""): SelectionEditIntent | null {

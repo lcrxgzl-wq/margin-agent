@@ -112,7 +112,7 @@ describe("bounded completion adapter", () => {
         messages: Array<{ role: string; content: string }>;
       };
       expect(body.messages[0]?.content).toContain("只输出译文");
-      expect(body.messages[1]?.content).toContain("规范的学术英语");
+      expect(body.messages[1]?.content).toContain("规范英语");
       expect(body.messages[1]?.content).toContain("选区：原文");
       expect(body).not.toHaveProperty("tools");
       expect(body).not.toHaveProperty("response_format");

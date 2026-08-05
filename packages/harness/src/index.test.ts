@@ -29,16 +29,28 @@ afterEach(() => {
 });
 
 describe("harness", () => {
-  it("defaults to social-science-zh", () => {
-    expect(getHarness().id).toBe("social-science-zh");
+  it("defaults to office-zh", () => {
+    expect(getHarness().id).toBe("office-zh");
     expect(getHarness().instructions).toContain("文档写作与修订");
-    expect(getHarness().instructions).toContain("通读策略");
+    expect(getHarness().instructions).toContain("通读：");
     expect(getHarness().instructions).toContain("[Margin 文稿全文");
     expect(getHarness().instructions).toContain("直接 offer_cascade");
+    expect(getHarness().instructions).toContain("别讲实现架构");
     expect(getHarness().instructions).toContain("证据底线");
     expect(getHarness().limits.maxTurns).toBe(40);
     expect(getHarness().capabilities).toContain("review.academic");
     expect(getHarness().capabilities).toContain("analysis.tabular");
+    expect(getHarness().capabilities).toContain("remote.mcp");
+    expect(getHarness().skills.scope).toBe("all");
+    expect(getHarness().skills.direct).toEqual(["format-tidy-zh"]);
+    expect(getHarness().approvals.remoteMcp).toBe("per-call");
+  });
+
+  it("keeps stronger academic tone defaults on the optional social-science profile", () => {
+    const academic = getHarness("social-science-zh");
+    expect(academic.styleHint).toContain("问题意识");
+    expect(academic.capabilities).toContain("analysis.tabular");
+    expect(academic.skills.direct).toEqual(["argument-revision-zh", "source-grounded-writing"]);
   });
 
   it("lists harnesses", () => {
@@ -57,7 +69,11 @@ describe("harness", () => {
       expect(h.instructions).toContain("选区"); // 微观选区优先（共享骨架）
     }
     expect(getHarness("office-zh").instructions).not.toContain("文献"); // 学术约束不进办公档
-    expect(getHarness("office-zh").capabilities).not.toContain("review.academic");
+    expect(getHarness("office-zh").capabilities).toEqual(expect.arrayContaining([
+      "review.academic",
+      "analysis.tabular",
+      "remote.mcp",
+    ]));
   });
 
   it("exposes office-zh in registry", () => {
@@ -94,6 +110,9 @@ describe("harness", () => {
   it("composeSystemPrompt is Pi-short: persona + boundary + skills index", () => {
     const session = composeSystemPrompt("social-science-zh", "session");
     expect(session).toContain("文档写作与修订");
+    expect(session).toContain("对用户：短说、可行动");
+    expect(session).toContain("别讲实现架构");
+    expect(session).not.toMatch(/隔离文件系统|宿主为你当前会话挂载/);
     expect(session).toContain("风格：问题意识清晰、文献对话、克制可辩护");
     expect(session).toContain("禁止 bash");
     expect(session).toContain("available_skills");
@@ -112,11 +131,13 @@ describe("harness", () => {
     expect(scan.length).toBeLessThan(320);
   });
 
-  it("filters skills by harness scope", () => {
+  it("lists academic method skills on the default office profile without auto-inlining them", () => {
     const session = composeSystemPrompt("office-zh", "session");
-    expect(session).not.toContain("argument-revision-zh");
-    expect(session).not.toContain("socratic-revision-zh");
-    expect(session).toContain("cascade-consistency-zh"); // core 技能保留
+    expect(session).toContain("argument-revision-zh");
+    expect(session).toContain("socratic-revision-zh");
+    expect(session).toContain("cascade-consistency-zh");
+    expect(session).toContain("本 profile 已启用：学术检查、表格分析");
+    expect(session).not.toContain("## 步骤");
   });
 
   it("includes format-tidy-zh in both academic and office scopes", () => {
@@ -147,17 +168,17 @@ describe("harness", () => {
   });
 
   it("resolves effective states from profile scope and user disablement", () => {
-    const office = listSkillStates(undefined, "core", ["format-tidy-zh"]);
+    const office = listSkillStates(undefined, "all", ["format-tidy-zh"]);
     expect(office.find((skill) => skill.name === "format-tidy-zh")?.state).toBe("disabled");
     expect(office.find((skill) => skill.name === "argument-revision-zh")?.state)
-      .toBe("blocked_by_profile");
+      .toBe("enabled");
   });
 
   it("rejects unavailable explicit direct Skills instead of silently skipping", () => {
     expect(() => composeDirectPromptDetailed("minimal", { selectedSkills: ["format-tidy-zh"] }))
       .toThrow(/不允许使用 Skill/);
     expect(() => composeDirectPromptDetailed("office-zh", { selectedSkills: ["argument-revision-zh"] }))
-      .toThrow(/无法使用 Skill/);
+      .not.toThrow();
     expect(() => composeDirectPromptDetailed("social-science-zh", {
       selectedSkills: ["argument-revision-zh"],
       disabledSkills: ["argument-revision-zh"],
@@ -178,9 +199,11 @@ describe("harness", () => {
     expect(() => composeSystemPromptDetailed("minimal", "session", {
       selectedSkills: ["format-tidy-zh"],
     })).toThrow(/不允许使用 Skill/);
-    expect(() => composeSystemPromptDetailed("office-zh", "session", {
+    expect(composeSystemPromptDetailed("office-zh", "session", {
       selectedSkills: ["argument-revision-zh"],
-    })).toThrow(/无法使用 Skill/);
+    }).loadedSkills).toEqual([
+      { name: "argument-revision-zh", contentHash: expect.stringMatching(/^[a-f0-9]{16}$/) },
+    ]);
     expect(() => composeSystemPromptDetailed("social-science-zh", "session", {
       selectedSkills: ["unknown-skill"],
     })).toThrow(/无法使用 Skill/);

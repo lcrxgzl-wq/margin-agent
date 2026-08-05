@@ -263,7 +263,7 @@ describe("workspace bridge extensions", () => {
     expect("mcp" in createWorkspaceBridge(workspace)).toBe(false);
   });
 
-  it("passes the unlimited-read switch through bridge.readText", async () => {
+  it("defaults unlimited-read ON through bridge.readText", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-agent-"));
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "margin-outside-"));
     dirs.push(root, outside);
@@ -274,13 +274,39 @@ describe("workspace bridge extensions", () => {
     try {
       const bridge = createWorkspaceBridge(workspace);
       delete process.env.MARGIN_UNLIMITED;
-      await expect(bridge.readText(target)).rejects.toThrow(/outside workspace/);
-
-      process.env.MARGIN_UNLIMITED = "1";
       await expect(bridge.readText(target)).resolves.toMatchObject({
         relativePath: target,
         text: "external evidence",
       });
+
+      process.env.MARGIN_UNLIMITED = "0";
+      await expect(bridge.readText(target)).rejects.toThrow(/outside workspace/);
+    } finally {
+      if (previous === undefined) delete process.env.MARGIN_UNLIMITED;
+      else process.env.MARGIN_UNLIMITED = previous;
+      workspace.db.close();
+      await workspace.releaseLock();
+    }
+  });
+
+  it("honors unlimited-read=false from llm settings without restart env", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "margin-chat-agent-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "margin-outside-"));
+    dirs.push(root, outside);
+    const target = path.join(outside, "external.txt");
+    fs.writeFileSync(target, "settings evidence", "utf8");
+    const workspace = await openWorkspace(root);
+    const previous = process.env.MARGIN_UNLIMITED;
+    try {
+      delete process.env.MARGIN_UNLIMITED;
+      const bridge = createWorkspaceBridge(workspace);
+      await expect(bridge.readText(target)).resolves.toMatchObject({
+        relativePath: target,
+        text: "settings evidence",
+      });
+
+      await saveLlmSettings(root, { unlimitedRead: false });
+      await expect(bridge.readText(target)).rejects.toThrow(/outside workspace/);
     } finally {
       if (previous === undefined) delete process.env.MARGIN_UNLIMITED;
       else process.env.MARGIN_UNLIMITED = previous;

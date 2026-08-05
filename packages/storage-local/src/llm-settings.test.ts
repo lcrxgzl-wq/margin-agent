@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   applyPreset,
+  isUnlimitedReadEnabled,
   loadAndApplyLlmSettings,
   publicLlmSettings,
   readLlmSettingsStore,
@@ -556,6 +557,38 @@ describe("reasoning settings", () => {
     await saveLlmSettings(root, { compactionAuto: null });
     expect(readLlmSettingsStore(root).compactionAuto).toBeUndefined();
     expect(publicLlmSettings(readLlmSettingsStore(root)).compactionAuto).toBeUndefined();
+  });
+
+  it("persists unlimitedRead and defaults ON unless explicitly disabled", async () => {
+    const previous = process.env.MARGIN_UNLIMITED;
+    try {
+      delete process.env.MARGIN_UNLIMITED;
+      expect(readLlmSettingsStore(root).unlimitedRead).toBeUndefined();
+      expect(isUnlimitedReadEnabled(root)).toBe(true);
+      expect(publicLlmSettings(readLlmSettingsStore(root)).unlimitedReadFromEnv).toBe(false);
+
+      await saveLlmSettings(root, { unlimitedRead: false });
+      expect(readLlmSettingsStore(root).unlimitedRead).toBe(false);
+      expect(isUnlimitedReadEnabled(root)).toBe(false);
+
+      await saveLlmSettings(root, { unlimitedRead: true });
+      expect(isUnlimitedReadEnabled(root)).toBe(true);
+
+      process.env.MARGIN_UNLIMITED = "0";
+      expect(isUnlimitedReadEnabled(root)).toBe(false);
+
+      process.env.MARGIN_UNLIMITED = "1";
+      expect(publicLlmSettings(readLlmSettingsStore(root)).unlimitedReadFromEnv).toBe(true);
+      expect(isUnlimitedReadEnabled(root)).toBe(true);
+
+      await saveLlmSettings(root, { unlimitedRead: null });
+      delete process.env.MARGIN_UNLIMITED;
+      expect(readLlmSettingsStore(root).unlimitedRead).toBeUndefined();
+      expect(isUnlimitedReadEnabled(root)).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.MARGIN_UNLIMITED;
+      else process.env.MARGIN_UNLIMITED = previous;
+    }
   });
 
   it("rejects invalid compactionAuto values at save", async () => {

@@ -720,7 +720,7 @@ export async function runOfflineSessionTurn(
   if (/^(你是谁|你是什么|介绍一下你自己|who are you)\s*$/i.test(msg)) {
     return finish({
       reply:
-        "我是 Margin：本地工作区上的论文 Agent。通过工具读写文件、打开文稿、提出可 Accept/Undo 的修订。未配 API 时走离线工具环；接上 Key 后同一套工具由模型调度。",
+        "我是 Margin：帮你改文稿。对选区提提案，你接受或拒绝后才写入。可以说「打开样章」或文件名。",
       proposals: [],
       comments: [],
     });

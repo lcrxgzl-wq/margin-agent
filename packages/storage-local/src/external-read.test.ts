@@ -43,11 +43,11 @@ describe("unlimited external reads", () => {
     fs.writeFileSync(target, "hello", "utf8");
 
     await expect(readWorkspaceSource(workspace, target)).rejects.toThrow(
-      /outside workspace; start with --unlimited/,
+      /outside workspace; unlimited read is off/,
     );
     await expect(
       readWorkspaceSource(workspace, target, { unlimitedRead: false }),
-    ).rejects.toThrow(/outside workspace; start with --unlimited/);
+    ).rejects.toThrow(/outside workspace; unlimited read is off/);
   });
 
   it("reads an external text file and backfills the absolute path", async () => {

@@ -293,6 +293,12 @@ describe("reasoning fields", () => {
     expect(update.provider).toBeUndefined();
   });
 
+  it("threads unlimitedRead without touching the provider patch", () => {
+    const update = buildLlmSettingsUpdate({ unlimitedRead: true }, "custom");
+    expect(update.unlimitedRead).toBe(true);
+    expect(update.provider).toBeUndefined();
+  });
+
   it("persists and clears compactionAuto through the update flow", async () => {
     const before = activeProfile(readLlmSettingsStore(root));
     await saveLlmSettings(

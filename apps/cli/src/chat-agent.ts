@@ -39,6 +39,7 @@ import {
   readWorkspaceSource,
   readWorkspaceSourceVersion,
   readLlmSettingsStore,
+  isUnlimitedReadEnabled,
   readSkillSettings,
   disabledSkillNames,
   readNativeDocxTableCell,
@@ -259,11 +260,11 @@ export function createWorkspaceBridge(
     listSourceFiles: () => listWorkspaceSourceFiles(workspace),
     readText: (relativePath) =>
       readWorkspaceSource(workspace, relativePath, {
-        unlimitedRead: process.env.MARGIN_UNLIMITED === "1",
+        unlimitedRead: isUnlimitedReadEnabled(workspace.root),
       }),
     readVersion: (relativePath) =>
       readWorkspaceSourceVersion(workspace, relativePath, {
-        unlimitedRead: process.env.MARGIN_UNLIMITED === "1",
+        unlimitedRead: isUnlimitedReadEnabled(workspace.root),
       }),
     writeText: (relativePath, content) => {
       assertNotRegisteredDocumentWrite(workspace, relativePath);
@@ -877,7 +878,7 @@ export async function runChatAgentTurn(opts: {
     claimsDocumentOpened(turn.reply)
   ) {
     turn.reply =
-      "Host 没有返回有效的文稿打开结果，所以文稿尚未打开。我不会把模型文字当作成功；只有分页画布实际出现才算打开。请发送一个带引号的绝对 DOCX 路径。";
+      "还没打开文稿。请发带引号的 DOCX 绝对路径，或把文件放进工作区后再说打开。";
     turn.messages = agentState.agentMessages;
     turn.notes = [
       ...(turn.notes ?? []),

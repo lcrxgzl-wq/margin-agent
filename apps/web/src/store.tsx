@@ -184,7 +184,7 @@ export const initialMarginState: MarginState = {
     {
       id: crypto.randomUUID(),
       role: "assistant",
-      text: "在。打开一篇稿，或先聊问题意识。",
+      text: "你好。我是 Margin：本地文档修订 Agent。打开一篇稿，或直接说想改什么。",
     },
   ],
   bootError: null,

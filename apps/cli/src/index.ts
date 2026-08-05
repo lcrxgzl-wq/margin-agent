@@ -46,6 +46,7 @@ import {
   listAgentTranscripts,
   loadAndApplyLlmSettings,
   readLlmSettingsStore,
+  isUnlimitedReadEnabled,
   readSkillSettings,
   disabledSkillNames,
   setSkillMode,
@@ -67,7 +68,6 @@ import {
   CONTEXT_TIER_PRESETS,
   isUserFacingPhase,
   PiLoopFailure,
-  createReviewChecklistRuns,
   runBlockScan,
   resolveEngine,
   resolveRuntimeModel,
@@ -563,12 +563,8 @@ async function main() {
       const checklistByChecker = new Map(
         (scan.reviewChecklists ?? []).map((checklist) => [checklist.run.checker, checklist]),
       );
-      const scannedBlocks = blocks.filter((block) => blockIds.includes(block.id));
-      for (const checklist of createReviewChecklistRuns(documentId, scannedBlocks)) {
-        if (!checklistByChecker.has(checklist.run.checker)) {
-          checklistByChecker.set(checklist.run.checker, checklist);
-        }
-      }
+      // Academic checklists are only persisted when the model/tool path produced them
+      // (user asked for a check). Do not auto-inject cite/style after every scan/edit.
       if (state.runs.get(runId)?.status === "cancelled") return;
       const persistence = await enqueueDocumentMutation(workspace, documentId, () => {
         if (signal?.aborted || state.runs.get(runId)?.status === "cancelled") {
@@ -799,6 +795,8 @@ async function main() {
       selectionContextChars?: number | null;
       /** Automatic context compaction toggle; null clears back to default. */
       compactionAuto?: boolean | null;
+      /** Unlimited external reads; null clears back to default ON. */
+      unlimitedRead?: boolean | null;
     };
   }>("/api/v1/settings/llm", async (req, reply) => {
     requireAuth(state, req.headers.authorization);
@@ -1724,7 +1722,10 @@ async function main() {
     return { ok: true };
   });
 
-  app.post<{ Params: { approvalId: string }; Body: { decision?: string } }>(
+  app.post<{
+    Params: { approvalId: string };
+    Body: { decision?: string; rememberForSession?: boolean };
+  }>(
     "/api/v1/extensions/mcp/approvals/:approvalId",
     async (req, reply) => {
       requireAuth(state, req.headers.authorization);
@@ -1732,7 +1733,9 @@ async function main() {
       if (decision !== "allow" && decision !== "deny") {
         return reply.code(400).send({ error: "decision must be allow or deny" });
       }
-      const result = mcpApprovalRegistry.resolve(req.params.approvalId, decision);
+      const result = mcpApprovalRegistry.resolve(req.params.approvalId, decision, {
+        rememberForSession: req.body?.rememberForSession === true,
+      });
       if (result.status === "expired") {
         return reply.code(410).send({ error: "审批已超时失效" });
       }
@@ -2141,6 +2144,28 @@ async function main() {
     const remoteMcp = {
       bridge: createRemoteMcpBridge(workspacePath),
       requestApproval: async (request: RemoteMcpApprovalRequest): Promise<"allow" | "deny"> => {
+        if (
+          mcpApprovalRegistry.isTrusted(
+            state.agent.sessionId,
+            request.serverId,
+            request.tool,
+          )
+        ) {
+          mcpApprovalAudit.push({
+            ts: new Date().toISOString(),
+            approvalId: "session-trust",
+            sessionId: state.agent.sessionId.slice(0, 64),
+            runId: runId.slice(0, 64),
+            toolCallId: request.toolCallId.slice(0, 200),
+            serverId: request.serverId.slice(0, 80),
+            serverName: request.serverName.slice(0, 80),
+            tool: request.tool.slice(0, 120),
+            decision: "allow",
+            reason: "session-trust",
+            argsHash: "session-trust",
+          });
+          return "allow";
+        }
         const { approvalId, wait } = mcpApprovalRegistry.request({
           workspaceRoot: workspacePath,
           sessionId: state.agent.sessionId,
@@ -2457,8 +2482,10 @@ async function main() {
   console.log(`  UI:        ${url}`);
   console.log(`  llm:       ${llmMode()}`);
   console.log(`  engine:    ${resolveEngine()} (preferred=pi)`);
-  if (process.env.MARGIN_UNLIMITED === "1") {
+  if (isUnlimitedReadEnabled(workspacePath)) {
     console.log(`  security: unlimited-read ON (external path reads allowed)`);
+  } else {
+    console.log(`  security: unlimited-read OFF (workspace-only reads)`);
   }
   console.log(`  keep this terminal open; Ctrl+C to stop`);
   if (llmMode() === "mock") {

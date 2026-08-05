@@ -388,6 +388,7 @@ describe("offline academic checklists", () => {
   it("returns actual checker runs without creating heuristic comments or proposals", async () => {
     const turn = await runOfflineSessionTurn({
       message: "检查引用和语体风格",
+      harnessId: "social-science-zh",
       bridge,
       bag: {
         documentId: "doc-1",
@@ -410,6 +411,33 @@ describe("offline academic checklists", () => {
       "style_lint",
     ]);
     expect(turn.reviewChecklists?.flatMap((entry) => entry.items).length).toBeGreaterThan(0);
+  });
+
+  it("runs academic checklists on the default office profile", async () => {
+    const turn = await runOfflineSessionTurn({
+      message: "检查引用和语体风格",
+      harnessId: "office-zh",
+      bridge,
+      bag: {
+        documentId: "doc-1",
+        revision: 0,
+        relativePath: "paper.md",
+        blocks: [{
+          id: "b1",
+          kind: "paragraph",
+          text: "新时代背景下（张三，2020）的治理研究具有重要的理论意义。",
+          order: 0,
+          contentHash: "hash-b1",
+        }],
+      },
+    });
+
+    expect(turn.reply).toMatch(/已生成检查清单/);
+    expect(turn.proposals).toEqual([]);
+    expect(turn.reviewChecklists?.map((entry) => entry.run.checker)).toEqual([
+      "cite_check",
+      "style_lint",
+    ]);
   });
 });
 

@@ -378,6 +378,10 @@ export type LlmSettingsPublic = {
   contextTier?: ContextTier;
   /** Automatic context compaction; absent means enabled (default). */
   compactionAuto?: boolean;
+  /** Unlimited external reads preference; absent means default ON. */
+  unlimitedRead?: boolean;
+  /** True when process started with --unlimited / MARGIN_UNLIMITED=1. */
+  unlimitedReadFromEnv?: boolean;
   ccSwitch?: {
     detected: boolean;
     proxyBaseURL?: string;
@@ -423,6 +427,7 @@ export async function saveLlmSettings(body: {
   selectionContextChars?: number | null;
   contextTier?: ContextTier | null;
   compactionAuto?: boolean | null;
+  unlimitedRead?: boolean | null;
   harnessId?: string | null;
 }) {
   return api<LlmSettingsPublic>("/api/v1/settings/llm", {
@@ -855,16 +860,20 @@ export async function chatStream(
   throw new Error("chat stream ended without done");
 }
 
-/** One-use decision for a pending remote MCP approval (404 unknown / 410 expired). */
+/** Decision for a pending remote MCP approval (404 unknown / 410 expired). */
 export async function resolveMcpApproval(
   approvalId: string,
   decision: "allow" | "deny",
+  opts?: { rememberForSession?: boolean },
 ) {
   return api<{ ok: true }>(
     `/api/v1/extensions/mcp/approvals/${encodeURIComponent(approvalId)}`,
     {
       method: "POST",
-      body: JSON.stringify({ decision }),
+      body: JSON.stringify({
+        decision,
+        rememberForSession: opts?.rememberForSession === true ? true : undefined,
+      }),
     },
   );
 }

@@ -4,8 +4,13 @@ import { inferTranslationTarget, selectionEditIntent } from "./selectionEditInte
 describe("selectionEditIntent", () => {
   it("routes concise translation and polishing commands to direct edits", () => {
     expect(selectionEditIntent("翻译", "An English sentence.")).toMatchObject({ operation: "translate", targetLanguage: "zh-CN" });
-    expect(selectionEditIntent("翻译成英文", "中文")).toMatchObject({ operation: "translate", targetLanguage: "en" });
-    expect(selectionEditIntent("润色")?.instruction).toContain("润色所选文本");
+    expect(selectionEditIntent("翻译成英文", "中文")).toMatchObject({
+      operation: "translate",
+      targetLanguage: "en",
+      instruction: expect.stringContaining("规范英语"),
+    });
+    expect(selectionEditIntent("润色")?.instruction).toContain("准确、清楚、克制");
+    expect(selectionEditIntent("润色")?.instruction).not.toContain("学术");
   });
 
   it("leaves discussion prompts in chat", () => {

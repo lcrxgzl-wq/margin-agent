@@ -30,5 +30,8 @@ describe("AgentTab runtime presets", () => {
     expect(html).toContain("重试间隔（秒）");
     expect(html).toContain('placeholder="30"');
     expect(html).toContain("包含首次请求");
+    expect(html).toContain("工作区外读取");
+    expect(html).toContain("允许通过绝对路径读取工作区外资料（默认开启）");
+    expect(html).toContain("默认全工具可用");
   });
 });
